@@ -98,18 +98,32 @@ function resolveScenePayloadName(root, dir) {
 //           vcAudit:[{node,ch,name,type,bytes,uvDup,f32}], typeWarnings:Set }
 function analyze(root, dir) {
     const channels = { positions: 0, normals: 0, uv: 0, uv2: 0, vcolor: 0, indices: 0, skin: 0, morph: 0 };
+    const logicalChannels = { positions: 0, normals: 0, uv: 0, uv2: 0, vcolor: 0, indices: 0, skin: 0, morph: 0 };
     const ranges = [];
+    const exactRanges = new Map();
     const perNode = [];
     const vcAudit = [];
     const typeWarnings = new Set();
     let verts = 0, tris = 0;
+    let aliasReferences = 0, aliasedBytes = 0;
 
     const addRange = (off, count, type, ch, label) => {
         if (off == null || count == null) return 0;
         if (type && !KNOWN_TYPES.has(String(type).toLowerCase())) typeWarnings.add(String(type));
         const len = count * stride(type);
-        ranges.push({ off, len, label });
-        channels[ch] += len;
+        const normalizedType = String(type || 'f32').toLowerCase();
+        // Only the same semantic channel may intentionally alias a range.
+        // Equal byte spans used as different attributes remain an overlap bug.
+        const exactKey = `${ch}:${off}:${len}:${normalizedType}`;
+        logicalChannels[ch] += len;
+        if (exactRanges.has(exactKey)) {
+            aliasReferences++;
+            aliasedBytes += len;
+        } else {
+            exactRanges.set(exactKey, { off, len, label, type: normalizedType });
+            ranges.push({ off, len, label, type: normalizedType });
+            channels[ch] += len;
+        }
         return len;
     };
 
@@ -159,7 +173,10 @@ function analyze(root, dir) {
         cursor = Math.max(cursor, r.off + r.len);
         hi = cursor;
     }
-    return { channels, ranges, perNode, vcAudit, typeWarnings, verts, tris, gap, overlap, hi };
+    return {
+        channels, logicalChannels, ranges, perNode, vcAudit, typeWarnings,
+        verts, tris, gap, overlap, hi, aliasReferences, aliasedBytes,
+    };
 }
 
 function collectMaterials(root) {
@@ -197,7 +214,13 @@ async function main() {
     const report = {
         files: { 'snapshot.json': jsonSize, [binName]: sceneBinSize, ...(animName ? { [animName]: animBinSize } : {}) },
         totals: { nodes: (root.nodes || []).length, materials: mats.length, verts: Math.round(a.verts), tris: Math.round(a.tris), animationClips: clips },
-        sceneBinChannels: a.channels, accounted, gap: a.gap, overlap: a.overlap, highWater: a.hi,
+        sceneBinChannels: a.channels,
+        logicalSceneBinChannels: a.logicalChannels,
+        accounted,
+        gap: a.gap,
+        overlap: a.overlap,
+        highWater: a.hi,
+        aliases: { references: a.aliasReferences, bytesReused: a.aliasedBytes },
         vertexColor: { total: vcTotal, channels: a.vcAudit.length, bytesOnUv2Duplicates: vcDup, bytesOnChannelsGE3: vcHigh, bytesStoredAsF32: vcF32 },
         topNodes: [...a.perNode].sort((x, y) => y.bytes - x.bytes).slice(0, args.top || a.perNode.length),
         unknownTypes: [...a.typeWarnings],
@@ -222,6 +245,9 @@ async function main() {
     console.log('');
     console.log('layout integrity:');
     console.log(`  accounted ${MB(accounted)} / file ${MB(sceneBinSize)} · high-water ${MB(a.hi)} · gaps ${MB(a.gap)} · overlaps ${MB(a.overlap)}`);
+    if (a.aliasReferences) {
+        console.log(`  ${a.aliasReferences.toLocaleString()} exact range aliases reuse ${MB(a.aliasedBytes)} of logical geometry storage`);
+    }
     if (a.gap > 1048576) console.log('  ⚠ >1MB of gaps — either an unmodeled channel or wasted/over-allocated space');
     if (a.overlap > 0) console.log('  ⚠ overlapping ranges — possible offset/length bug');
     if (report.unknownTypes.length) console.log(`  ⚠ unrecognized data types (sized as 4B): ${report.unknownTypes.join(', ')}`);

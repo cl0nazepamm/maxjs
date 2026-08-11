@@ -759,6 +759,173 @@
         group.norms.clear();
     }
 
+    static std::unordered_map<ULONG, ULONG> BuildSnapshotNativeInstanceFamilyMap(INode* root) {
+        std::unordered_map<ULONG, ULONG> families;
+        if (!root) return families;
+
+        IInstanceMgr* instanceMgr = IInstanceMgr::GetInstanceMgr();
+        if (!instanceMgr) return families;
+
+        std::unordered_set<ULONG> visited;
+        std::function<void(INode*)> visit = [&](INode* parent) {
+            for (int i = 0; i < parent->NumberOfChildren(); ++i) {
+                INode* node = parent->GetChildNode(i);
+                if (!node) continue;
+
+                const ULONG handle = node->GetHandle();
+                if (visited.insert(handle).second) {
+                    INodeTab instances;
+                    instanceMgr->GetInstances(*node, instances);
+                    if (instances.Count() > 1) {
+                        ULONG family = handle;
+                        for (int j = 0; j < instances.Count(); ++j) {
+                            INode* instance = instances[j];
+                            if (!instance) continue;
+                            const ULONG instanceHandle = instance->GetHandle();
+                            if (instanceHandle != 0 &&
+                                (family == 0 || instanceHandle < family)) {
+                                family = instanceHandle;
+                            }
+                        }
+                        if (family != 0) {
+                            families[handle] = family;
+                            for (int j = 0; j < instances.Count(); ++j) {
+                                INode* instance = instances[j];
+                                if (!instance) continue;
+                                const ULONG instanceHandle = instance->GetHandle();
+                                if (instanceHandle == 0) continue;
+                                families[instanceHandle] = family;
+                                visited.insert(instanceHandle);
+                            }
+                        }
+                    }
+                }
+
+                visit(node);
+            }
+        };
+        visit(root);
+        return families;
+    }
+
+    template <typename T>
+    static bool SnapshotVectorBytesEqual(const std::vector<T>& a,
+                                         const std::vector<T>& b) {
+        return a.size() == b.size() &&
+            (a.empty() || memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0);
+    }
+
+    static bool SnapshotVertexColorPayloadsEqual(
+            const std::vector<VertexColorAttributeRecord>& a,
+            const std::vector<VertexColorAttributeRecord>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (a[i].channel != b[i].channel ||
+                a[i].attrName != b[i].attrName ||
+                !SnapshotVectorBytesEqual(a[i].values, b[i].values)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool SnapshotMaterialGroupsEqual(const std::vector<MatGroup>& a,
+                                            const std::vector<MatGroup>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) {
+            if (a[i].matID != b[i].matID ||
+                a[i].start != b[i].start ||
+                a[i].count != b[i].count) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool CanAliasSnapshotNativeInstanceGeometry(const SnapshotNodeRecord& node) {
+        // Skin and morph payloads carry node-specific rig/animation metadata.
+        // Keep those independent until their complete binary contract is
+        // explicitly included in the equality test below.
+        return !node.helper && !node.spline && !node.skinRig &&
+            node.morphTargets.empty() && !node.verts.empty() && !node.indices.empty();
+    }
+
+    static bool SnapshotGeometryPayloadsEqual(const SnapshotNodeRecord& a,
+                                              const SnapshotNodeRecord& b) {
+        return CanAliasSnapshotNativeInstanceGeometry(a) &&
+            CanAliasSnapshotNativeInstanceGeometry(b) &&
+            SnapshotVectorBytesEqual(a.verts, b.verts) &&
+            SnapshotVectorBytesEqual(a.indices, b.indices) &&
+            SnapshotVectorBytesEqual(a.uvs, b.uvs) &&
+            SnapshotVectorBytesEqual(a.uv2s, b.uv2s) &&
+            SnapshotVectorBytesEqual(a.norms, b.norms) &&
+            SnapshotVertexColorPayloadsEqual(a.vertexColors, b.vertexColors) &&
+            SnapshotMaterialGroupsEqual(a.groups, b.groups);
+    }
+
+    static void ReserveSnapshotGeometryRanges(size_t& totalBytes,
+                                              SnapshotNodeRecord& node) {
+        AlignBinarySize(totalBytes, alignof(float));
+        node.vOff = totalBytes;
+        totalBytes += node.verts.size() * sizeof(float);
+        ReserveBinaryIndexRange(
+            totalBytes,
+            node.indices,
+            node.iOff,
+            node.iN,
+            node.iType);
+        {
+            size_t uvCount = 0;
+            ReserveBinaryUvRange(
+                totalBytes,
+                node.uvs,
+                node.uvOff,
+                uvCount,
+                node.uvType);
+        }
+        {
+            size_t uv2Count = 0;
+            ReserveBinaryUvRange(
+                totalBytes,
+                node.uv2s,
+                node.uv2Off,
+                uv2Count,
+                node.uv2Type);
+        }
+        {
+            size_t normalCount = 0;
+            ReserveBinaryNormalRange(
+                totalBytes,
+                node.norms,
+                node.nOff,
+                normalCount,
+                node.nType);
+        }
+        for (VertexColorAttributeRecord& attr : node.vertexColors) {
+            AlignBinarySize(totalBytes, alignof(float));
+            attr.off = totalBytes;
+            totalBytes += attr.values.size() * sizeof(float);
+        }
+    }
+
+    static void AliasSnapshotGeometryRanges(SnapshotNodeRecord& node,
+                                            const SnapshotNodeRecord& owner) {
+        node.vOff = owner.vOff;
+        node.iOff = owner.iOff;
+        node.iN = owner.iN;
+        node.uvOff = owner.uvOff;
+        node.uv2Off = owner.uv2Off;
+        node.nOff = owner.nOff;
+        node.iType = owner.iType;
+        node.uvType = owner.uvType;
+        node.uv2Type = owner.uv2Type;
+        node.nType = owner.nType;
+        for (size_t i = 0; i < node.vertexColors.size(); ++i) {
+            node.vertexColors[i].off = owner.vertexColors[i].off;
+        }
+        node.binaryGeometryAlias = true;
+    }
+
     static bool HasHtmlTextureSlot(const MaxJSPBR& pbr) {
         auto has = [](const MaxJSPBR::TexTransform& xf) { return !xf.htmlFile.empty(); };
         return has(pbr.colorMapTransform) || has(pbr.gradientMapTransform) ||
@@ -944,6 +1111,9 @@
         std::vector<SnapshotNodeRecord> nodes;
         size_t totalBytes = 0;
         std::unordered_set<ULONG> skinRigMeshHandles;
+        const std::unordered_map<ULONG, ULONG> nativeInstanceFamilies =
+            BuildSnapshotNativeInstanceFamilyMap(root);
+        std::unordered_map<ULONG, std::vector<size_t>> nativeInstanceGeometryOwners;
         MaterialLibraryBuilder materialLibrary;
         SnapshotRuntimeFeatures runtimeFeatures;
         runtimeFeatures.snapshotUi = options.includeSnapshotUi && !snapshotUiJson.empty();
@@ -1096,50 +1266,35 @@
                             requiredUvMask);
                     }
 
+                    // Native Max instances stay ordinary scene nodes. When their
+                    // finalized channel payloads are byte-identical, only their
+                    // M3 storage ranges alias; no instOf/InstancedMesh metadata is
+                    // emitted. Exact comparison protects unique modifier outcomes.
+                    bool aliasedGeometry = false;
+                    ULONG instanceFamily = 0;
+                    const auto familyIt = nativeInstanceFamilies.find(snapshotNode.handle);
+                    if (familyIt != nativeInstanceFamilies.end() &&
+                        CanAliasSnapshotNativeInstanceGeometry(snapshotNode)) {
+                        instanceFamily = familyIt->second;
+                        auto ownersIt = nativeInstanceGeometryOwners.find(instanceFamily);
+                        if (ownersIt != nativeInstanceGeometryOwners.end()) {
+                            for (size_t ownerIndex : ownersIt->second) {
+                                if (ownerIndex >= nodes.size()) continue;
+                                const SnapshotNodeRecord& owner = nodes[ownerIndex];
+                                if (!SnapshotGeometryPayloadsEqual(snapshotNode, owner)) continue;
+                                AliasSnapshotGeometryRanges(snapshotNode, owner);
+                                aliasedGeometry = true;
+                                break;
+                            }
+                        }
+                    }
+
                     // Calculate ALL binary offsets after skin/morph extraction
-                    // (bind pose replaces verts/uvs/norms/indices — use final sizes)
-                    AlignBinarySize(totalBytes, alignof(float));
-                    snapshotNode.vOff = totalBytes;
-                    totalBytes += snapshotNode.verts.size() * sizeof(float);
-                    ReserveBinaryIndexRange(
-                        totalBytes,
-                        snapshotNode.indices,
-                        snapshotNode.iOff,
-                        snapshotNode.iN,
-                        snapshotNode.iType);
-                    {
-                        size_t uvCount = 0;
-                        ReserveBinaryUvRange(
-                            totalBytes,
-                            snapshotNode.uvs,
-                            snapshotNode.uvOff,
-                            uvCount,
-                            snapshotNode.uvType);
+                    // (bind pose replaces verts/uvs/norms/indices — use final sizes).
+                    if (!aliasedGeometry) {
+                        ReserveSnapshotGeometryRanges(totalBytes, snapshotNode);
                     }
-                    {
-                        size_t uv2Count = 0;
-                        ReserveBinaryUvRange(
-                            totalBytes,
-                            snapshotNode.uv2s,
-                            snapshotNode.uv2Off,
-                            uv2Count,
-                            snapshotNode.uv2Type);
-                    }
-                    {
-                        size_t normalCount = 0;
-                        ReserveBinaryNormalRange(
-                            totalBytes,
-                            snapshotNode.norms,
-                            snapshotNode.nOff,
-                            normalCount,
-                            snapshotNode.nType);
-                    }
-                    for (VertexColorAttributeRecord& attr : snapshotNode.vertexColors) {
-                        AlignBinarySize(totalBytes, alignof(float));
-                        attr.off = totalBytes;
-                        totalBytes += attr.values.size() * sizeof(float);
-                    }
-                    if (snapshotNode.skinRig) {
+                    if (!aliasedGeometry && snapshotNode.skinRig) {
                         ReserveBinarySkinWeightRange(
                             totalBytes,
                             snapshotNode.skinWData,
@@ -1156,14 +1311,20 @@
                     }
                     // Morph delta streams: any mesh carrying morph targets, skinned
                     // or not. Float-aligned so the viewer can map them as Float32Array.
-                    for (auto& ch : snapshotNode.morphTargets.channels) {
-                        AlignBinarySize(totalBytes, alignof(float));
-                        ch.binaryOffset = totalBytes;
-                        ch.floatCount = static_cast<int>(ch.deltas.size());
-                        totalBytes += ch.deltas.size() * sizeof(float);
+                    if (!aliasedGeometry) {
+                        for (auto& ch : snapshotNode.morphTargets.channels) {
+                            AlignBinarySize(totalBytes, alignof(float));
+                            ch.binaryOffset = totalBytes;
+                            ch.floatCount = static_cast<int>(ch.deltas.size());
+                            totalBytes += ch.deltas.size() * sizeof(float);
+                        }
                     }
 
+                    const size_t nodeIndex = nodes.size();
                     nodes.push_back(std::move(snapshotNode));
+                    if (!aliasedGeometry && instanceFamily != 0) {
+                        nativeInstanceGeometryOwners[instanceFamily].push_back(nodeIndex);
+                    }
                 }
 
                 collect(node);
@@ -1273,43 +1434,45 @@
                 continue;
             }
 
-            if (!node.verts.empty()) {
-                memcpy(buffer + node.vOff, node.verts.data(), node.verts.size() * sizeof(float));
-            }
-            if (!node.indices.empty()) {
-                CopyBinaryIndices(buffer, node.iOff, node.indices, node.iType);
-            }
-            if (!node.uvs.empty()) {
-                CopyBinaryUvs(buffer, node.uvOff, node.uvs, node.uvType);
-            }
-            if (!node.uv2s.empty()) {
-                CopyBinaryUvs(buffer, node.uv2Off, node.uv2s, node.uv2Type);
-            }
-            if (!node.norms.empty()) {
-                CopyBinaryNormals(buffer, node.nOff, node.norms, node.nType);
-            }
-            for (const VertexColorAttributeRecord& attr : node.vertexColors) {
-                if (!attr.values.empty()) {
-                    memcpy(buffer + attr.off, attr.values.data(), attr.values.size() * sizeof(float));
+            if (!node.binaryGeometryAlias) {
+                if (!node.verts.empty()) {
+                    memcpy(buffer + node.vOff, node.verts.data(), node.verts.size() * sizeof(float));
                 }
-            }
-            if (node.skinRig) {
-                if (!node.skinWData.empty()) {
-                    CopyBinarySkinWeights(buffer, node.skinWOff, node.skinWData, node.skinWType);
+                if (!node.indices.empty()) {
+                    CopyBinaryIndices(buffer, node.iOff, node.indices, node.iType);
                 }
-                if (!node.skinIdxData.empty()) {
-                    CopyBinarySkinIndices(buffer, node.skinIndOff, node.skinIdxData, node.skinIdxType);
+                if (!node.uvs.empty()) {
+                    CopyBinaryUvs(buffer, node.uvOff, node.uvs, node.uvType);
                 }
-                if (!node.skinBoneBindLocal.empty()) {
-                    memcpy(buffer + node.skinBoneBindOff, node.skinBoneBindLocal.data(),
-                           node.skinBoneBindLocal.size() * sizeof(float));
+                if (!node.uv2s.empty()) {
+                    CopyBinaryUvs(buffer, node.uv2Off, node.uv2s, node.uv2Type);
                 }
-            }
-            // Morph delta streams: any mesh carrying morph targets, skinned or not.
-            for (const auto& ch : node.morphTargets.channels) {
-                if (!ch.deltas.empty()) {
-                    memcpy(buffer + ch.binaryOffset, ch.deltas.data(),
-                           ch.deltas.size() * sizeof(float));
+                if (!node.norms.empty()) {
+                    CopyBinaryNormals(buffer, node.nOff, node.norms, node.nType);
+                }
+                for (const VertexColorAttributeRecord& attr : node.vertexColors) {
+                    if (!attr.values.empty()) {
+                        memcpy(buffer + attr.off, attr.values.data(), attr.values.size() * sizeof(float));
+                    }
+                }
+                if (node.skinRig) {
+                    if (!node.skinWData.empty()) {
+                        CopyBinarySkinWeights(buffer, node.skinWOff, node.skinWData, node.skinWType);
+                    }
+                    if (!node.skinIdxData.empty()) {
+                        CopyBinarySkinIndices(buffer, node.skinIndOff, node.skinIdxData, node.skinIdxType);
+                    }
+                    if (!node.skinBoneBindLocal.empty()) {
+                        memcpy(buffer + node.skinBoneBindOff, node.skinBoneBindLocal.data(),
+                               node.skinBoneBindLocal.size() * sizeof(float));
+                    }
+                }
+                // Morph delta streams: any mesh carrying morph targets, skinned or not.
+                for (const auto& ch : node.morphTargets.channels) {
+                    if (!ch.deltas.empty()) {
+                        memcpy(buffer + ch.binaryOffset, ch.deltas.data(),
+                               ch.deltas.size() * sizeof(float));
+                    }
                 }
             }
 

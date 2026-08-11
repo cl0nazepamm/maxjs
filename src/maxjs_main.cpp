@@ -651,6 +651,10 @@ public:
         bool visible = true;
         bool spline = false;
         bool helper = false;
+        // True when this node's M3 channel descriptors alias byte ranges owned
+        // by another native Max instance. This is storage deduplication only:
+        // the node remains an ordinary mesh and never emits instOf metadata.
+        bool binaryGeometryAlias = false;
         std::vector<float> verts, uvs, uv2s, norms;
         std::vector<VertexColorAttributeRecord> vertexColors;
         std::vector<int> indices;

@@ -41,13 +41,26 @@ function analyzeSnapshotRoot(root, files = {}, options = {}) {
         skin: 0,
         morph: 0,
     };
+    const logicalChannels = {
+        positions: 0,
+        normals: 0,
+        uv: 0,
+        uv2: 0,
+        vcolor: 0,
+        indices: 0,
+        skin: 0,
+        morph: 0,
+    };
     const ranges = [];
+    const exactRanges = new Map();
     const perNode = [];
     const vcAudit = [];
     const morphNodes = [];
     const unknownTypes = new Set();
     let verts = 0;
     let tris = 0;
+    let aliasReferences = 0;
+    let aliasedBytes = 0;
 
     const addRange = (off, count, type, channel, label) => {
         if (off == null || count == null) return 0;
@@ -57,8 +70,16 @@ function analyzeSnapshotRoot(root, files = {}, options = {}) {
         const typeName = String(type || 'f32').toLowerCase();
         if (!KNOWN_TYPES.has(typeName)) unknownTypes.add(typeName);
         const len = n * stride(typeName);
-        ranges.push({ off: o, len, label });
-        channels[channel] += len;
+        const exactKey = `${channel}:${o}:${len}:${typeName}`;
+        logicalChannels[channel] += len;
+        if (exactRanges.has(exactKey)) {
+            aliasReferences++;
+            aliasedBytes += len;
+        } else {
+            exactRanges.set(exactKey, { off: o, len, label, type: typeName, channel });
+            ranges.push({ off: o, len, label, type: typeName, channel });
+            channels[channel] += len;
+        }
         return len;
     };
 
@@ -149,6 +170,7 @@ function analyzeSnapshotRoot(root, files = {}, options = {}) {
         }, 0);
     }, 0);
     const accounted = Object.values(channels).reduce((sum, value) => sum + value, 0);
+    const logicalAccounted = Object.values(logicalChannels).reduce((sum, value) => sum + value, 0);
     const vcTotal = channels.vcolor;
     const vcDup = vcAudit.filter(v => v.uvDup).reduce((sum, v) => sum + v.bytes, 0);
     const vcHigh = vcAudit.filter(v => Number(v.ch) >= 3).reduce((sum, v) => sum + v.bytes, 0);
@@ -166,10 +188,16 @@ function analyzeSnapshotRoot(root, files = {}, options = {}) {
             morphTracks: morphTrackCount,
         },
         sceneBinChannels: channels,
+        logicalSceneBinChannels: logicalChannels,
         accounted,
+        logicalAccounted,
         gap,
         overlap,
         highWater,
+        aliases: {
+            references: aliasReferences,
+            bytesReused: aliasedBytes,
+        },
         vertexColor: {
             total: vcTotal,
             channels: vcAudit.length,

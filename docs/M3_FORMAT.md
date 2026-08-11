@@ -111,6 +111,12 @@ instance decoder as described below.
   may alias the exact same range; partial overlaps are suspicious and should be
   reported by audit tools, but per-range type/alignment/bounds validation is
   the safety requirement.
+- Max native object instances remain separate ordinary `nodes`. When their
+  finalized geometry channels are byte-identical, the snapshot writer aliases
+  their `geo` ranges to one M3 storage block, and consumers may reuse the same
+  decoded `BufferGeometry` for those ordinary meshes. This is storage/runtime
+  reuse only: it does not emit `instOf`, `forestInstances`, or require a
+  Three.js `InstancedMesh`/WebGPU instance path.
 - Empty scenes still carry a small payload (currently four zero bytes); readers must not infer content from file size.
 - Offsets and counts must be non-negative safe integers. Check multiplication and addition for overflow before constructing a typed array.
 

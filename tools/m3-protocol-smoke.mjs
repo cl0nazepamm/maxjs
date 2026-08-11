@@ -2,6 +2,7 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import * as THREE from '../web/node_modules/three/build/three.module.js';
 import {
     COMMAND_TYPES,
     DELTA_FRAME_MAGIC,
@@ -16,6 +17,8 @@ import {
     typedArrayCanStore,
     updateFloatGeometryAttribute,
 } from '../web/js/scene_binary.js';
+import { applySceneBin } from '../web/js/scene_applier.js';
+import { analyzeSnapshotPayload } from '../web/js/snapshot_diagnostics.js';
 import {
     fetchSnapshotScenePayload,
     snapshotScenePayloadCandidates,
@@ -308,6 +311,77 @@ function m3RangeSmoke() {
     assert.ok(warnings.length >= 7);
 }
 
+function m3AliasedRangeDiagnosticsSmoke() {
+    const sharedGeo = { vOff: 0, vN: 9, iOff: 36, iN: 3, iType: 'u32' };
+    const report = analyzeSnapshotPayload({
+        snapshotJson: {
+            nodes: [
+                { h: 1, n: 'Tree001', geo: sharedGeo },
+                { h: 2, n: 'Tree002', geo: { ...sharedGeo } },
+            ],
+        },
+        files: { sceneBinBytes: 48 },
+    });
+    assert.equal(report.overlap, 0, 'exact M3 aliases are not corruption overlaps');
+    assert.equal(report.accounted, 48, 'physical bytes are counted once');
+    assert.equal(report.logicalAccounted, 96, 'logical node bytes include both meshes');
+    assert.deepEqual(report.aliases, { references: 2, bytesReused: 48 });
+
+    const invalid = analyzeSnapshotPayload({
+        snapshotJson: {
+            nodes: [
+                { h: 1, n: 'Mesh001', geo: { vOff: 0, vN: 9, iOff: 36, iN: 3, iType: 'u32' } },
+                { h: 2, n: 'Mesh002', geo: { vOff: 4, vN: 9, iOff: 48, iN: 3, iType: 'u32' } },
+            ],
+        },
+        files: { sceneBinBytes: 60 },
+    });
+    assert.ok(invalid.overlap > 0, 'partial M3 overlaps remain visible as corruption');
+    assert.equal(invalid.aliases.references, 0);
+}
+
+async function m3AliasedGeometryReuseSmoke() {
+    const buffer = new ArrayBuffer(48);
+    const view = new DataView(buffer);
+    [-1, -1, 0, 1, -1, 0, 0, 1, 0]
+        .forEach((value, index) => view.setFloat32(index * 4, value, true));
+    [0, 1, 2].forEach((value, index) => view.setInt32(36 + index * 4, value, true));
+
+    const geo = { vOff: 0, vN: 9, iOff: 36, iN: 3, iType: 'u32' };
+    const transform = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
+    const nodeMap = new Map();
+    const maxRoot = new THREE.Group();
+    const scene = new THREE.Scene();
+    scene.add(maxRoot);
+
+    const result = await applySceneBin({
+        buffer,
+        meta: {
+            type: 'scene_bin',
+            nodes: [
+                { h: 1, n: 'Tree001', t: transform, geo },
+                { h: 2, n: 'Tree002', t: transform, geo: { ...geo } },
+            ],
+        },
+        ctx: { nodeMap, maxRoot, scene },
+    });
+
+    const first = nodeMap.get(1);
+    const second = nodeMap.get(2);
+    assert.ok(first?.isMesh && second?.isMesh);
+    assert.notEqual(first.isInstancedMesh, true);
+    assert.notEqual(second.isInstancedMesh, true);
+    assert.notEqual(first, second, 'ordinary mesh nodes remain distinct objects');
+    assert.equal(first.geometry, second.geometry,
+        'aliased M3 ranges reuse one decoded BufferGeometry and typed arrays');
+    assert.equal(first.geometry.getAttribute('position').array,
+        second.geometry.getAttribute('position').array,
+        'aliased ordinary meshes do not allocate a second Float32Array');
+    assert.equal(first.geometry.index.array, second.geometry.index.array,
+        'aliased ordinary meshes do not allocate a second index array');
+    assert.equal(result.reusedM3GeometryCount, 1);
+}
+
 async function loaderCompatibilitySmoke() {
     assert.equal(validateM3Metadata({ type: 'scene_bin' }).type, 'scene_bin');
     assert.equal(validateM3Metadata({
@@ -372,10 +446,18 @@ function sourceContractSmoke() {
         'broken Skin init TMs are checked against the Skin reference frame');
     assert.match(extractorSource, /referenceBasisMatches\s*>\s*skinBasisMatches/,
         'the legacy Daz world-basis fallback is evidence-gated');
+    assert.match(snapshotSource, /IInstanceMgr::GetInstanceMgr\(\)/,
+        'snapshot writer uses native Max instance truth for binary range aliasing');
+    assert.match(snapshotSource, /SnapshotGeometryPayloadsEqual/,
+        'snapshot writer verifies finalized geometry before aliasing M3 ranges');
+    assert.match(snapshotSource, /binaryGeometryAlias/,
+        'snapshot writer marks storage aliases without runtime instance metadata');
 }
 
 protocolGoldenSmoke();
 m3RangeSmoke();
+m3AliasedRangeDiagnosticsSmoke();
+await m3AliasedGeometryReuseSmoke();
 await loaderCompatibilitySmoke();
 sourceContractSmoke();
 console.log('M3 + MXJB protocol smoke: PASS');

@@ -367,6 +367,21 @@ function syncNodeGeometryGroups(mesh, geom, groups, nodeMap) {
     return target;
 }
 
+// Snapshot-native Max instances remain ordinary THREE.Mesh nodes. Their M3
+// descriptors alias identical byte ranges, so decode those ranges once and
+// reuse the resulting BufferGeometry. This deliberately does not participate
+// in instOf buckets or create an InstancedMesh. jsmod/skin/morph/spline paths
+// retain independent geometry because they can carry node-owned mutations.
+function ordinaryM3GeometryReuseKey(nd) {
+    if (!nd?.geo || nd.spline || nd.skin || nd.morph || nd.jsmod) return null;
+    if (!Number.isSafeInteger(nd.geo.vOff) || !Number.isSafeInteger(nd.geo.vN) ||
+        !Number.isSafeInteger(nd.geo.iOff) || !Number.isSafeInteger(nd.geo.iN) ||
+        nd.geo.vN <= 0 || nd.geo.iN <= 0) {
+        return null;
+    }
+    return JSON.stringify([nd.geo, Array.isArray(nd.groups) ? nd.groups : null]);
+}
+
 function getInstanceTransformPayload(grp, buffer) {
     if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN)) {
         const values = binaryFloatView(buffer, grp.xformOff, grp.xformN, 'instance transform');
@@ -656,8 +671,10 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         sceneChanged = true;
     }
 
-    // Geometry cache for instance sharing within this sync.
+    // Geometry caches for explicit instOf sharing and M3 storage aliases.
     const geoByHandle = new Map();
+    const geometryByM3Storage = new Map();
+    let reusedM3GeometryCount = 0;
 
     for (const nd of meta.nodes) {
         let mesh = nodeMap.get(nd.h);
@@ -666,7 +683,6 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
                 removeNodeObject(mesh);
                 releaseGeometryRef(refCounts, mesh.geometry);
                 hooks.disposeMaterial(mesh.material);
-                mesh.geometry?.dispose?.();
                 mesh = null;
             }
             if (!mesh) {
@@ -717,13 +733,21 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
             if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
         } else if (nd.geo && !jsmodSkipGeo) {
-            const built = geometryFromNodeBinary(nd, buffer);
-            if (!built) continue;
-            geom = built;
-            hooks.setVertexColors(geom, nd.geo.vc, buffer);
-            applyInstanceGeometryGroups(geom, nd.groups);
-            if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
-            if (!nd.spline) attachMorphAttributes(geom, nd, buffer);
+            const reuseKey = ordinaryM3GeometryReuseKey(nd);
+            const reused = reuseKey ? geometryByM3Storage.get(reuseKey) : null;
+            if (reused) {
+                geom = reused;
+                reusedM3GeometryCount++;
+            } else {
+                const built = geometryFromNodeBinary(nd, buffer);
+                if (!built) continue;
+                geom = built;
+                hooks.setVertexColors(geom, nd.geo.vc, buffer);
+                applyInstanceGeometryGroups(geom, nd.groups);
+                if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
+                if (!nd.spline) attachMorphAttributes(geom, nd, buffer);
+                if (reuseKey) geometryByM3Storage.set(reuseKey, geom);
+            }
         } else if (geom && nd.groups) {
             geom = syncNodeGeometryGroups(mesh, geom, nd.groups, nodeMap);
         }
@@ -843,7 +867,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         transport: 'binary-scene',
         applyStart,
         producerBytes: meta.stats?.producerBytes ?? buffer.byteLength,
-        options: { ...options, bucketPlan, sceneChanged },
+        options: { ...options, bucketPlan, sceneChanged, reusedM3GeometryCount },
     });
 
     return {
@@ -853,5 +877,6 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         addedHandles,
         removedHandles,
         bucketSignature: bucketPlan.signature,
+        reusedM3GeometryCount,
     };
 }

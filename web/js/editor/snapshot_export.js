@@ -343,6 +343,7 @@ function createSnapshotExport(deps = {}) {
                 `;
             }).join('');
             const vertexColor = report.vertexColor || {};
+            const aliases = report.aliases || {};
             const warnings = [];
             if (report.overlap > 0) warnings.push(`${formatBytes(report.overlap)} overlapping M3 ranges`);
             if (report.gap > 0) warnings.push(`${formatBytes(report.gap)} unaccounted M3 gaps`);
@@ -382,6 +383,8 @@ function createSnapshotExport(deps = {}) {
                                 ${snapshotDiagnosticRow('High water', `${formatBytes(report.highWater)} (${formatPercent(report.highWater, sceneBinBytes)})`)}
                                 ${snapshotDiagnosticRow('Gaps', formatBytes(report.gap))}
                                 ${snapshotDiagnosticRow('Overlaps', formatBytes(report.overlap))}
+                                ${snapshotDiagnosticRow('Alias references', Number(aliases.references || 0).toLocaleString())}
+                                ${snapshotDiagnosticRow('Logical bytes reused', formatBytes(aliases.bytesReused))}
                             </div>
                             <div class="snapshot-diagnostics-card">
                                 <h3>Vertex Colors</h3>

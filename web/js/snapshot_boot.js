@@ -599,7 +599,7 @@ async function registerOptionalModules(features, ctx) {
     return modules;
 }
 
-const SNAPSHOT_HALO_GI_DEFAULTS = Object.freeze({
+const SNAPSHOT_SPEEDBALL_GI_DEFAULTS = Object.freeze({
     enabled: false,
     intensity: 10,
     divisions: 16,
@@ -630,37 +630,37 @@ function numOrFallback(value, fallback, min = -Infinity, max = Infinity) {
     return Math.max(min, Math.min(max, n));
 }
 
-function normalizeSnapshotHaloGiState(snapshotUi) {
-    const source = snapshotUi?.haloGi;
+function normalizeSnapshotSpeedballGiState(snapshotUi) {
+    const source = snapshotUi?.speedballGi;
     if (!source || typeof source !== 'object') return null;
     return {
         enabled: source.enabled === true,
-        intensity: numOrFallback(source.intensity, SNAPSHOT_HALO_GI_DEFAULTS.intensity, 0, 32),
-        divisions: Math.round(numOrFallback(source.divisions, SNAPSHOT_HALO_GI_DEFAULTS.divisions, 2, 32)),
-        rays: Math.round(numOrFallback(source.rays, SNAPSHOT_HALO_GI_DEFAULTS.rays, 32, 256) / 16) * 16,
+        intensity: numOrFallback(source.intensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.intensity, 0, 32),
+        divisions: Math.round(numOrFallback(source.divisions, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.divisions, 2, 32)),
+        rays: Math.round(numOrFallback(source.rays, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.rays, 32, 256) / 16) * 16,
         cascades: Math.round(Number(source.cascades)) === 2 ? 2 : 1,
         continuous: source.continuous !== false,
-        hysteresis: numOrFallback(source.hysteresis, SNAPSHOT_HALO_GI_DEFAULTS.hysteresis, 0, 0.99),
+        hysteresis: numOrFallback(source.hysteresis, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.hysteresis, 0, 0.99),
         // Absent in pre-normalization exports — default ON to match the field.
         hysteresisNormalize: source.hysteresisNormalize !== false,
-        normalBias: numOrFallback(source.normalBias, SNAPSHOT_HALO_GI_DEFAULTS.normalBias, 0, 8),
-        radianceClamp: numOrFallback(source.radianceClamp, SNAPSHOT_HALO_GI_DEFAULTS.radianceClamp, 0, 64),
-        depthSharpness: numOrFallback(source.depthSharpness, SNAPSHOT_HALO_GI_DEFAULTS.depthSharpness, 1, 200),
-        cheby: numOrFallback(source.cheby, SNAPSHOT_HALO_GI_DEFAULTS.cheby, 0, 1),
-        classify: numOrFallback(source.classify, SNAPSHOT_HALO_GI_DEFAULTS.classify, 0, 1),
-        filter: numOrFallback(source.filter, SNAPSHOT_HALO_GI_DEFAULTS.filter, 0, 1),
-        smoothness: numOrFallback(source.smoothness, SNAPSHOT_HALO_GI_DEFAULTS.smoothness, 0, 1),
-        detail: numOrFallback(source.detail, SNAPSHOT_HALO_GI_DEFAULTS.detail, 0, 1),
+        normalBias: numOrFallback(source.normalBias, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.normalBias, 0, 8),
+        radianceClamp: numOrFallback(source.radianceClamp, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.radianceClamp, 0, 64),
+        depthSharpness: numOrFallback(source.depthSharpness, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.depthSharpness, 1, 200),
+        cheby: numOrFallback(source.cheby, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.cheby, 0, 1),
+        classify: numOrFallback(source.classify, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.classify, 0, 1),
+        filter: numOrFallback(source.filter, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.filter, 0, 1),
+        smoothness: numOrFallback(source.smoothness, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.smoothness, 0, 1),
+        detail: numOrFallback(source.detail, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.detail, 0, 1),
         roughReflections: source.roughReflections === true,
-        reflectionIntensity: numOrFallback(source.reflectionIntensity, SNAPSHOT_HALO_GI_DEFAULTS.reflectionIntensity, 0, 1),
-        changeThreshold: numOrFallback(source.changeThreshold, SNAPSHOT_HALO_GI_DEFAULTS.changeThreshold, 0.5, 8),
-        snapAmount: numOrFallback(source.snapAmount, SNAPSHOT_HALO_GI_DEFAULTS.snapAmount, 0, 0.9),
-        fireflyClamp: numOrFallback(source.fireflyClamp, SNAPSHOT_HALO_GI_DEFAULTS.fireflyClamp, 1, 20),
+        reflectionIntensity: numOrFallback(source.reflectionIntensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.reflectionIntensity, 0, 1),
+        changeThreshold: numOrFallback(source.changeThreshold, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.changeThreshold, 0.5, 8),
+        snapAmount: numOrFallback(source.snapAmount, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.snapAmount, 0, 0.9),
+        fireflyClamp: numOrFallback(source.fireflyClamp, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.fireflyClamp, 1, 20),
         volumes: Array.isArray(source.volumes) ? source.volumes : [],
     };
 }
 
-function snapshotHaloVolumeBoxes(volumes) {
+function snapshotSpeedballVolumeBoxes(volumes) {
     const out = [];
     for (const entry of Array.isArray(volumes) ? volumes : []) {
         if (!entry || !Array.isArray(entry.min) || !Array.isArray(entry.max)) continue;
@@ -692,7 +692,7 @@ function snapshotHaloVolumeBoxes(volumes) {
     return out;
 }
 
-function markSnapshotHaloGiMaterialsDirty(scene) {
+function markSnapshotSpeedballGiMaterialsDirty(scene) {
     const seen = new WeakSet();
     const mark = (material) => {
         if (!material || seen.has(material)) return;
@@ -710,7 +710,7 @@ function markSnapshotHaloGiMaterialsDirty(scene) {
     });
 }
 
-function applySnapshotHaloGiSettings(field, settings) {
+function applySnapshotSpeedballGiSettings(field, settings) {
     field.setIntensity?.(settings.intensity);
     field.setDivisions?.(settings.divisions);
     field.setRays?.(settings.rays);
@@ -725,40 +725,34 @@ function applySnapshotHaloGiSettings(field, settings) {
     field.setClassifyStrength?.(settings.classify);
     field.setFilterStrength?.(settings.filter);
     field.setSmoothness?.(settings.smoothness);
-    field.setDetailStrength?.(settings.detail);
+    // The probe-field wrapper names this setNormalDetail (it forwards to the
+    // node's setDetailStrength) — the old optional-chained name was a no-op.
+    (field.setNormalDetail ?? field.setDetailStrength)?.call(field, settings.detail);
     field.setReflectionIntensity?.(settings.reflectionIntensity);
     field.setChangeThreshold?.(settings.changeThreshold);
     field.setSnapAmount?.(settings.snapAmount);
     field.setFireflyClamp?.(settings.fireflyClamp);
 }
 
-async function createSnapshotHaloGi({ renderer, scene, snapshotUi } = {}) {
-    const settings = normalizeSnapshotHaloGiState(snapshotUi);
+async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
+    const settings = normalizeSnapshotSpeedballGiState(snapshotUi);
     if (!settings?.enabled) return null;
     if (renderer?.backend?.isWebGPUBackend !== true || !renderer?.lighting?.createNode) return null;
-    // An adaptive MaxLightsNode factory already injects the probe term when
-    // light links or Reflection Paint required it. Otherwise install GiLights.
-    // Check the actual factory marker instead of assuming every `studio` block
-    // needed specialized lighting.
-    const swapLightingNode = renderer.lighting.createNode?.maxjsAdaptiveLighting !== true;
-
-    let previousCreateNode = null;
-    let installedCreateNode = null;
     try {
-        const { createProbeField } = await import('speedball-gi');
-        if (swapLightingNode) {
-            const { giLights } = await import('speedball-gi');
-            previousCreateNode = renderer.lighting.createNode;
-            const lightOptions = {
-                maxDirectionalLights: 16,
-                maxPointLights: 32,
-                maxSpotLights: 32,
-                maxHemisphereLights: 4,
-            };
-            installedCreateNode = (lights = []) => giLights(lightOptions).setLights(lights);
-            renderer.lighting.createNode = installedCreateNode;
+        // Live max.js always compiles through MaxLightsNode. Snapshot parity must
+        // use that same lighting graph even when the portable Studio block has no
+        // active links/paint; Speedball's generic GiLightsNode is intentionally a
+        // library fallback, not the max.js runtime contract. This still lands
+        // before the snapshot's first scene render/compile.
+        if (renderer.lighting.createNode?.maxjsAdaptiveLighting !== true) {
+            const { installMaxLightsRenderer } = await import('./max_lights_node.js');
+            if (!installMaxLightsRenderer(renderer)) {
+                console.warn('[snapshot_boot] Speedball GI needs the max.js WebGPU lighting graph');
+                return null;
+            }
         }
 
+        const { createProbeField } = await import('speedball-gi');
         const field = createProbeField({
             renderer,
             scene,
@@ -767,36 +761,81 @@ async function createSnapshotHaloGi({ renderer, scene, snapshotUi } = {}) {
             divisions: settings.divisions,
             roughReflections: settings.roughReflections,
             reflectionIntensity: settings.reflectionIntensity,
-            onRebuilt: () => markSnapshotHaloGiMaterialsDirty(scene),
+            onRebuilt: () => markSnapshotSpeedballGiMaterialsDirty(scene),
         });
-        applySnapshotHaloGiSettings(field, settings);
-        const volumes = snapshotHaloVolumeBoxes(settings.volumes);
+        applySnapshotSpeedballGiSettings(field, settings);
+        const volumes = snapshotSpeedballVolumeBoxes(settings.volumes);
         if (volumes.length) field.setVolumes(volumes);
         field.setEnabled(true);
         field.requestRebuild?.();
+        let warmupPasses = 0;
+        let tickPending = false;
+        // Each accepted tick blends only (1 - hysteresis) of its solve into the
+        // probe atlas, so "cascades + 1" passes leaves the field at a few
+        // percent of its converged radiance — the snapshot rendered as if GI
+        // (and the rough-reflection composite, filled by the same ticks) were
+        // off. The editor only looks right because it keeps ticking while
+        // idle; an auto-playing snapshot timeline never grants that idle, so
+        // warm up until the exponential blend has actually converged (~97%)
+        // before handing control to the editor-parity idle/playing gate.
+        const warmupHysteresis = Math.min(0.99, Math.max(0.5, settings.hysteresis));
+        const requiredWarmupPasses = Math.max(
+            (settings.cascades === 2 ? 2 : 1) + 1,
+            Math.min(240, Math.ceil(Math.log(0.03) / Math.log(warmupHysteresis))),
+        );
+
+        // Texture-late retrace: the warmup above can converge against a scene
+        // whose material maps are still streaming — the trace then bounces off
+        // untextured (bright) surfaces, and once the timeline gate takes over
+        // the probes hold that washed-out field forever ("snapshot GI is
+        // flat"). Every time the shared loader queue drains, re-trace and
+        // re-run the warmup so the converged field reflects the textured
+        // scene. Fires rarely (queue drains are coarse) and each pass rides
+        // the same warmup path, so this never churns a settled field.
+        const loadingManager = THREE.DefaultLoadingManager;
+        const priorOnLoad = loadingManager.onLoad;
+        let loadHookInstalled = true;
+        const onTexturesSettled = () => {
+            if (typeof priorOnLoad === 'function') priorOnLoad();
+            warmupPasses = 0;
+            field.requestRebuild?.();
+        };
+        loadingManager.onLoad = onTexturesSettled;
 
         return {
             field,
             settings,
             update() {
-                if (!field.isSupported?.()) return;
-                void field.tick({ idleMs: Number.POSITIVE_INFINITY, playing: false });
+                if (!field.isSupported?.() || tickPending) return;
+                const nowMs = performance.now();
+                const timelineUpdateMs = maxTimeline.lastUpdateMs?.();
+                const timelineIdleMs = Number.isFinite(timelineUpdateMs) && timelineUpdateMs > 0
+                    ? nowMs - timelineUpdateMs
+                    : Number.POSITIVE_INFINITY;
+                const warmingUp = warmupPasses < requiredWarmupPasses;
+                tickPending = true;
+                void field.tick({
+                    idleMs: warmingUp ? Number.POSITIVE_INFINITY : timelineIdleMs,
+                    playing: !warmingUp && maxTimeline.playing?.() === true,
+                }).then(() => {
+                    if (field.hasData?.() && warmupPasses < requiredWarmupPasses) warmupPasses += 1;
+                }).finally(() => {
+                    tickPending = false;
+                });
             },
             requestRebuild() {
                 field.requestRebuild?.();
             },
             dispose() {
-                try { field.dispose?.(); } catch {}
-                if (renderer.lighting?.createNode === installedCreateNode) {
-                    renderer.lighting.createNode = previousCreateNode;
+                if (loadHookInstalled && loadingManager.onLoad === onTexturesSettled) {
+                    loadingManager.onLoad = priorOnLoad ?? undefined;
                 }
+                loadHookInstalled = false;
+                try { field.dispose?.(); } catch {}
             },
         };
     } catch (error) {
-        if (installedCreateNode && renderer.lighting?.createNode === installedCreateNode) {
-            renderer.lighting.createNode = previousCreateNode;
-        }
-        console.warn('[snapshot_boot] HALO-GI snapshot replay failed', error);
+        console.warn('[snapshot_boot] Speedball GI snapshot replay failed', error);
         return null;
     }
 }
@@ -2068,12 +2107,12 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.notifyEnvironmentChanged?.();
     syncDefaultLights();
 
-    const snapshotHaloGi = await createSnapshotHaloGi({
+    const snapshotSpeedballGi = await createSnapshotSpeedballGi({
         renderer,
         scene,
         snapshotUi: meta.snapshotUi,
     });
-    if (snapshotHaloGi) optionalModules.haloGi = snapshotHaloGi;
+    if (snapshotSpeedballGi) optionalModules.speedballGi = snapshotSpeedballGi;
 
     // Phase 7b: top-level camera state. Lives at meta.camera independently
     // of snapshotUi (which is gated by the "Viewer UI State" export toggle
@@ -2194,7 +2233,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
-            optionalModules.haloGi?.requestRebuild?.();
+            optionalModules.speedballGi?.requestRebuild?.();
             return result;
         },
         applyLights: (lightsData) => {
@@ -2202,23 +2241,23 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             authoredLightCount = countVisibleLightPayload(lightsData);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
-            optionalModules.haloGi?.requestRebuild?.();
+            optionalModules.speedballGi?.requestRebuild?.();
             return r;
         },
         setEnvironmentEnabled: (enabled) => {
             const state = snapshotEnvironment.setEnabled(enabled);
             syncDefaultLights();
-            optionalModules.haloGi?.requestRebuild?.();
+            optionalModules.speedballGi?.requestRebuild?.();
             return state;
         },
         setEnvironmentVisible: (visible) => {
             const state = snapshotEnvironment.setBackgroundVisible(visible);
-            optionalModules.haloGi?.requestRebuild?.();
+            optionalModules.speedballGi?.requestRebuild?.();
             return state;
         },
         setEnvironmentBackgroundVisible: (visible) => {
             const state = snapshotEnvironment.setBackgroundVisible(visible);
-            optionalModules.haloGi?.requestRebuild?.();
+            optionalModules.speedballGi?.requestRebuild?.();
             return state;
         },
         dispose() {

@@ -47,6 +47,8 @@ import {
     geometryFromNodeBinary,
     attachSkinAttributes,
     attachMorphAttributes,
+    applySkinRestPose,
+    chooseSkinBindBasis,
     buildSkinnedMeshFromNd,
     indexArrayFromBinary,
     normalAttributeFromBinary,
@@ -661,6 +663,8 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
     const geoByHandle = new Map();
     const geometryByM3Storage = new Map();
     let reusedM3GeometryCount = 0;
+    // Built lazily on the first skin node — bone rest poses resolve through it.
+    let ndByHandle = null;
 
     for (const nd of meta.nodes) {
         let mesh = nodeMap.get(nd.h);
@@ -782,8 +786,11 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             if (wantsLine) {
                 mesh = new THREE.LineSegments(geom, material);
             } else if (nd.skin) {
-                mesh = buildSkinnedMeshFromNd({ nd, geom, material, buffer, nodeMap })
-                    ?? new THREE.Mesh(geom, material);
+                ndByHandle ??= new Map(meta.nodes.map((n) => [n.h, n]));
+                mesh = buildSkinnedMeshFromNd({
+                    nd, geom, material, buffer, nodeMap,
+                    resolveNodeDescriptor: (handle) => ndByHandle.get(handle),
+                }) ?? new THREE.Mesh(geom, material);
             } else {
                 mesh = new THREE.Mesh(geom, material);
                 // Plain mesh with morph targets: the Mesh ctor's updateMorphTargets()
@@ -844,6 +851,11 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
             mesh.skeleton.calculateInverses();
             mesh.bind(mesh.skeleton, mesh.matrixWorld);
+            chooseSkinBindBasis(mesh, maxRoot);
+            // Inverses above captured the bind pose; only now may the bones
+            // move to the export-time stance (bones without animation tracks
+            // would otherwise stay frozen at bind pose).
+            applySkinRestPose(mesh);
             mesh.userData._skelBound = true;
         }
     }

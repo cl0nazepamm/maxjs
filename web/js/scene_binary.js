@@ -216,7 +216,7 @@ export function updateGeometryIndexAttribute(geometry, buffer, off, n, type = ''
         // Deform settle packets re-send an unchanged index. Bumping the
         // attribute version there re-uploads the buffer AND reads as a
         // connectivity change to every structural change-detector downstream
-        // (HALO-GI/PT geoSignature → full MeshBVH rebuild + kernel recompile
+        // (Speedball GI/PT geoSignature → full MeshBVH rebuild + kernel recompile
         // on scrub release). Byte-identical indices must be a no-op.
         const dst = current.array;
         let changed = false;
@@ -395,6 +395,148 @@ export function attachMorphAttributes(geom, nd, buffer) {
     }
 }
 
+function finiteMatrix16(value) {
+    if (!Array.isArray(value) || value.length !== 16) return null;
+    for (let i = 0; i < 16; i++) {
+        if (!Number.isFinite(value[i])) return null;
+    }
+    return value;
+}
+
+/**
+ * The packed skin bind matrices only describe the Skin BIND basis (they feed
+ * `boneInverses`). The rig's CURRENT pose lives in the exported bone helper
+ * node descriptors, whose `t` is the flat under-max-root transform — the same
+ * space `applyTransform` consumes and the same convention the scoped bone
+ * animation tracks sample (`parentWorld⁻¹ · boneWorld`). Bones that carry no
+ * animation track would otherwise freeze at bind pose, which parks a
+ * posed/moved character at the Skin-init origin instead of where it stands.
+ * Returns one parent-local 16-float array per bone (null where the pose is
+ * unknown), or null when no descriptor resolves.
+ */
+function computeSkinPoseLocals(nd, sk, resolveNodeDescriptor) {
+    if (typeof resolveNodeDescriptor !== 'function') return null;
+    const meshFlat = finiteMatrix16(nd.t);
+    const boneMat = new THREE.Matrix4();
+    const parentMat = new THREE.Matrix4();
+    const locals = [];
+    let any = false;
+    for (let i = 0; i < sk.bones.length; i++) {
+        const boneFlat = finiteMatrix16(resolveNodeDescriptor(sk.bones[i])?.t);
+        const pi = sk.parent[i];
+        const parentFlat = pi >= 0
+            ? finiteMatrix16(resolveNodeDescriptor(sk.bones[pi])?.t)
+            : meshFlat;
+        if (!boneFlat || !parentFlat) { locals.push(null); continue; }
+        parentMat.fromArray(parentFlat);
+        if (Math.abs(parentMat.determinant()) < 1e-12) { locals.push(null); continue; }
+        boneMat.fromArray(boneFlat).premultiply(parentMat.invert());
+        locals.push(Array.from(boneMat.elements));
+        any = true;
+    }
+    return any ? locals : null;
+}
+
+const _skinBasisScratch = {
+    meshWorldInv: new THREE.Matrix4(),
+    rootWorld: new THREE.Matrix4(),
+    meshFlat: new THREE.Matrix4(),
+    boneLocal: new THREE.Matrix4(),
+    center: new THREE.Vector3(),
+    centerB: new THREE.Vector3(),
+    chainCenter: new THREE.Vector3(),
+    p: new THREE.Vector3(),
+};
+
+/**
+ * The exported bind-local chain is relative to whichever basis the Skin
+ * modifier reported at export (`meshInitWorld`): the mesh node's TM for
+ * Genesis/Daz-style rigs, but the raw Skin-init TM (often identity — flat
+ * world space) for imported glTF rigs whose node was moved after binding.
+ * The geometry verts are always node OBJECT space, so with an identity Skin
+ * basis the composed bind skeleton and the bind geometry sit apart by
+ * exactly the mesh node TM and skinning smears the mesh across the rig.
+ * Both interpretations are testable from the data: pick the one that puts
+ * the composed bind skeleton inside the bind geometry, and when the Skin
+ * basis wins, recapture `boneInverses` against the max root (which injects
+ * the node TM between the verts and the chain — `boneNow·inv(chain)·T·v`).
+ * MUST run after `calculateInverses` + `bind` and before any bone re-pose.
+ */
+export function chooseSkinBindBasis(mesh, maxRoot) {
+    const skeleton = mesh?.skeleton;
+    const geometry = mesh?.geometry;
+    if (!skeleton?.bones?.length || !geometry || !maxRoot) return;
+    const s = _skinBasisScratch;
+    if (!geometry.boundingSphere) {
+        try { geometry.computeBoundingSphere(); } catch { return; }
+    }
+    const sphere = geometry.boundingSphere;
+    if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius <= 0) return;
+
+    mesh.updateWorldMatrix(true, false);
+    maxRoot.updateWorldMatrix(true, false);
+    s.meshWorldInv.copy(mesh.matrixWorld);
+    if (Math.abs(s.meshWorldInv.determinant()) < 1e-12) return;
+    s.meshWorldInv.invert();
+    s.rootWorld.copy(maxRoot.matrixWorld);
+    // Flat node TM (under max root) — maps object-space verts to the chain's
+    // flat world when the chain was exported in the Skin-init basis.
+    s.meshFlat.copy(s.rootWorld);
+    if (Math.abs(s.meshFlat.determinant()) < 1e-12) return;
+    s.meshFlat.invert().multiply(mesh.matrixWorld);
+
+    // Composed chain positions live in mesh-local space at capture time
+    // (bones still carry their bind locals here).
+    s.chainCenter.set(0, 0, 0);
+    for (const bone of skeleton.bones) {
+        bone.updateWorldMatrix(false, false);
+        s.boneLocal.copy(s.meshWorldInv).multiply(bone.matrixWorld);
+        s.p.setFromMatrixPosition(s.boneLocal);
+        s.chainCenter.add(s.p);
+    }
+    s.chainCenter.divideScalar(skeleton.bones.length);
+
+    s.center.copy(sphere.center);
+    const dA = s.center.distanceTo(s.chainCenter);
+    s.centerB.copy(sphere.center).applyMatrix4(s.meshFlat);
+    const dB = s.centerB.distanceTo(s.chainCenter);
+
+    // Conservative switch: only when the node-basis read is clearly broken
+    // (skeleton far outside the mesh) AND the Skin basis clearly repairs it.
+    if (!(dA > sphere.radius * 0.5 && dB < dA * 0.25)) return;
+
+    for (let i = 0; i < skeleton.bones.length; i++) {
+        const bone = skeleton.bones[i];
+        s.boneLocal.copy(s.meshWorldInv).multiply(bone.matrixWorld);
+        skeleton.boneInverses[i]
+            .copy(s.rootWorld)
+            .multiply(s.boneLocal)
+            .invert();
+    }
+}
+
+/**
+ * Poses a skinned mesh's bones to the export-time stance stashed by
+ * `buildSkinnedMeshFromNd`. MUST run only after the final skeleton bind
+ * (`calculateInverses` + `bind`) — the inverses have to capture the bind
+ * pose the geometry is authored in, not the current stance.
+ */
+export function applySkinRestPose(mesh) {
+    const locals = mesh?.userData?._skelPoseLocals;
+    if (!Array.isArray(locals)) return;
+    delete mesh.userData._skelPoseLocals;
+    const bones = mesh.skeleton?.bones ?? [];
+    const count = Math.min(bones.length, locals.length);
+    for (let i = 0; i < count; i++) {
+        const m = locals[i];
+        const bone = bones[i];
+        if (!m || !bone) continue;
+        bone.matrix.fromArray(m);
+        bone.matrix.decompose(bone.position, bone.quaternion, bone.scale);
+        bone.matrixWorldNeedsUpdate = true;
+    }
+}
+
 /**
  * Assembles a `THREE.SkinnedMesh` from a node descriptor + bind-pose
  * matrices in the binary buffer. Lifts `buildSkinnedMeshFromNd` out of
@@ -403,8 +545,12 @@ export function attachMorphAttributes(geom, nd, buffer) {
  * `nodeMap` is required so the bones can be registered under their
  * scoped key (`${meshHandle}:${boneHandle}`) — the AnimationMixer
  * resolves bone targets through this map.
+ *
+ * `resolveNodeDescriptor` (optional, handle → nd) lets the mesh carry its
+ * export-time pose: bones start at bind pose for the caller's inverse
+ * capture, and the caller applies `applySkinRestPose` after binding.
  */
-export function buildSkinnedMeshFromNd({ nd, geom, material, buffer, nodeMap }) {
+export function buildSkinnedMeshFromNd({ nd, geom, material, buffer, nodeMap, resolveNodeDescriptor }) {
     const sk = nd?.skin;
     const nB = sk?.bones?.length ?? 0;
     if (!Number.isSafeInteger(nB) || nB <= 0 || !geom ||
@@ -475,6 +621,9 @@ export function buildSkinnedMeshFromNd({ nd, geom, material, buffer, nodeMap }) 
 
     skinned.bind(new THREE.Skeleton(bones));
     skinned.userData.maxjsSkinRig = true;
+
+    const poseLocals = computeSkinPoseLocals(nd, sk, resolveNodeDescriptor);
+    if (poseLocals) skinned.userData._skelPoseLocals = poseLocals;
 
     if (nd.morph?.names?.length) {
         const nM = nd.morph.names.length;

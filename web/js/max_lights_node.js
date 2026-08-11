@@ -523,7 +523,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
         // grid-resize recompile, but data-only surfel-buffer writes share the same
         // program.
         if (getGiVolumeNode().active) typeSet.add(getGiVolumeNode().cacheToken);
-        // HALO-GI probe field: token bumps ONLY on grid resize / enable, never on
+        // Speedball GI probe field: token bumps ONLY on grid resize / enable, never on
         // per-tick atlas writes (the atlas is a stable sampled binding) — so probe
         // updates never recompile materials. This is the churn-free contract.
         if (getGiProbeNode().active) typeSet.add(getGiProbeNode().cacheToken);
@@ -653,7 +653,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
         const giVolumeNode = getGiVolumeNode();
         if (giVolumeNode.active) lightNodes.push(giVolumeNode);
 
-        // HALO-GI BVH-traced DDGI probe field — leak-free room-scale bounce into
+        // Speedball GI BVH-traced DDGI probe field — leak-free room-scale bounce into
         // context.irradiance (global, unmasked, same as the surfel volume). The
         // two are mutually exclusive at runtime (index.html mutes the surfel
         // volume when the probe field is active) to avoid double-counting bounce.

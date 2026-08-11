@@ -231,7 +231,7 @@ function createRendererCore(deps = {}) {
             // WebGPU devices come up at spec-MINIMUM limits unless asked
             // otherwise — 16 sampled textures per shader stage is one
             // shadow-casting light away from overflowing a scene material's
-            // bind group once shadow maps and the HALO-GI probe atlases fold
+            // bind group once shadow maps and the Speedball GI probe atlases fold
             // in (2026-07-24: "add one light and the floor vanishes" —
             // BindGroupLayout creation failed, every mesh on that material
             // stopped rendering). Mirror the adapter's real limits into the

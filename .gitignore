@@ -13,6 +13,7 @@ tmp_*
 .claude/
 .cursor/
 .playwright-mcp/
+.playwright-cli/
 .graphify_python
 graphify-out/
 build/_tmp_*

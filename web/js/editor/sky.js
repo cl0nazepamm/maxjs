@@ -335,12 +335,12 @@ function createSky(deps = {}) {
         }
 
         function syncSpectralGiSky(params) {
-            if (!deps.isStudioMode || !deps.haloGi?.setSky) return false;
+            if (!deps.isStudioMode || !deps.speedballGi?.setSky) return false;
             if (!params) {
-                deps.haloGi.setSky(null);
+                deps.speedballGi.setSky(null);
                 return false;
             }
-            deps.haloGi.setSky(buildSpectralGiSky(params), { intensity: SPECTRAL_GI_SKY_INTENSITY });
+            deps.speedballGi.setSky(buildSpectralGiSky(params), { intensity: SPECTRAL_GI_SKY_INTENSITY });
             return true;
         }
 

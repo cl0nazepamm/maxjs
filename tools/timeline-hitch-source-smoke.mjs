@@ -90,7 +90,7 @@ assert.match(sync, /pathTraceUpdateReady = !guardedDeform \|\| hasExactIncomingN
 assert.match(sync, /pathTraceFullAfterNormalHandles\.add\(meta\.h\)[\s\S]*pathTraceFullAfterNormalHandles\.delete\(meta\.h\)/,
     'flatten-group dissolution retains structural PT debt through normal settle');
 assert.match(sync, /maxTimeline\.noteSceneSync\?\.\(\)/,
-    'geometry delivery extends HALO interaction gating through native settle');
+    'geometry delivery extends Speedball interaction gating through native settle');
 assert.match(sync, /schedulePathTracingLiveRebuild\('transform'\)/);
 assert.match(sync, /schedulePathTracingLiveRebuild\('light'\)/,
     'changed light packets use the packed-light lane instead of a BVH rebuild');
@@ -125,8 +125,8 @@ assert.match(boot, /queueRuntimeTransformRefresh[\s\S]*schedulePathTracingLiveRe
     'runtime surface motion keeps the cheap transform-aware tracer invalidation');
 
 const giGlue = await read('../web/js/editor/gi_volume_glue.js');
-assert.match(giGlue, /Math\.min\(nowMs - deps\.haloGiLastInteractionMs, timelineIdleMs\)/,
-    'HALO idle gate includes scrub/step/stop activity');
+assert.match(giGlue, /Math\.min\(nowMs - deps\.speedballGiLastInteractionMs, timelineIdleMs\)/,
+    'Speedball idle gate includes scrub/step/stop activity');
 
 const lights = await read('../web/js/editor/lights.js');
 assert.match(lights, /function lightTracePayloadSignature\(/,
@@ -151,6 +151,6 @@ assert.match(updateDeforms, /if \(refitted === 0 \|\| !updateTlas\)/,
 const probes = await read('../web/vendor/speedball-gi/js/gi_probes.js');
 assert.match(probes, /const RAYS_PER_TICK_MIN = 2_048/);
 assert.match(probes, /if \(!moving && wasMoving\) \{[\s\S]*probeBudgetAfterInteraction\(tickBudgetRays\)/,
-    'HALO resumes a stopped scrub with GPU headroom for the settle lane');
+    'Speedball resumes a stopped scrub with GPU headroom for the settle lane');
 
 console.log('timeline-hitch-source-smoke: OK');

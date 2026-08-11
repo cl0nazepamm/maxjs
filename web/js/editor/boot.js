@@ -452,7 +452,7 @@
         // MaxLightsNode is the adaptive factory in every node-renderer mode.
         // Unlinked lights stay on Three's own dynamic/native light nodes; only
         // a light with an explicit include/exclude mode enters the masked path.
-        // The same factory also carries the opt-in HALO-GI nodes, replacing the
+        // The same factory also carries the opt-in Speedball GI nodes, replacing the
         // old Standard=GiLights / Spectral=MaxLights split.
         // Pathtracing = isolated legacy WebGL2 progressive path tracer.
         //               This is live-viewer only and is not exported to snapshots.
@@ -465,11 +465,11 @@
         installMaxLightsRenderer(renderer);
 
         let giVolume = null;
-        let haloGi = null; // HALO-GI BVH-traced DDGI probe field (opt-in; see init below)
-        // HALO-GI idle tracking: the probe field holds its synchronous BVH rebuild + GPU
+        let speedballGi = null; // Speedball GI BVH-traced DDGI probe field (opt-in; see init below)
+        // Speedball GI idle tracking: the probe field holds its synchronous BVH rebuild + GPU
         // solve until the view rests (camera quiet, not playing, delta-sync settled), so
         // a freeze can never land during interaction. Updated in the render loop.
-        let haloGiLastInteractionMs = 0;
+        let speedballGiLastInteractionMs = 0;
 
         let controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
@@ -1159,7 +1159,7 @@
             get lightProbe() { return lightProbe; },
             get lightHandleMap() { return lightHandleMap; },
             get isPathTracingMode() { return isPathTracingMode; },
-            get haloGi() { return haloGi; },
+            get speedballGi() { return speedballGi; },
             get currentEnvParams() { return currentEnvParams; },
             get skyActive() { return skyActive; },
             set skyActive(value) { skyActive = value; },
@@ -1372,24 +1372,24 @@
             get lastLightsSignature() { return lastLightsSignature; },
             get giVolume() { return giVolume; },
             set giVolume(value) { giVolume = value; },
-            get haloGi() { return haloGi; },
-            set haloGi(value) { haloGi = value; },
-            get haloGiLastInteractionMs() { return haloGiLastInteractionMs; },
-            set haloGiLastInteractionMs(value) { haloGiLastInteractionMs = value; },
+            get speedballGi() { return speedballGi; },
+            set speedballGi(value) { speedballGi = value; },
+            get speedballGiLastInteractionMs() { return speedballGiLastInteractionMs; },
+            set speedballGiLastInteractionMs(value) { speedballGiLastInteractionMs = value; },
         });
         const {
-            HALO_GI_NUMERIC_CONTROLS,
+            SPEEDBALL_GI_NUMERIC_CONTROLS,
             GI_VOLUME_CAMERA_DEBOUNCE_MS,
             serializeRelayProbeGrids,
-            getHaloGiSettings,
-            clampHaloGiNumber,
-            formatHaloGiValue,
-            normalizeHaloGiSettings,
-            applyHaloGiTuning,
-            serializeHaloGiState,
-            applyHaloGiState,
-            setHaloGiSetting,
-            resetHaloGiToDefaults,
+            getSpeedballGiSettings,
+            clampSpeedballGiNumber,
+            formatSpeedballGiValue,
+            normalizeSpeedballGiSettings,
+            applySpeedballGiTuning,
+            serializeSpeedballGiState,
+            applySpeedballGiState,
+            setSpeedballGiSetting,
+            resetSpeedballGiToDefaults,
             shouldAutoStartStudioGiVolume,
             ensureStudioGiVolume,
             installStudioGiConsoleHandle,
@@ -1422,9 +1422,9 @@
             updateLightProbeFromCurrentScene,
             scheduleLightProbeFromCurrentScene,
             updateLightProbeFromHDRI,
-            buildHaloProbeVolumes,
-            serializeHaloGiProbeVolumes,
-            syncHaloProbeVolumes,
+            buildSpeedballProbeVolumes,
+            serializeSpeedballGiProbeVolumes,
+            syncSpeedballProbeVolumes,
             disposeProbeHelpers,
             updateProbeHelpers,
             setProbeHelpersVisible,
@@ -1511,8 +1511,8 @@
             if (next) {
                 relayController.enable();
                 relayController.emit({
-                    type: 'haloGiSettings',
-                    settings: { ...getHaloGiSettings() },
+                    type: 'speedballGiSettings',
+                    settings: { ...getSpeedballGiSettings() },
                 });
                 relayController.emit(serializeRelayProbeGrids());
             } else {
@@ -1705,7 +1705,7 @@
             markLightProbeSceneDirty,
             markLightProbeLightsDirty,
             scheduleLightProbeFromCurrentScene,
-            syncHaloProbeVolumes,
+            syncSpeedballProbeVolumes,
             schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
             applyCamera: (...args) => applyCamera(...args),
             applySky: (...args) => applySky(...args),
@@ -2334,33 +2334,33 @@
             bridge,
             onShaderLabSnapshotChange,
             applyCameraClipOverrides,
-            applyHaloGiState,
+            applySpeedballGiState,
             applyHdriReflectionOnlyState,
             applyLightProbeState,
             applyLocalHDRISettings,
             applyLocalHDRIToScene,
             applyRendererPerformanceSettings,
             clampDockWidth,
-            clampHaloGiNumber,
+            clampSpeedballGiNumber,
             clearLocalHDRI,
             computeVisibleSceneBounds,
             disposeMaxInstanceBuckets,
             disposeFlattenedGroups,
             enterAsciiMode,
             exitAsciiMode,
-            formatHaloGiValue,
+            formatSpeedballGiValue,
             getEffectivePixelRatio,
             getEffectivePostFxResolutionScale,
-            getHaloGiSettings,
+            getSpeedballGiSettings,
             isLocalHdriActive,
             loadLocalHDRIFile,
             maxjsDebugWarn,
             rebuildAsciiEffect,
             refreshLightProbeFromCurrentHDRI,
             reportBridgeError,
-            resetHaloGiToDefaults,
+            resetSpeedballGiToDefaults,
             setBackgroundColor,
-            setHaloGiSetting,
+            setSpeedballGiSetting,
             setRightDockWidth,
             setShaderLabSnapshot,
             syncCameraLockButtonUi,
@@ -2373,7 +2373,7 @@
             serializeSnapshotUiState: (...args) => serializeSnapshotUiState(...args),
             DEFAULT_CAMERA_NEAR,
             DEFAULT_TONE_MAPPING,
-            HALO_GI_NUMERIC_CONTROLS,
+            SPEEDBALL_GI_NUMERIC_CONTROLS,
             PERFORMANCE_DEFAULTS,
             toneMappingModes,
             btnLightProbe,
@@ -2478,7 +2478,7 @@
                     enabled: authoredEnvironmentActive ? false : localHdriEnabled,
                     fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
                 },
-                haloGi: serializeHaloGiState(),
+                speedballGi: serializeSpeedballGiState(),
                 performance: {
                     fpsCap: performanceSettings.fpsCap,
                     renderScale: performanceSettings.renderScale,
@@ -2668,9 +2668,9 @@
             set pathTracingRasterWarmupFrames(value) { pathTracingRasterWarmupFrames = value; },
             get asciiActive() { return asciiActive; },
             get asciiEffect() { return asciiEffect; },
-            get haloGiLastInteractionMs() { return haloGiLastInteractionMs; },
-            set haloGiLastInteractionMs(value) { haloGiLastInteractionMs = value; },
-            get haloGi() { return haloGi; },
+            get speedballGiLastInteractionMs() { return speedballGiLastInteractionMs; },
+            set speedballGiLastInteractionMs(value) { speedballGiLastInteractionMs = value; },
+            get speedballGi() { return speedballGi; },
             get isPathTracingMode() { return isPathTracingMode; },
             get css3dOverlay() { return css3dOverlay; },
             get blobOverlayCtx() { return blobOverlayCtx; },

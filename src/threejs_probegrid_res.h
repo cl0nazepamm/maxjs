@@ -1,6 +1,6 @@
 #pragma once
 
-// Resource IDs for the max.js HALO-GI Probe Grid helper.
+// Resource IDs for the max.js Speedball GI Probe Grid helper.
 // Ranges chosen above all existing src/*_res.h usage (IDD/IDS <= 760, IDC <= 7607).
 #define IDD_THREEJS_PROBEGRID            800
 #define IDS_THREEJS_PROBEGRID_PARAMS     801

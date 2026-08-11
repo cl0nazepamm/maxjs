@@ -167,7 +167,7 @@ first..last anchor functions.
 | 2 | `renderer_core.js` | `getEffectivePixelRatio`..`createRenderer`, `getViewportFrameRect`..`applyRenderViewportLayout`, `isWgl2FallbackBackendActive`..`getNextRendererPipelineMode`, `restartWithRendererBackend` | 900 | backend prefs, pixel-ratio state |
 | 3 | `environment.js` | `loadEnvironmentTexture`, `getEnvironmentBackgroundMap`..`resetEnvironmentLighting`, `loadHDRI`..`syncHdriPanel`, HDRI IndexedDB stash | 900 | env maps, local-HDRI object URLs, PMREM retention |
 | 4 | `sky.js` | `addSkyProbeSample`..`updateSkyAmbientLightProbe`, `skyNumber`..`removeSky` | 800 | sky mesh/params, sky probe scratch |
-| 5 | `gi_volume_glue.js` | `clampHaloGiNumber`..`installStudioGiConsoleHandle`, `supportsWebGLLightProbeGrid`..`updateLightProbeFromHDRI`, `giVolumeNowMs`..`noteGiVolumeCameraSync`, `buildHaloProbeVolumes`..`setProbeHelpersVisible` | 1200 | haloGiSettings, giVolume debounce serials/tokens, probe helpers |
+| 5 | `gi_volume_glue.js` | `clampSpeedballGiNumber`..`installStudioGiConsoleHandle`, `supportsWebGLLightProbeGrid`..`updateLightProbeFromHDRI`, `giVolumeNowMs`..`noteGiVolumeCameraSync`, `buildSpeedballProbeVolumes`..`setProbeHelpersVisible` | 1200 | speedballGiSettings, giVolume debounce serials/tokens, probe helpers |
 | 6 | `pathtracing_glue.js` | `isPathTracingViewActive`..`applyPathTracingSettings` | 300 | PT warmup/schedule state |
 | 7 | `splats.js` | `queueSplatMutation`..`applySplatUpdates` | 200 | splat viewer handle, tracked splats |
 | 8 | `texture_pipeline.js` | `normalizeTextureTransform`..`createHTMLTextureOverrideMaterial` (incl. MaterialX templates, video, bake-texture loaders, HTML texture sizing) | 1050 | texture caches, template cache, bake-load failures |

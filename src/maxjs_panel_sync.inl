@@ -4930,7 +4930,7 @@
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
-    // HALO-GI Probe Grid out-of-band sync: a tiny JSON side-channel carrying each
+    // Speedball GI Probe Grid out-of-band sync: a tiny JSON side-channel carrying each
     // probe grid's box size + manual divisions + enabled flag, keyed by node handle.
     // The grid's TRANSFORM rides the normal helper-node sync (both JSON and binary
     // paths); the viewer fits the GI volume from (synced transform x this size).
@@ -5370,8 +5370,9 @@
         }
         if (ltype == kLight_Spot) {
             const float angleDeg = HasParam(pb, pl_angle) ? pb->GetFloat(pl_angle, t) : 45.0f;
+            const float penumbra = HasParam(pb, pl_penumbra) ? pb->GetFloat(pl_penumbra, t) : 0.0f;
             ss << L",\"angle\":" << (angleDeg * 3.14159265f / 180.f);
-            ss << L",\"penumbra\":" << (HasParam(pb, pl_penumbra) ? pb->GetFloat(pl_penumbra, t) : 0.0f);
+            ss << L",\"penumbra\":" << std::clamp(penumbra, 0.0f, 1.0f);
         }
         if (ltype == kLight_RectArea) {
             ss << L",\"width\":" << (HasParam(pb, pl_width) ? pb->GetFloat(pl_width, t) : 0.0f);
@@ -6498,7 +6499,7 @@
         }
         if (ltype == kLight_Spot) {
             ss << L",\"angle\":" << (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f);
-            ss << L",\"penumbra\":" << pb->GetFloat(pl_penumbra, t);
+            ss << L",\"penumbra\":" << std::clamp(pb->GetFloat(pl_penumbra, t), 0.0f, 1.0f);
         }
         if (ltype == kLight_RectArea) {
             ss << L",\"width\":" << pb->GetFloat(pl_width, t);
@@ -6562,7 +6563,7 @@
         ld.angle = (ltype == kLight_Spot) && pb && HasParam(pb, pl_angle)
             ? (pb->GetFloat(pl_angle, t) * 3.14159265f / 180.f) : 0.0f;
         ld.penumbra = (ltype == kLight_Spot) && pb && HasParam(pb, pl_penumbra)
-            ? pb->GetFloat(pl_penumbra, t) : 0.0f;
+            ? std::clamp(pb->GetFloat(pl_penumbra, t), 0.0f, 1.0f) : 0.0f;
         ld.width = (ltype == kLight_RectArea) && pb && HasParam(pb, pl_width)
             ? pb->GetFloat(pl_width, t) : 0.0f;
         ld.height = (ltype == kLight_RectArea) && pb && HasParam(pb, pl_height)

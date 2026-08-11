@@ -32,7 +32,7 @@ function createSceneSync(deps = {}) {
         // Handles that stream geometry (deforming characters, live edits).
         // Re-flattening them just re-arms the dissolve on the next packet —
         // a per-scrub merge/dissolve oscillation that churns materials and
-        // every structural change-detector (HALO-GI/PT BVH rebuilds).
+        // every structural change-detector (Speedball GI/PT BVH rebuilds).
         const flattenDeformExcludedHandles = new Set();
         // If a position-only packet dissolves a flattened group, PT owes a
         // structural rebuild—but it must wait for that handle's exact normals.
@@ -606,7 +606,7 @@ function createSceneSync(deps = {}) {
             // clusters, merge only new or edited ones. Untouched merges keep
             // their meshes AND their already-compiled materials — a full
             // dispose-and-remerge here recompiles pipelines and reads as a
-            // structural scene change to HALO-GI/PT on every group edit.
+            // structural scene change to Speedball GI/PT on every group edit.
             let changed = false;
             for (const headHandle of [...flattenedClusterSignatures.keys()]) {
                 if (plan.clusterSignatures.get(headHandle) !== flattenedClusterSignatures.get(headHandle)) {
@@ -832,7 +832,7 @@ function createSceneSync(deps = {}) {
             // entry points, so a full pipeline rebuild is unnecessary here.
             if (sceneChanged) deps.maxjsFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
-            deps.syncHaloProbeVolumes();
+            deps.syncSpeedballProbeVolumes();
 
             if (firstSync && snapshot.nodes.length > 0) {
                 firstSync = false;

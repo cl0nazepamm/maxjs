@@ -185,7 +185,7 @@ function fakeResponse(status) {
     assert.equal(controller.state, RELAY_STATES.OFF);
     controller.enable();
     // This viewer-owned state is cached while producer_hello is in flight.
-    controller.emit({ type: 'haloGiSettings', settings: { intensity: 2 } });
+    controller.emit({ type: 'speedballGiSettings', settings: { intensity: 2 } });
     await waitFor(() => resyncs.length === 1, 'initial relay_resync');
     assert.equal(controller.state, RELAY_STATES.RECOVERING);
     assert.equal(resyncs[0].reason, 'relay-enabled');
@@ -198,7 +198,7 @@ function fakeResponse(status) {
         'scene plus cached panel and current-cycle host state');
 
     const baseline = posts.find((entry) => entry.isBinary)?.decoded;
-    const halo = posts.find((entry) => entry.json?.data?.type === 'haloGiSettings')?.json;
+    const speedball = posts.find((entry) => entry.json?.data?.type === 'speedballGiSettings')?.json;
     const env = posts.find((entry) => entry.json?.data?.type === 'env_update')?.json;
     assert.ok(baseline);
     assert.equal(baseline.meta.type, 'scene_bin');
@@ -209,8 +209,8 @@ function fakeResponse(status) {
     assert.equal(baseline.relay.sceneRevision, 1);
     assert.equal(baseline.relay.sequence, 0);
     assert.deepEqual([...baseline.payload], [1, 2, 3, 4]);
-    assert.equal(halo.relay.sceneRevision, 1);
-    assert.equal(halo.relay.sequence, 1);
+    assert.equal(speedball.relay.sceneRevision, 1);
+    assert.equal(speedball.relay.sequence, 1);
     assert.equal(env.relay.sceneRevision, 1);
     assert.equal(env.relay.sequence, 2);
     await waitFor(() => controller.state === RELAY_STATES.STREAMING, 'streaming state');
@@ -263,7 +263,7 @@ function fakeResponse(status) {
     assert.equal(secondBaseline.relay.sceneRevision, 2);
     assert.equal(secondBaseline.relay.sceneRequestId, 1);
     assert.equal(secondBaseline.relay.sequence, 0);
-    await waitFor(() => posts.filter((entry) => entry.json?.data?.type === 'haloGiSettings').length === 2,
+    await waitFor(() => posts.filter((entry) => entry.json?.data?.type === 'speedballGiSettings').length === 2,
         'persistent panel state replay');
     assert.equal(posts.filter((entry) => entry.json?.data?.type === 'env_update').length, 1,
         'old host state must not overwrite a later baseline');

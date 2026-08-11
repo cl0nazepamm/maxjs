@@ -178,6 +178,29 @@
             return false;
         }
 
+        // Speedball owns the snapshot DDGI implementation. Its public entry is
+        // resolved by the snapshot import map, so every standalone export must
+        // carry the package alongside the copied runtime shell.
+        const std::wstring speedballVendor = webDir + L"\\vendor\\speedball-gi";
+        if (!DirectoryExists(speedballVendor + L"\\js")) {
+            error = L"Snapshot runtime dependency missing: web/vendor/speedball-gi/js";
+            return false;
+        }
+        if (!CopyDirectoryRecursive(speedballVendor, outDir + L"\\vendor\\speedball-gi")) {
+            error = L"Failed to copy snapshot runtime Speedball vendor";
+            return false;
+        }
+
+        const std::wstring speedballBvhDependency = webDir + L"\\node_modules\\three-mesh-bvh";
+        if (!DirectoryExists(speedballBvhDependency + L"\\src")) {
+            error = L"Snapshot runtime dependency missing: web/node_modules/three-mesh-bvh/src";
+            return false;
+        }
+        if (!CopyDirectoryRecursive(speedballBvhDependency, outDir + L"\\node_modules\\three-mesh-bvh")) {
+            error = L"Failed to copy snapshot runtime Speedball BVH dependency";
+            return false;
+        }
+
         const std::wstring threeVendor = webDir + L"\\vendor\\three-r185";
         if (!DirectoryExists(threeVendor + L"\\build")) {
             error = L"Snapshot runtime dependency missing: web/vendor/three-r185/build";

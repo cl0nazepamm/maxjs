@@ -1009,7 +1009,7 @@ function createPostFxGlue(deps = {}) {
                             </label>
                         </div>
                     </section>
-                    <section class="fx-section collapsed" data-fx-section="halogi" data-keep-on-shader-lab>
+                    <section class="fx-section collapsed" data-fx-section="speedball-gi" data-keep-on-shader-lab>
                         <div class="fx-section-header">
                             <div class="fx-section-title">Global Illumination</div>
                             <div style="display:flex;align-items:center;gap:6px">
@@ -1017,24 +1017,24 @@ function createPostFxGlue(deps = {}) {
                                 <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
                             </div>
                         </div>
-                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (HALO-GI). WebGPU, any render mode.</div>
+                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (Speedball GI). WebGPU, any render mode.</div>
                         <div class="fx-grid">
-                            ${deps.HALO_GI_NUMERIC_CONTROLS.map(control => `
+                            ${deps.SPEEDBALL_GI_NUMERIC_CONTROLS.map(control => `
                             <label class="fx-control" for="fx-gi-${control.key}">
-                                <div class="fx-control-head"><span>${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${deps.formatHaloGiValue(control.key)}</span></div>
-                                <input class="fx-range" id="fx-gi-${control.key}" type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${deps.getHaloGiSettings()[control.key]}">
+                                <div class="fx-control-head"><span>${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${deps.formatSpeedballGiValue(control.key)}</span></div>
+                                <input class="fx-range" id="fx-gi-${control.key}" type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${deps.getSpeedballGiSettings()[control.key]}">
                             </label>`).join('')}
                             <label class="fx-control" for="fx-gi-cascades">
                                 <div class="fx-control-head"><span>Cascades</span></div>
                                 <select id="fx-gi-cascades" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
-                                    <option value="1" ${deps.getHaloGiSettings().cascades === 1 ? 'selected' : ''}>Single grid</option>
-                                    <option value="2" ${deps.getHaloGiSettings().cascades === 2 ? 'selected' : ''}>Cascaded (2)</option>
+                                    <option value="1" ${deps.getSpeedballGiSettings().cascades === 1 ? 'selected' : ''}>Single grid</option>
+                                    <option value="2" ${deps.getSpeedballGiSettings().cascades === 2 ? 'selected' : ''}>Cascaded (2)</option>
                                 </select>
                             </label>
-                            <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${deps.getHaloGiSettings().continuous ? 'checked' : ''}></label>
-                            <label class="fx-check" for="fx-gi-reflections" title="Structural Speedball path: enabling allocates and runs the rough/glossy DDGI reflection caches; disabling removes that GPU cost."><span>Rough reflections (GPU cost)</span><input id="fx-gi-reflections" type="checkbox" ${deps.getHaloGiSettings().roughReflections ? 'checked' : ''}></label>
-                            <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${deps.getHaloGiSettings().hysteresisNormalize ? 'checked' : ''}></label>
-                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${deps.getHaloGiSettings().showProbes ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${deps.getSpeedballGiSettings().continuous ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-reflections" title="Structural Speedball path: enabling allocates and runs the rough/glossy DDGI reflection caches; disabling removes that GPU cost."><span>Rough reflections (GPU cost)</span><input id="fx-gi-reflections" type="checkbox" ${deps.getSpeedballGiSettings().roughReflections ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${deps.getSpeedballGiSettings().hysteresisNormalize ? 'checked' : ''}></label>
+                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${deps.getSpeedballGiSettings().showProbes ? 'checked' : ''}></label>
                         </div>
                     </section>
                     ${sectionsHtml}
@@ -1527,7 +1527,7 @@ function createPostFxGlue(deps = {}) {
             hdriReflectionOnlyCheck.checked = deps.localHdriReflectionOnly;
             deps.syncHdriPanel();
 
-            // HALO-GI controls (window.maxjsHaloGI exists only in Studio + WebGPU)
+            // Speedball GI controls (window.maxjsSpeedballGI exists only in Studio + WebGPU)
             {
                 const giToggle = document.getElementById('fx-gi-toggle');
                 const giReset = document.getElementById('fx-gi-reset');
@@ -1538,8 +1538,8 @@ function createPostFxGlue(deps = {}) {
                 const giShowProbes = document.getElementById('fx-gi-show-probes');
                 const canSyncGiInput = (input) => !!input && document.activeElement !== input;
                 const syncGiPanel = () => {
-                    const gi = window.maxjsHaloGI;
-                    const giSettings = deps.getHaloGiSettings();
+                    const gi = window.maxjsSpeedballGI;
+                    const giSettings = deps.getSpeedballGiSettings();
                     const on = !!(gi && gi.isOn && gi.isOn());
                     if (giToggle) {
                         giToggle.textContent = gi ? (on ? 'On' : 'Off') : 'N/A';
@@ -1547,7 +1547,7 @@ function createPostFxGlue(deps = {}) {
                         giToggle.disabled = !gi;
                     }
                     if (giReset) giReset.disabled = !gi;
-                    for (const control of deps.HALO_GI_NUMERIC_CONTROLS) {
+                    for (const control of deps.SPEEDBALL_GI_NUMERIC_CONTROLS) {
                         const input = document.getElementById(`fx-gi-${control.key}`);
                         const val = document.getElementById(`fx-gi-${control.key}-val`);
                         const value = giSettings[control.key];
@@ -1555,7 +1555,7 @@ function createPostFxGlue(deps = {}) {
                             input.disabled = !gi || (control.key === 'reflectionIntensity' && !giSettings.roughReflections);
                             if (canSyncGiInput(input)) input.value = String(value);
                         }
-                        if (val) val.textContent = deps.formatHaloGiValue(control.key, value);
+                        if (val) val.textContent = deps.formatSpeedballGiValue(control.key, value);
                     }
                     if (giCascades) {
                         giCascades.disabled = !gi;
@@ -1579,47 +1579,47 @@ function createPostFxGlue(deps = {}) {
                     }
                 };
                 window.__maxjsSyncGiPanel = syncGiPanel;
-                if (giReset) giReset.onclick = () => deps.resetHaloGiToDefaults({ persist: true });
+                if (giReset) giReset.onclick = () => deps.resetSpeedballGiToDefaults({ persist: true });
                 if (giToggle) giToggle.onclick = () => {
-                    const gi = window.maxjsHaloGI;
+                    const gi = window.maxjsSpeedballGI;
                     if (!gi) return;
-                    deps.setHaloGiSetting('enabled', !(gi.isOn && gi.isOn()), { persist: true });
+                    deps.setSpeedballGiSetting('enabled', !(gi.isOn && gi.isOn()), { persist: true });
                     syncGiPanel();
                 };
-                const HALO_GI_RANGE_DEFAULTS = Object.freeze({
+                const SPEEDBALL_GI_RANGE_DEFAULTS = Object.freeze({
                     intensity: 10, divisions: 16, rays: 64, hysteresis: 0.9,
                     normalBias: 1.75, radianceClamp: 8, depthSharpness: 40,
                     cheby: 0.5, classify: 0, filter: 1, smoothness: 1, detail: 1,
                     reflectionIntensity: 1.0,
                     changeThreshold: 2.5, snapAmount: 0.30, fireflyClamp: 6.0,
                 });
-                for (const control of deps.HALO_GI_NUMERIC_CONTROLS) {
+                for (const control of deps.SPEEDBALL_GI_NUMERIC_CONTROLS) {
                     const input = document.getElementById(`fx-gi-${control.key}`);
                     const val = document.getElementById(`fx-gi-${control.key}-val`);
                     if (!input) continue;
                     const apply = (persist = false) => {
-                        const v = deps.clampHaloGiNumber(control.key, input.value);
+                        const v = deps.clampSpeedballGiNumber(control.key, input.value);
                         input.value = String(v);
-                        if (val) val.textContent = deps.formatHaloGiValue(control.key, v);
-                        deps.setHaloGiSetting(control.key, v, { persist });
+                        if (val) val.textContent = deps.formatSpeedballGiValue(control.key, v);
+                        deps.setSpeedballGiSetting(control.key, v, { persist });
                     };
                     input.oninput = () => apply(false);
                     input.onchange = () => apply(true);
                     bindRangeReset(input, {
-                        defaultValue: HALO_GI_RANGE_DEFAULTS[control.key] ?? control.min,
+                        defaultValue: SPEEDBALL_GI_RANGE_DEFAULTS[control.key] ?? control.min,
                         apply: (raw) => {
-                            const next = deps.clampHaloGiNumber(control.key, raw);
+                            const next = deps.clampSpeedballGiNumber(control.key, raw);
                             input.value = String(next);
-                            if (val) val.textContent = deps.formatHaloGiValue(control.key, next);
-                            deps.setHaloGiSetting(control.key, next, { persist: true });
+                            if (val) val.textContent = deps.formatSpeedballGiValue(control.key, next);
+                            deps.setSpeedballGiSetting(control.key, next, { persist: true });
                         },
                     });
                 }
-                if (giCascades) giCascades.onchange = () => deps.setHaloGiSetting('cascades', giCascades.value, { persist: true });
-                if (giContinuous) giContinuous.onchange = () => deps.setHaloGiSetting('continuous', giContinuous.checked, { persist: true });
-                if (giReflections) giReflections.onchange = () => deps.setHaloGiSetting('roughReflections', giReflections.checked, { persist: true });
-                if (giHystNorm) giHystNorm.onchange = () => deps.setHaloGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
-                if (giShowProbes) giShowProbes.onchange = () => deps.setHaloGiSetting('showProbes', giShowProbes.checked, { persist: true });
+                if (giCascades) giCascades.onchange = () => deps.setSpeedballGiSetting('cascades', giCascades.value, { persist: true });
+                if (giContinuous) giContinuous.onchange = () => deps.setSpeedballGiSetting('continuous', giContinuous.checked, { persist: true });
+                if (giReflections) giReflections.onchange = () => deps.setSpeedballGiSetting('roughReflections', giReflections.checked, { persist: true });
+                if (giHystNorm) giHystNorm.onchange = () => deps.setSpeedballGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
+                if (giShowProbes) giShowProbes.onchange = () => deps.setSpeedballGiSetting('showProbes', giShowProbes.checked, { persist: true });
                 syncGiPanel();
             }
 
@@ -2188,8 +2188,8 @@ function createPostFxGlue(deps = {}) {
                     deps.cameraClip.far = Number.isFinite(saved.cameraClip.far) && saved.cameraClip.far > 0 ? saved.cameraClip.far : null;
                     deps.applyCameraClipOverrides(deps.camera);
                 }
-                if (saved.haloGi && typeof saved.haloGi === 'object') {
-                    deps.applyHaloGiState(saved.haloGi);
+                if (saved.speedballGi && typeof saved.speedballGi === 'object') {
+                    deps.applySpeedballGiState(saved.speedballGi);
                 }
                 if (saved.performance) {
                     if (Number.isFinite(saved.performance.fpsCap)) {

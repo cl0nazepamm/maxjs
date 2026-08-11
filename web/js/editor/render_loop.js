@@ -157,7 +157,7 @@ function createRenderLoop(deps = {}) {
             if (!deps.renderToImageActive) {
                 deps.updateGiVolumeIdleWork();
                 deps.syncGiVolumeActive();
-                // HALO-GI probe field tick — every frame (the field idle-gates and
+                // Speedball GI probe field tick — every frame (the field idle-gates and
                 // budget-throttles itself); no-op unless enabled; never recompiles
                 // materials. ONLY camera movement marks interaction — matching the
                 // speedball standalone. Delta-sync must NOT mark it: Max edits
@@ -166,9 +166,9 @@ function createRenderLoop(deps = {}) {
                 // ("delayed" GI). The field handles live edits itself — cheap
                 // in-place light refresh + settle-debounced geometry rebuild
                 // (24-tick checks × 2 stable) that can never land mid-drag.
-                const haloNowMs = performance.now();
-                if (controlsChanged) deps.haloGiLastInteractionMs = haloNowMs;
-                deps.haloGi?.tick(haloNowMs);
+                const speedballNowMs = performance.now();
+                if (controlsChanged) deps.speedballGiLastInteractionMs = speedballNowMs;
+                deps.speedballGi?.tick(speedballNowMs);
                 // White Phosphor = the imager senses NIR. One state, three
                 // consumers, each a no-op when unchanged so the per-frame calls
                 // are free — and they catch every state path (panel, restore,
@@ -182,7 +182,7 @@ function createRenderLoop(deps = {}) {
                     && (psMode === 'infrared' || psMode === 'nightshot');
                 deps.pathTracingFx?.setRenderMode?.(
                     deps.isPathTracingMode && nirSensing ? 'nv' : 'visible');
-                deps.haloGi?.field?.setNirSensing?.(nirSensing);
+                deps.speedballGi?.field?.setNirSensing?.(nirSensing);
                 setNirDirectSensing(nirSensing);
                 // Raster band swap for ctx.spectral material tags: tagged
                 // diffuse scalars flip to their authored NIR level under NV
@@ -195,7 +195,7 @@ function createRenderLoop(deps = {}) {
                 const psIrGain = Number(deps.maxjsFx.getPowerShotOptions?.()?.irIlluminator);
                 const irGain = Number.isFinite(psIrGain) ? psIrGain : 1;
                 setNirIlluminatorGain(irGain);
-                deps.haloGi?.field?.setNirGain?.(irGain);
+                deps.speedballGi?.field?.setNirGain?.(irGain);
                 deps.pathTracingFx?.setNirGain?.(irGain);
                 deps.updateProbeHelpers();
             }

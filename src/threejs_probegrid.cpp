@@ -17,8 +17,8 @@ class MaxJSProbeGridClassDesc : public ClassDesc2 {
 public:
     int IsPublic() override { return TRUE; }
     void* Create(BOOL) override;
-    const TCHAR* ClassName() override { return _T("HALO-GI Probe Grid"); }
-    const TCHAR* NonLocalizedClassName() override { return _T("HALO-GI Probe Grid"); }
+    const TCHAR* ClassName() override { return _T("Speedball GI Probe Grid"); }
+    const TCHAR* NonLocalizedClassName() override { return _T("Speedball GI Probe Grid"); }
     SClass_ID SuperClassID() override { return HELPER_CLASS_ID; }
     Class_ID ClassID() override { return THREEJS_PROBE_GRID_CLASS_ID; }
     const TCHAR* Category() override { return _T("max.js"); }
@@ -59,7 +59,7 @@ public:
     void DeleteThis() override { delete this; }
     Class_ID ClassID() override { return THREEJS_PROBE_GRID_CLASS_ID; }
     SClass_ID SuperClassID() override { return HELPER_CLASS_ID; }
-    void GetClassName(MSTR& s, bool) const override { s = _T("HALO-GI Probe Grid"); }
+    void GetClassName(MSTR& s, bool) const override { s = _T("Speedball GI Probe Grid"); }
     void InitNodeName(MSTR& s) override { s = _T("maxjs_ProbeGrid"); }
     int IsRenderable() override { return 0; }
     int UsesWireColor() override { return 1; }
@@ -156,7 +156,7 @@ CreateMouseCallBack* MaxJSProbeGrid::GetCreateMouseCallBack() { return &g_probeG
 void* MaxJSProbeGridClassDesc::Create(BOOL) { return new MaxJSProbeGrid(); }
 
 static ParamBlockDesc2 g_probeGridPB(
-    threejs_probegrid_params, _T("HALO-GI Probe Grid"), IDS_THREEJS_PROBEGRID_PARAMS, &g_probeGridDesc,
+    threejs_probegrid_params, _T("Speedball GI Probe Grid"), IDS_THREEJS_PROBEGRID_PARAMS, &g_probeGridDesc,
     P_AUTO_CONSTRUCT + P_AUTO_UI, 0,
     IDD_THREEJS_PROBEGRID, IDS_THREEJS_PROBEGRID_PARAMS, 0, 0, nullptr,
     pg_length, _T("length"), TYPE_WORLD, P_ANIMATABLE, 0,

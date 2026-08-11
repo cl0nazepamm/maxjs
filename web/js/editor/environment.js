@@ -128,7 +128,7 @@ function createEnvironment(deps = {}) {
             const spectralSkyDdgiOwnsDiffuse = isNativeWebGPUBackend()
                 && deps.scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse === true;
             deps.scene.userData.maxjsHdriReflectionOnly = hdriReflectionOnly;
-            // HALO's sky is occlusion-aware diffuse lighting. Keep the PMREM for
+            // Speedball's sky is occlusion-aware diffuse lighting. Keep the PMREM for
             // glossy reflections, but do not also inject its flat diffuse IBL.
             deps.maxjsHdriDiffuseIntensity.value = hdriReflectionOnly || spectralSkyDdgiOwnsDiffuse ? 0.0 : 1.0;
             deps.applyLightProbeState();

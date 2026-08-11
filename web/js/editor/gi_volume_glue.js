@@ -1,12 +1,12 @@
-// gi_volume_glue.js - HALO-GI, GI volume, and light-probe refresh glue.
+// gi_volume_glue.js - Speedball GI, GI volume, and light-probe refresh glue.
 import * as THREE from 'three';
 import * as THREE_STD from 'three-std';
 import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
 import { LightProbeGrid } from 'three/addons/lighting/LightProbeGrid.js';
-import { createIrradianceVolume, createProbeField as createHaloProbeField } from 'speedball-gi';
+import { createIrradianceVolume, createProbeField as createSpeedballProbeField } from 'speedball-gi';
 
 function createGiVolumeGlue(deps = {}) {
-        // HALO-GI Probe Grid side-channel: handle -> { size:[l,w,h], div:[x,y,z], enabled }.
+        // Speedball GI Probe Grid side-channel: handle -> { size:[l,w,h], div:[x,y,z], enabled }.
         // Transform rides the normal helper-node sync; this carries size + manual divisions.
         const probeGridData = new Map();
         let probeVolumeSig = '';
@@ -23,11 +23,11 @@ function createGiVolumeGlue(deps = {}) {
                 })),
             };
         }
-        const HALO_GI_DEFAULTS = Object.freeze({
+        const SPEEDBALL_GI_DEFAULTS = Object.freeze({
             // Speedball probes exist only in spectral, where they default ON
-            // (the DDGI field IS the live view). window.MAXJS_HALO_GI = false
+            // (the DDGI field IS the live view). window.MAXJS_SPEEDBALL_GI = false
             // force-disables; standard mode never runs them.
-            enabled: deps.isStudioMode && window.MAXJS_HALO_GI !== false,
+            enabled: deps.isStudioMode && window.MAXJS_SPEEDBALL_GI !== false,
             intensity: 10,
             divisions: 16,
             rays: 64,
@@ -50,7 +50,7 @@ function createGiVolumeGlue(deps = {}) {
             reflectionIntensity: 1.0,
             showProbes: false,
         });
-        const HALO_GI_NUMERIC_CONTROLS = Object.freeze([
+        const SPEEDBALL_GI_NUMERIC_CONTROLS = Object.freeze([
             { key: 'intensity', label: 'Intensity', min: 0, max: 32, step: 0.05, digits: 1 },
             { key: 'divisions', label: 'Divisions', min: 2, max: 32, step: 1, digits: 0 },
             { key: 'rays', label: 'Rays / Probe', min: 32, max: 256, step: 16, digits: 0 },
@@ -68,7 +68,7 @@ function createGiVolumeGlue(deps = {}) {
             { key: 'snapAmount', label: 'Snap Amount', min: 0, max: 0.9, step: 0.01, digits: 2 },
             { key: 'fireflyClamp', label: 'Firefly Clamp', min: 1, max: 20, step: 0.5, digits: 1 },
         ]);
-        let haloGiSettings = { ...HALO_GI_DEFAULTS };
+        let speedballGiSettings = { ...SPEEDBALL_GI_DEFAULTS };
         let giVolumeSyncToken = '';
         let giVolumeRefreshTimer = 0;
         let giVolumeFadeFrame = 0;
@@ -98,30 +98,30 @@ function createGiVolumeGlue(deps = {}) {
         const isAdvancedWebGpuLighting = deps.isStudioMode && deps.renderer.backend?.isWebGPUBackend === true;
         const isWebGpuBackend = deps.renderer.backend?.isWebGPUBackend === true;
 
-        function getHaloGiSettings() {
-            return haloGiSettings;
+        function getSpeedballGiSettings() {
+            return speedballGiSettings;
         }
 
-        function clampHaloGiNumber(key, value) {
-            const control = HALO_GI_NUMERIC_CONTROLS.find(c => c.key === key);
-            if (!control) return Number.isFinite(value) ? value : HALO_GI_DEFAULTS[key];
+        function clampSpeedballGiNumber(key, value) {
+            const control = SPEEDBALL_GI_NUMERIC_CONTROLS.find(c => c.key === key);
+            if (!control) return Number.isFinite(value) ? value : SPEEDBALL_GI_DEFAULTS[key];
             const n = Number(value);
-            const fallback = HALO_GI_DEFAULTS[key];
+            const fallback = SPEEDBALL_GI_DEFAULTS[key];
             if (!Number.isFinite(n)) return fallback;
             const stepped = control.step >= 1 ? Math.round(n / control.step) * control.step : n;
             return THREE.MathUtils.clamp(stepped, control.min, control.max);
         }
-        function formatHaloGiValue(key, value = haloGiSettings[key]) {
-            const control = HALO_GI_NUMERIC_CONTROLS.find(c => c.key === key);
+        function formatSpeedballGiValue(key, value = speedballGiSettings[key]) {
+            const control = SPEEDBALL_GI_NUMERIC_CONTROLS.find(c => c.key === key);
             if (!control) return String(value);
             const n = Number(value);
-            if (!Number.isFinite(n)) return String(HALO_GI_DEFAULTS[key]);
+            if (!Number.isFinite(n)) return String(SPEEDBALL_GI_DEFAULTS[key]);
             return control.digits === 0 ? String(Math.round(n)) : n.toFixed(control.digits);
         }
-        function normalizeHaloGiSettings(input = {}, base = HALO_GI_DEFAULTS) {
+        function normalizeSpeedballGiSettings(input = {}, base = SPEEDBALL_GI_DEFAULTS) {
             const out = { ...base };
-            for (const control of HALO_GI_NUMERIC_CONTROLS) {
-                if (control.key in input) out[control.key] = clampHaloGiNumber(control.key, input[control.key]);
+            for (const control of SPEEDBALL_GI_NUMERIC_CONTROLS) {
+                if (control.key in input) out[control.key] = clampSpeedballGiNumber(control.key, input[control.key]);
             }
             if ('enabled' in input) out.enabled = input.enabled === true;
             if ('continuous' in input) out.continuous = input.continuous === true;
@@ -131,61 +131,61 @@ function createGiVolumeGlue(deps = {}) {
             if ('cascades' in input) out.cascades = Math.round(Number(input.cascades)) === 2 ? 2 : 1;
             return out;
         }
-        function applyHaloGiTuning(field = deps.haloGi?.field) {
+        function applySpeedballGiTuning(field = deps.speedballGi?.field) {
             if (!field) return;
-            field.setIntensity?.(haloGiSettings.intensity);
-            field.setDivisions?.(haloGiSettings.divisions);
-            field.setRays?.(haloGiSettings.rays);
-            field.setCascades?.(haloGiSettings.cascades);
-            field.setContinuous?.(haloGiSettings.continuous);
-            field.setHysteresis?.(haloGiSettings.hysteresis);
-            field.setHysteresisNormalization?.(haloGiSettings.hysteresisNormalize);
-            field.setNormalBias?.(haloGiSettings.normalBias);
-            field.setRadianceClamp?.(haloGiSettings.radianceClamp);
-            field.setDepthSharpness?.(haloGiSettings.depthSharpness);
-            field.setChebyStrength?.(haloGiSettings.cheby);
-            field.setClassifyStrength?.(haloGiSettings.classify);
-            field.setFilterStrength?.(haloGiSettings.filter);
-            field.setSmoothness?.(haloGiSettings.smoothness);
-            field.setDetailStrength?.(haloGiSettings.detail);
-            field.setReflectionIntensity?.(haloGiSettings.reflectionIntensity);
-            field.setChangeThreshold?.(haloGiSettings.changeThreshold);
-            field.setSnapAmount?.(haloGiSettings.snapAmount);
-            field.setFireflyClamp?.(haloGiSettings.fireflyClamp);
+            field.setIntensity?.(speedballGiSettings.intensity);
+            field.setDivisions?.(speedballGiSettings.divisions);
+            field.setRays?.(speedballGiSettings.rays);
+            field.setCascades?.(speedballGiSettings.cascades);
+            field.setContinuous?.(speedballGiSettings.continuous);
+            field.setHysteresis?.(speedballGiSettings.hysteresis);
+            field.setHysteresisNormalization?.(speedballGiSettings.hysteresisNormalize);
+            field.setNormalBias?.(speedballGiSettings.normalBias);
+            field.setRadianceClamp?.(speedballGiSettings.radianceClamp);
+            field.setDepthSharpness?.(speedballGiSettings.depthSharpness);
+            field.setChebyStrength?.(speedballGiSettings.cheby);
+            field.setClassifyStrength?.(speedballGiSettings.classify);
+            field.setFilterStrength?.(speedballGiSettings.filter);
+            field.setSmoothness?.(speedballGiSettings.smoothness);
+            field.setDetailStrength?.(speedballGiSettings.detail);
+            field.setReflectionIntensity?.(speedballGiSettings.reflectionIntensity);
+            field.setChangeThreshold?.(speedballGiSettings.changeThreshold);
+            field.setSnapAmount?.(speedballGiSettings.snapAmount);
+            field.setFireflyClamp?.(speedballGiSettings.fireflyClamp);
         }
-        function serializeHaloGiState() {
+        function serializeSpeedballGiState() {
             return {
-                ...haloGiSettings,
-                volumes: serializeHaloGiProbeVolumes(),
+                ...speedballGiSettings,
+                volumes: serializeSpeedballGiProbeVolumes(),
             };
         }
-        function applyHaloGiState(input = {}, { persist = false } = {}) {
+        function applySpeedballGiState(input = {}, { persist = false } = {}) {
             const togglesEnabled = Object.prototype.hasOwnProperty.call(input, 'enabled');
             const togglesReflections = Object.prototype.hasOwnProperty.call(input, 'roughReflections')
-                && (input.roughReflections === true) !== haloGiSettings.roughReflections;
+                && (input.roughReflections === true) !== speedballGiSettings.roughReflections;
             const togglesProbes = Object.prototype.hasOwnProperty.call(input, 'showProbes');
-            haloGiSettings = normalizeHaloGiSettings(input, haloGiSettings);
-            const gi = window.maxjsHaloGI;
-            if (togglesReflections && gi?.setRoughReflections) gi.setRoughReflections(haloGiSettings.roughReflections);
-            else applyHaloGiTuning();
-            if (togglesProbes && haloGiSettings.showProbes !== probeHelpersVisible) setProbeHelpersVisible(haloGiSettings.showProbes);
+            speedballGiSettings = normalizeSpeedballGiSettings(input, speedballGiSettings);
+            const gi = window.maxjsSpeedballGI;
+            if (togglesReflections && gi?.setRoughReflections) gi.setRoughReflections(speedballGiSettings.roughReflections);
+            else applySpeedballGiTuning();
+            if (togglesProbes && speedballGiSettings.showProbes !== probeHelpersVisible) setProbeHelpersVisible(speedballGiSettings.showProbes);
             if (gi && togglesEnabled) {
-                if (haloGiSettings.enabled) gi.enable({ applySettings: false });
+                if (speedballGiSettings.enabled) gi.enable({ applySettings: false });
                 else gi.disable({ applySettings: false });
             }
             window.__maxjsSyncGiPanel?.();
             // Mirror authored settings to relay consumers without a global hook.
-            deps.relayEmit?.({ type: 'haloGiSettings', settings: { ...haloGiSettings } });
+            deps.relayEmit?.({ type: 'speedballGiSettings', settings: { ...speedballGiSettings } });
             if (persist) deps.savePostFxState();
         }
-        function setHaloGiSetting(key, value, { persist = false } = {}) {
-            applyHaloGiState({ [key]: value }, { persist });
+        function setSpeedballGiSetting(key, value, { persist = false } = {}) {
+            applySpeedballGiState({ [key]: value }, { persist });
         }
-        function resetHaloGiToDefaults({ persist = false } = {}) {
-            applyHaloGiState({
-                ...HALO_GI_DEFAULTS,
-                enabled: haloGiSettings.enabled,
-                showProbes: haloGiSettings.showProbes,
+        function resetSpeedballGiToDefaults({ persist = false } = {}) {
+            applySpeedballGiState({
+                ...SPEEDBALL_GI_DEFAULTS,
+                enabled: speedballGiSettings.enabled,
+                showProbes: speedballGiSettings.showProbes,
             }, { persist });
         }
 
@@ -258,7 +258,7 @@ function createGiVolumeGlue(deps = {}) {
 
         function applyLightProbeState() {
             // Native three.js probes are standard-mode GI only — the spectral
-            // stack sources ALL probe GI from speedball (HALO-GI DDGI).
+            // stack sources ALL probe GI from speedball (Speedball GI DDGI).
             const probesAllowed = !deps.isStudioMode;
             const hdriDiffuseMuted = deps.isHdriReflectionOnlyEffective();
             const useGrid = probesAllowed && !hdriDiffuseMuted && deps.lightProbeEnabled && deps.hasLightProbeGridData && !!deps.lightProbeGrid;
@@ -341,7 +341,7 @@ function createGiVolumeGlue(deps = {}) {
 
         // THE global recompile hammer: needsUpdate on every scene material
         // rebuilds every pipeline's node graph inside the next render() — one
-        // synchronous ~140 ms+ frame with the HALO probe fold-in enlarging
+        // synchronous ~140 ms+ frame with the Speedball probe fold-in enlarging
         // each graph. Call it ONLY on a real lighting-topology flip (GI
         // active state, probe grid resize, environment identity) — NEVER
         // from a per-settle/per-sync path. Routing it through the scrub
@@ -851,12 +851,12 @@ function createGiVolumeGlue(deps = {}) {
             }
         }
 
-        // Fit the HALO-GI probe volume(s) to the synced probe-grid helper(s): each box's
+        // Fit the Speedball GI probe volume(s) to the synced probe-grid helper(s): each box's
         // world AABB (from the helper node's transform x its size) + manual divisions.
         // No enabled grids -> whole-scene auto-fit. Change-gated.
         const _pgBox = new THREE.Box3();
         const _pgVec = new THREE.Vector3();
-        function buildHaloProbeVolumes() {
+        function buildSpeedballProbeVolumes() {
             const volumes = [];
             for (const [h, data] of probeGridData) {
                 if (!data || data.enabled === false || !Array.isArray(data.size)) continue;
@@ -876,8 +876,8 @@ function createGiVolumeGlue(deps = {}) {
             }
             return volumes;
         }
-        function serializeHaloGiProbeVolumes() {
-            return buildHaloProbeVolumes().map((entry) => {
+        function serializeSpeedballGiProbeVolumes() {
+            return buildSpeedballProbeVolumes().map((entry) => {
                 const box = entry.isBox3 ? entry : entry.box;
                 const res = entry.isBox3 ? null : entry.res;
                 if (!box || !box.isBox3 || box.isEmpty()) return null;
@@ -889,10 +889,10 @@ function createGiVolumeGlue(deps = {}) {
                 return out;
             }).filter(Boolean);
         }
-        function syncHaloProbeVolumes() {
-            const gi = window.maxjsHaloGI;
+        function syncSpeedballProbeVolumes() {
+            const gi = window.maxjsSpeedballGI;
             if (!gi || typeof gi.setVolumes !== 'function') return;
-            const volumes = buildHaloProbeVolumes();
+            const volumes = buildSpeedballProbeVolumes();
             let sig = '';
             for (const entry of volumes) {
                 const box = entry.isBox3 ? entry : entry.box;
@@ -909,7 +909,7 @@ function createGiVolumeGlue(deps = {}) {
             else gi.setVolumes(volumes);
         }
 
-        // ── Diagnostics: draw the HALO-GI probe field as a grid of small spheres. ──
+        // ── Diagnostics: draw the Speedball GI probe field as a grid of small spheres. ──
         let probeHelperMesh = null;
         let probeHelpersVisible = false;
         let probeHelperSig = '';
@@ -925,7 +925,7 @@ function createGiVolumeGlue(deps = {}) {
         }
         function updateProbeHelpers() {
             if (!probeHelpersVisible) return;
-            const gi = window.maxjsHaloGI;
+            const gi = window.maxjsSpeedballGI;
             const field = gi?.field;
             if (!field || typeof field.getResolution !== 'function' || gi.hasData?.() === false) {
                 if (probeHelperMesh) probeHelperMesh.visible = false;
@@ -965,7 +965,7 @@ function createGiVolumeGlue(deps = {}) {
         }
         function setProbeHelpersVisible(v) {
             probeHelpersVisible = !!v;
-            haloGiSettings.showProbes = probeHelpersVisible;
+            speedballGiSettings.showProbes = probeHelpersVisible;
             if (!probeHelpersVisible) { if (probeHelperMesh) probeHelperMesh.visible = false; }
             else updateProbeHelpers();
             const cb = document.getElementById('fx-gi-show-probes');
@@ -980,77 +980,77 @@ function createGiVolumeGlue(deps = {}) {
             }
         }
 
-        // HALO-GI: BVH-traced DDGI probe field (docs/GI_HALO_design.md) — the
+        // Speedball GI: BVH-traced DDGI probe field — the
         // speedball probes. SPECTRAL-ONLY: standard mode is vanilla three.js
         // (native LightProbe / LightProbeGrid GI) and must never run speedball.
         // In spectral the field is constructed up front and ON by default — it
         // IS the live view, and because it shares the BVH/traversal core with
         // the path tracer (spectral_traverse.js) the PT ⇄ DDGI switch is
-        // instant. window.MAXJS_HALO_GI = false force-disables. When enabled it
+        // instant. window.MAXJS_SPEEDBALL_GI = false force-disables. When enabled it
         // mutes the surfel giVolume to avoid double-counting and ticks every
         // frame — the field self-gates on idle and auto-throttles its own ray
         // budget. The probe node only injects into context.irradiance while
         // active, so a disabled field changes nothing.
         if (isWebGpuBackend && deps.isStudioMode) {
             try {
-                let haloOn = haloGiSettings.enabled === true;
-                let haloField = null;
-                let haloSkyInput = null;
-                let haloSkyIntensity = 2.0;
-                const syncHaloSkyState = () => {
-                    haloField?.setSky?.(haloSkyInput);
-                    haloField?.setSkyIntensity?.(haloSkyIntensity);
-                    const ownsDiffuse = haloOn
-                        && haloSkyInput != null
-                        && haloField?.isSupported?.() === true
+                let speedballOn = speedballGiSettings.enabled === true;
+                let speedballField = null;
+                let speedballSkyInput = null;
+                let speedballSkyIntensity = 2.0;
+                const syncSpeedballSkyState = () => {
+                    speedballField?.setSky?.(speedballSkyInput);
+                    speedballField?.setSkyIntensity?.(speedballSkyIntensity);
+                    const ownsDiffuse = speedballOn
+                        && speedballSkyInput != null
+                        && speedballField?.isSupported?.() === true
                         && !deps.isPathTracingMode;
                     deps.setSpectralSkyDiffuseOwnership?.(ownsDiffuse);
                     return ownsDiffuse;
                 };
-                const createConfiguredHaloField = () => createHaloProbeField({
+                const createConfiguredSpeedballField = () => createSpeedballProbeField({
                     renderer: deps.renderer,
                     scene: deps.scene,
-                    intensity: haloGiSettings.intensity,
-                    hysteresis: haloGiSettings.hysteresis,
-                    divisions: haloGiSettings.divisions,
-                    roughReflections: haloGiSettings.roughReflections,
-                    reflectionIntensity: haloGiSettings.reflectionIntensity,
+                    intensity: speedballGiSettings.intensity,
+                    hysteresis: speedballGiSettings.hysteresis,
+                    divisions: speedballGiSettings.divisions,
+                    roughReflections: speedballGiSettings.roughReflections,
+                    reflectionIntensity: speedballGiSettings.reflectionIntensity,
                     onRebuilt: markLightProbeMaterialsDirty,
                 });
-                const replaceHaloField = () => {
-                    const previousField = haloField;
+                const replaceSpeedballField = () => {
+                    const previousField = speedballField;
                     previousField?.setEnabled?.(false);
                     previousField?.dispose?.();
-                    haloField = createConfiguredHaloField();
-                    applyHaloGiTuning(haloField);
+                    speedballField = createConfiguredSpeedballField();
+                    applySpeedballGiTuning(speedballField);
                     // The reflection feature is structural in Speedball: recreation
                     // is deliberate. Off has no glossy buffers/kernels; On allocates
                     // and runs them, making the performance comparison truthful.
                     probeVolumeSig = '\0';
-                    syncHaloProbeVolumes();
-                    if (haloOn) {
-                        haloField.setEnabled(true);
-                        haloField.requestRebuild();
+                    syncSpeedballProbeVolumes();
+                    if (speedballOn) {
+                        speedballField.setEnabled(true);
+                        speedballField.requestRebuild();
                     }
-                    syncHaloSkyState();
+                    syncSpeedballSkyState();
                     markLightProbeMaterialsDirty();
                     updateProbeHelpers();
-                    return haloField;
+                    return speedballField;
                 };
-                haloField = createConfiguredHaloField();
-                applyHaloGiTuning(haloField);
-                deps.haloGi = {
-                    get field() { return haloField; },
-                    isOn: () => haloOn && haloField?.isSupported?.() === true,
+                speedballField = createConfiguredSpeedballField();
+                applySpeedballGiTuning(speedballField);
+                deps.speedballGi = {
+                    get field() { return speedballField; },
+                    isOn: () => speedballOn && speedballField?.isSupported?.() === true,
                     enable({ applySettings = true } = {}) {
-                        if (!haloField?.isSupported?.()) { console.warn('HALO-GI needs the WebGPU backend'); return false; }
-                        haloOn = true;
-                        haloGiSettings.enabled = true;
+                        if (!speedballField?.isSupported?.()) { console.warn('Speedball GI needs the WebGPU backend'); return false; }
+                        speedballOn = true;
+                        speedballGiSettings.enabled = true;
                         if (deps.giVolume) { deps.giVolume.setEnabled(false); deps.giVolume.setIntensity(0); }
-                        if (applySettings) applyHaloGiTuning(haloField);
-                        haloField.setEnabled(true);
-                        haloField.requestRebuild();
-                        syncHaloSkyState();
+                        if (applySettings) applySpeedballGiTuning(speedballField);
+                        speedballField.setEnabled(true);
+                        speedballField.requestRebuild();
+                        syncSpeedballSkyState();
                         // The fold-in recompile is forced by the field's onRebuilt hook
                         // (markLightProbeMaterialsDirty) the moment the first rebuild
                         // produces probe data — same frame the data exists, not a rebuild
@@ -1059,60 +1059,60 @@ function createGiVolumeGlue(deps = {}) {
                         return true;
                     },
                     disable({ applySettings = true } = {}) {
-                        haloOn = false;
-                        haloGiSettings.enabled = false;
-                        if (applySettings) applyHaloGiTuning(haloField);
-                        haloField.setEnabled(false);
-                        syncHaloSkyState();
+                        speedballOn = false;
+                        speedballGiSettings.enabled = false;
+                        if (applySettings) applySpeedballGiTuning(speedballField);
+                        speedballField.setEnabled(false);
+                        syncSpeedballSkyState();
                         markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
                         window.__maxjsSyncGiPanel?.();
                     },
                     setRoughReflections(enabled) {
                         const next = enabled === true;
-                        const current = haloField?.hasRoughReflections?.() === true;
-                        haloGiSettings.roughReflections = next;
+                        const current = speedballField?.hasRoughReflections?.() === true;
+                        speedballGiSettings.roughReflections = next;
                         if (next === current) return false;
-                        replaceHaloField();
+                        replaceSpeedballField();
                         window.__maxjsSyncGiPanel?.();
                         return true;
                     },
-                    hasRoughReflections: () => haloField?.hasRoughReflections?.() === true,
-                    setSky(input, { intensity = haloSkyIntensity } = {}) {
-                        haloSkyInput = input ?? null;
-                        if (Number.isFinite(Number(intensity))) haloSkyIntensity = Math.max(0, Number(intensity));
-                        return syncHaloSkyState();
+                    hasRoughReflections: () => speedballField?.hasRoughReflections?.() === true,
+                    setSky(input, { intensity = speedballSkyIntensity } = {}) {
+                        speedballSkyInput = input ?? null;
+                        if (Number.isFinite(Number(intensity))) speedballSkyIntensity = Math.max(0, Number(intensity));
+                        return syncSpeedballSkyState();
                     },
-                    getSky: () => haloSkyInput,
-                    getSkyIntensity: () => haloSkyIntensity,
-                    syncSkyState: syncHaloSkyState,
-                    setReflectionIntensity: (v) => setHaloGiSetting('reflectionIntensity', v),
-                    setIntensity: (v) => setHaloGiSetting('intensity', v),
-                    setDivisions: (v) => setHaloGiSetting('divisions', v),
-                    setRays: (v) => setHaloGiSetting('rays', v),
-                    setCascades: (v) => setHaloGiSetting('cascades', v),
-                    setContinuous: (v) => setHaloGiSetting('continuous', v),
-                    setHysteresis: (v) => setHaloGiSetting('hysteresis', v),
-                    setHysteresisNormalize: (v) => setHaloGiSetting('hysteresisNormalize', v),
-                    setNormalBias: (v) => setHaloGiSetting('normalBias', v),
-                    setRadianceClamp: (v) => setHaloGiSetting('radianceClamp', v),
-                    setDepthSharpness: (v) => setHaloGiSetting('depthSharpness', v),
-                    setCheby: (v) => setHaloGiSetting('cheby', v), // 0 leaks, 1 leak-free
-                    setChebyStrength: (v) => setHaloGiSetting('cheby', v),
-                    setClassify: (v) => setHaloGiSetting('classify', v), // 0 off (default), 1 drop buried probes (solid scenes)
-                    setClassifyStrength: (v) => setHaloGiSetting('classify', v),
-                    setFilter: (v) => setHaloGiSetting('filter', v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
-                    setFilterStrength: (v) => setHaloGiSetting('filter', v),
-                    setSmoothness: (v) => setHaloGiSetting('smoothness', v),     // UI "Smoothness": widen the denoise edge-stop (kills GI splotch)
-                    setChangeThreshold: (v) => setHaloGiSetting('changeThreshold', v),
-                    setSnapAmount: (v) => setHaloGiSetting('snapAmount', v),
-                    setFireflyClamp: (v) => setHaloGiSetting('fireflyClamp', v),
-                    resetDefaults: () => resetHaloGiToDefaults({ persist: true }),
-                    getSettings: () => serializeHaloGiState(),
-                    setBounds: (box) => haloField?.setBounds?.(box),     // single Probe Origin box; null = auto-fit
-                    setVolumes: (boxes) => haloField?.setVolumes?.(boxes), // multiple Probe Origin boxes (unioned for now)
-                    getStats: () => haloField?.getStats?.() ?? { active: false, available: false },
+                    getSky: () => speedballSkyInput,
+                    getSkyIntensity: () => speedballSkyIntensity,
+                    syncSkyState: syncSpeedballSkyState,
+                    setReflectionIntensity: (v) => setSpeedballGiSetting('reflectionIntensity', v),
+                    setIntensity: (v) => setSpeedballGiSetting('intensity', v),
+                    setDivisions: (v) => setSpeedballGiSetting('divisions', v),
+                    setRays: (v) => setSpeedballGiSetting('rays', v),
+                    setCascades: (v) => setSpeedballGiSetting('cascades', v),
+                    setContinuous: (v) => setSpeedballGiSetting('continuous', v),
+                    setHysteresis: (v) => setSpeedballGiSetting('hysteresis', v),
+                    setHysteresisNormalize: (v) => setSpeedballGiSetting('hysteresisNormalize', v),
+                    setNormalBias: (v) => setSpeedballGiSetting('normalBias', v),
+                    setRadianceClamp: (v) => setSpeedballGiSetting('radianceClamp', v),
+                    setDepthSharpness: (v) => setSpeedballGiSetting('depthSharpness', v),
+                    setCheby: (v) => setSpeedballGiSetting('cheby', v), // 0 leaks, 1 leak-free
+                    setChebyStrength: (v) => setSpeedballGiSetting('cheby', v),
+                    setClassify: (v) => setSpeedballGiSetting('classify', v), // 0 off (default), 1 drop buried probes (solid scenes)
+                    setClassifyStrength: (v) => setSpeedballGiSetting('classify', v),
+                    setFilter: (v) => setSpeedballGiSetting('filter', v),     // CORE denoise: 0 off (baseline), 1 full intra-tile spatial filter
+                    setFilterStrength: (v) => setSpeedballGiSetting('filter', v),
+                    setSmoothness: (v) => setSpeedballGiSetting('smoothness', v),     // UI "Smoothness": widen the denoise edge-stop (kills GI splotch)
+                    setChangeThreshold: (v) => setSpeedballGiSetting('changeThreshold', v),
+                    setSnapAmount: (v) => setSpeedballGiSetting('snapAmount', v),
+                    setFireflyClamp: (v) => setSpeedballGiSetting('fireflyClamp', v),
+                    resetDefaults: () => resetSpeedballGiToDefaults({ persist: true }),
+                    getSettings: () => serializeSpeedballGiState(),
+                    setBounds: (box) => speedballField?.setBounds?.(box),     // single Probe Origin box; null = auto-fit
+                    setVolumes: (boxes) => speedballField?.setVolumes?.(boxes), // multiple Probe Origin boxes (unioned for now)
+                    getStats: () => speedballField?.getStats?.() ?? { active: false, available: false },
                     tick(nowMs) {
-                        if (!haloOn || deps.isPathTracingMode || !haloField?.isSupported?.()) return;
+                        if (!speedballOn || deps.isPathTracingMode || !speedballField?.isSupported?.()) return;
                         // Tick EVERY frame, exactly like the speedball standalone — the
                         // field self-gates on viewport idle and auto-throttles its ray
                         // budget from measured tick-to-tick dt. An external cadence cap
@@ -1123,21 +1123,21 @@ function createGiVolumeGlue(deps = {}) {
                         const timelineIdleMs = Number.isFinite(timelineUpdateMs) && timelineUpdateMs > 0
                             ? nowMs - timelineUpdateMs
                             : Infinity;
-                        void haloField.tick({
+                        void speedballField.tick({
                             // Scrub/step/stop are interactions too. Using the
                             // newest camera OR timeline activity keeps scene
                             // scans/refits out of the input callback tail.
-                            idleMs: Math.min(nowMs - deps.haloGiLastInteractionMs, timelineIdleMs),
+                            idleMs: Math.min(nowMs - deps.speedballGiLastInteractionMs, timelineIdleMs),
                             playing: !!deps.maxTimeline?.playing?.(),
                         });
                     },
                 };
-                window.maxjsHaloGI = deps.haloGi; // console handle
-                if (haloOn) deps.haloGi.enable({ applySettings: false });
+                window.maxjsSpeedballGI = deps.speedballGi; // console handle
+                if (speedballOn) deps.speedballGi.enable({ applySettings: false });
             } catch (err) {
-                deps.maxjsDebugWarn?.('max.js HALO-GI init failed:', err);
+                deps.maxjsDebugWarn?.('max.js Speedball GI init failed:', err);
                 deps.setSpectralSkyDiffuseOwnership?.(false);
-                deps.haloGi = null;
+                deps.speedballGi = null;
             }
         }
 
@@ -1187,7 +1187,7 @@ function createGiVolumeGlue(deps = {}) {
                         }
         });
 
-        // ── HALO-GI Probe Grid: size + manual divisions per node handle ──
+        // ── Speedball GI Probe Grid: size + manual divisions per node handle ──
         deps.bridge.on('probeGrids', msg => {
             probeGridData.clear();
             if (Array.isArray(msg.grids)) {
@@ -1200,30 +1200,30 @@ function createGiVolumeGlue(deps = {}) {
                     });
                 }
             }
-            // Auto-enable HALO-GI the first time an enabled grid appears so adding a
+            // Auto-enable Speedball GI the first time an enabled grid appears so adding a
             // probe grid "just works" (and survives viewer reloads).
-            if (!probeGridAutoEnabled && window.maxjsHaloGI && window.maxjsHaloGI.isOn?.() !== true) {
+            if (!probeGridAutoEnabled && window.maxjsSpeedballGI && window.maxjsSpeedballGI.isOn?.() !== true) {
                 for (const d of probeGridData.values()) {
-                    if (d.enabled && Array.isArray(d.size)) { probeGridAutoEnabled = true; try { window.maxjsHaloGI.enable(); } catch (e) {} break; }
+                    if (d.enabled && Array.isArray(d.size)) { probeGridAutoEnabled = true; try { window.maxjsSpeedballGI.enable(); } catch (e) {} break; }
                 }
             }
-            syncHaloProbeVolumes();
+            syncSpeedballProbeVolumes();
         });
-        window.maxjsHaloGIShowProbes = setProbeHelpersVisible;
+        window.maxjsSpeedballGIShowProbes = setProbeHelpersVisible;
 
         return {
-            HALO_GI_NUMERIC_CONTROLS,
+            SPEEDBALL_GI_NUMERIC_CONTROLS,
             GI_VOLUME_CAMERA_DEBOUNCE_MS,
             serializeRelayProbeGrids,
-            getHaloGiSettings,
-            clampHaloGiNumber,
-            formatHaloGiValue,
-            normalizeHaloGiSettings,
-            applyHaloGiTuning,
-            serializeHaloGiState,
-            applyHaloGiState,
-            setHaloGiSetting,
-            resetHaloGiToDefaults,
+            getSpeedballGiSettings,
+            clampSpeedballGiNumber,
+            formatSpeedballGiValue,
+            normalizeSpeedballGiSettings,
+            applySpeedballGiTuning,
+            serializeSpeedballGiState,
+            applySpeedballGiState,
+            setSpeedballGiSetting,
+            resetSpeedballGiToDefaults,
             shouldAutoStartStudioGiVolume,
             ensureStudioGiVolume,
             installStudioGiConsoleHandle,
@@ -1256,9 +1256,9 @@ function createGiVolumeGlue(deps = {}) {
             updateLightProbeFromCurrentScene,
             scheduleLightProbeFromCurrentScene,
             updateLightProbeFromHDRI,
-            buildHaloProbeVolumes,
-            serializeHaloGiProbeVolumes,
-            syncHaloProbeVolumes,
+            buildSpeedballProbeVolumes,
+            serializeSpeedballGiProbeVolumes,
+            syncSpeedballProbeVolumes,
             disposeProbeHelpers,
             updateProbeHelpers,
             setProbeHelpersVisible,

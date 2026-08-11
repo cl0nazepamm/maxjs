@@ -3,7 +3,7 @@
 #include <max.h>
 #include <iparamb2.h>
 
-// max.js HALO-GI Probe Grid — a HELPER object you draw in 3ds Max to define WHERE
+// max.js Speedball GI Probe Grid — a HELPER object you draw in 3ds Max to define WHERE
 // the realtime GI probe volume sits and how dense it is. Auto-fitting the whole
 // scene makes interior GI coarse when far background assets balloon the bounds; a
 // hand-placed box keeps probes dense where they matter. The box only bounds probe
@@ -20,7 +20,7 @@ enum ThreeJSProbeGridParamIDs {
     pg_div_x,    // probe divisions per axis (manual density)
     pg_div_y,
     pg_div_z,
-    pg_enabled,  // contribute this volume to HALO-GI
+    pg_enabled,  // contribute this volume to Speedball GI
 };
 
 bool IsThreeJSProbeGridClassID(const Class_ID& cid);

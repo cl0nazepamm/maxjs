@@ -43,7 +43,7 @@ function functionBody(source, signature) {
 
 const jsonHelper = sliceBetween(
     fullSyncSource,
-    'if (IsMaxJSHierarchyNode(node, t)) {',
+    'if (IsMaxJSHierarchyNode(node, t) || cameraLightCarrier) {',
     '// Hidden render nodes are skipped',
 );
 assert.match(jsonHelper, /WriteUserPropsJson\s*\(\s*ss\s*,\s*node\s*\)/,

@@ -51,7 +51,6 @@ function createPostFxGlue(deps = {}) {
         const isPowerShotNirMode = (values) => isPowerShotInfraredMode(values) || isPowerShotNightshotMode(values);
         const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && !isPowerShotNirMode(values);
         const isPowerShotAnalogMode = (values) => values.mode === 'analog';
-        const isPowerShotIspMode = (values) => isPowerShotDigitalMode(values) || isPowerShotAnalogMode(values);
         const isPowerShotFilmMode = (values) => values.mode === 'film';
         const isPowerShotElectronModelActive = (values) =>
             isPowerShotInfraredMode(values) && values.irElectronModel === true;
@@ -397,7 +396,10 @@ function createPostFxGlue(deps = {}) {
                     { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
                     // Pre-imager linear-light gain, matching PowerShot upstream.
                     // Film and NIR modes retain their own exposure controls.
-                    { key: 'inputExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true, visibleWhen: isPowerShotIspMode },
+                    // Plate gain in stops before the imager — the one exposure
+                    // control every PowerShot mode takes (film stacks it with
+                    // the stock's own trim; survives preset swaps).
+                    { key: 'inputExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true },
                     { key: 'lensSoftness', label: 'Lens Softness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
                     { key: 'ccdBloom', label: 'CCD Bloom', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
                     { key: 'noiseScale', label: 'Noise', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },

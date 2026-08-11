@@ -46,13 +46,12 @@ function exposureLinearToStops(linear) {
 }
 
 function setPowerShotInputExposure(pipeline, mode, linearExposure, options) {
-    if (!pipeline || mode === 'film') return;
-    // The PowerShot-native control belongs to the shared digital/analog
-    // Pipeline. Viewer exposure remains host-wide, so the two gains stack in
-    // the same photographic-stop domain before the imager.
-    const modeExposure = mode === 'digital' || mode === 'analog'
-        ? Number(options?.inputExposure)
-        : 0;
+    if (!pipeline) return;
+    // One plate-gain knob for every imager: viewer exposure (host-wide) and
+    // the panel's inputExposure stack in the same photographic-stop domain
+    // before the effect. Film takes it too — setInputExposure is separate
+    // from the stock's own P.exposure trim, so preset swaps can't clobber it.
+    const modeExposure = Number(options?.inputExposure);
     const stops = exposureLinearToStops(linearExposure)
         + (Number.isFinite(modeExposure) ? modeExposure : 0);
     if (typeof pipeline.setInputExposure === 'function') {
@@ -61,6 +60,10 @@ function setPowerShotInputExposure(pipeline, mode, linearExposure, options) {
     }
 
     // Compatibility with published PowerShot versions before setInputExposure.
+    // Old FilmPipelines stay a no-op on purpose: their only exposure knob is
+    // the stock trim, and writing host gain there is exactly the
+    // reset-on-preset-swap bug setInputExposure exists to fix.
+    if (mode === 'film') return;
     if (mode === 'infrared' && pipeline.ctx?.P?.exposure) {
         pipeline.ctx.P.exposure.value = options.irExposure + stops;
     } else if (mode === 'nightshot' && pipeline.ir?.ctx?.P?.exposure) {
@@ -200,10 +203,13 @@ export function listPowerShotPresets() {
  * @param supportsScreenSpaceEffects backend capability flag
  * @param isShaderLabEnabled        Shader Lab wins the final-stylize slot
  *
- * Viewer Exposure is scene-linear plate gain before every non-film mode.
- * Film ignores it and keeps filmExposure as the authoritative stock exposure.
- * brightness + contrast are post-effect corrective grades via setOutputColorGrading
- * (powershotLinearGrade on the linear print/phosphor/ISP output) — not input exposure.
+ * Exposure contract (the DaVinci shape): scene-linear plate gain in stops
+ * BEFORE the imager, taste after it. Viewer Exposure + the panel's
+ * inputExposure stack in the same stop domain and feed setInputExposure on
+ * EVERY mode — film included (it stacks with filmExposure, the stock's own
+ * trim, and survives preset swaps). brightness + contrast are post-effect
+ * corrective grades via setOutputColorGrading (powershotLinearGrade on the
+ * linear print/phosphor/ISP output) — never input exposure.
  */
 export function createPowerShotFinal({
     renderer,

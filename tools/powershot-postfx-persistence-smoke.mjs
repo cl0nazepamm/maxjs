@@ -92,22 +92,33 @@ const setInputExposure = new Function(
     `${exposureHelpersSource}
     return setPowerShotInputExposure;`,
 )();
-for (const mode of ['digital', 'analog']) {
+// The exposure contract: one plate-gain knob in stops, before the imager,
+// for EVERY mode — film stacks it with the stock trim, NIR modes stack it
+// with their own irExposure mode trim.
+for (const mode of ['digital', 'analog', 'film', 'infrared', 'nightshot']) {
     let appliedStops = null;
     setInputExposure({ setInputExposure: (stops) => { appliedStops = stops; } }, mode, 2, {
         inputExposure: -0.25,
     });
     assert.equal(appliedStops, 0.75, `${mode} stacks its PowerShot exposure with viewer exposure`);
 }
-let infraredStops = null;
-setInputExposure({ setInputExposure: (stops) => { infraredStops = stops; } }, 'infrared', 2, {
+// Published-version fallbacks: old FilmPipelines (no setInputExposure) must
+// stay untouched — their only knob is the stock trim, and writing host gain
+// there is the reset-on-preset-swap bug the contract exists to fix.
+const legacyFilmExposure = { value: 5 };
+setInputExposure({ ctx: { P: { exposure: legacyFilmExposure } } }, 'film', 2, {
     inputExposure: -0.25,
 });
-assert.equal(infraredStops, 1, 'NIR modes keep their separate exposure control');
+assert.equal(legacyFilmExposure.value, 5, 'legacy film pipelines keep their stock trim untouched');
+const legacyInfraredExposure = { value: 0 };
+setInputExposure({ ctx: { P: { exposure: legacyInfraredExposure } } }, 'infrared', 2, {
+    inputExposure: -0.25, irExposure: 3,
+});
+assert.equal(legacyInfraredExposure.value, 3.75, 'legacy NIR pipelines fold plate gain into their mode trim');
 assert.match(
     source,
-    /key: 'inputExposure', label: 'Exposure \(stops\)', min: -12, max: 12,[^\n]+visibleWhen: isPowerShotIspMode/,
-    'the -12 to +12 Exposure (stops) slider stays visible in the digital and analog modes',
+    /key: 'inputExposure', label: 'Exposure \(stops\)', min: -12, max: 12, step: 0\.05, realtime: true \}/,
+    'the -12 to +12 Exposure (stops) slider is visible in every PowerShot mode',
 );
 assert.match(
     adapterSource,

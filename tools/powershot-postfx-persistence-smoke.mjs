@@ -120,6 +120,45 @@ assert.match(
     /key: 'inputExposure', label: 'Exposure \(stops\)', min: -12, max: 12, step: 0\.05, realtime: true \}/,
     'the -12 to +12 Exposure (stops) slider is visible in every PowerShot mode',
 );
+const powerShotSectionSource = source.match(
+    /key: 'powershot',[\s\S]+?(?=\r?\n\s*\{\r?\n\s*key: 'dof')/,
+)?.[0];
+assert.ok(powerShotSectionSource, 'PowerShot section remains testable');
+assert.doesNotMatch(
+    powerShotSectionSource,
+    /\{ key: '(?:brightness|contrast)', label:/,
+    'PowerShot has no duplicate grade controls; the main Look controls own them',
+);
+// filmExposure has no control row on purpose: film.js sums P.exposure with
+// ctx.inputExposure into ONE gain at ONE point (exp2(a + b), before the H&D
+// curve), so a second slider was the same knob twice. The key stays live in
+// state so saved scenes keep round-tripping; only the duplicate UI is gone.
+// (Print Exposure is unrelated — a printer-light offset in the log10 density
+// domain after the negative develops.)
+assert.doesNotMatch(
+    source,
+    /key: 'filmExposure', label:/,
+    'film exposure has no duplicate slider next to the plate gain',
+);
+assert.match(
+    adapterSource,
+    /p\.filmExposure = THREE\.MathUtils\.clamp\(finiteOr\(p\.filmExposure, 0\), -12, 12\)/,
+    'filmExposure still normalizes so existing scenes keep their baked trim',
+);
+// Same duplication in infrared.js:142 — exp2u(P.exposure.add(inputExposure)).
+// irExposure keeps carrying the tube preset's baked trim (unlike the film
+// stocks it is non-zero, ~0.85) and still feeds the legacy no-setInputExposure
+// fallback above; it just has no redundant slider of its own.
+assert.doesNotMatch(
+    source,
+    /key: 'irExposure', label:/,
+    'NIR exposure has no duplicate slider next to the plate gain',
+);
+assert.match(
+    adapterSource,
+    /irExposure: preset\.exposure \?\? 0\.85/,
+    'NIR presets still seed their own exposure trim',
+);
 assert.match(
     adapterSource,
     /p\.inputExposure = THREE\.MathUtils\.clamp\(finiteOr\(p\.inputExposure, 0\), -12, 12\)/,

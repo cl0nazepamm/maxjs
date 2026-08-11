@@ -59,8 +59,8 @@ export function createMaxJSFxController({
         preset: 'powershot',
         amount: 1.0,
         resolutionScale: 0.75,
-        // Dedicated digital/analog plate gain in photographic stops. Viewer
-        // exposure remains a separate host gain and stacks with this value.
+        // Shared plate gain in photographic stops for every PowerShot imager.
+        // Viewer exposure remains a separate host gain and stacks with it.
         inputExposure: 0,
         lensSoftness: 0.32,
         ccdBloom: 0.35,

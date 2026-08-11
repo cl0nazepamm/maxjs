@@ -394,11 +394,11 @@ function createPostFxGlue(deps = {}) {
                     },
                     { key: 'amount', label: 'Amount', min: 0, max: 1, step: 0.01, realtime: true },
                     { key: 'resolutionScale', label: 'Resolution', min: 0.1, max: 1, step: 0.05 },
-                    // Pre-imager linear-light gain, matching PowerShot upstream.
-                    // Film and NIR modes retain their own exposure controls.
                     // Plate gain in stops before the imager — the one exposure
-                    // control every PowerShot mode takes (film stacks it with
-                    // the stock's own trim; survives preset swaps).
+                    // control every PowerShot mode takes. Film has no second
+                    // slider: film.js sums the stock's P.exposure with this
+                    // into a single gain, so exposing both was one knob twice
+                    // (filmExposure stays in state for saved scenes).
                     { key: 'inputExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true },
                     { key: 'lensSoftness', label: 'Lens Softness', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
                     { key: 'ccdBloom', label: 'CCD Bloom', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotDigitalMode },
@@ -410,7 +410,6 @@ function createPostFxGlue(deps = {}) {
                     { key: 'jpegChroma420', label: 'JPEG Chroma', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'jpegMidtone', label: 'JPEG Midtones', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
                     { key: 'jpegHighlight', label: 'JPEG Highlights', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotJpegActive },
-                    { key: 'filmExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmInputGamma', label: 'Input Gamma', min: 0.5, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmGrain', label: 'Grain', min: 0, max: 3, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmGrainSize', label: 'Grain Size', min: 0.5, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotFilmMode },
@@ -425,10 +424,6 @@ function createPostFxGlue(deps = {}) {
                     { key: 'filmWeave', label: 'Gate Weave', min: 0, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmFlicker', label: 'Flicker', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotFilmMode },
                     { key: 'filmNegative', label: 'Show Negative', type: 'checkbox', visibleWhen: isPowerShotFilmMode },
-                    // Post-effect corrective grade (powershotLinearGrade) — works
-                    // after every mode; mode-specific Exposure knobs stay separate.
-                    { key: 'brightness', label: 'Brightness', min: -1, max: 1, step: 0.01, realtime: true },
-                    { key: 'contrast', label: 'Contrast', min: -1, max: 1, step: 0.01, realtime: true },
                     // Solar Flares — scene-linear optical sun flare rendered
                     // onto the plate before the imager (fx/final/powershot.js).
                     { key: 'flareEnabled', label: 'Solar Flares', type: 'checkbox', affectsVisibility: true, visibleWhen: isPowerShotOpticalMode },
@@ -451,7 +446,6 @@ function createPostFxGlue(deps = {}) {
                     // Scene-side illuminator power in the sensed band (class-4 IR
                     // lights: raster direct + probe NEE + PT) — not a tube stage.
                     { key: 'irIlluminator', label: 'IR Illuminator', min: 0, max: 4, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
-                    { key: 'irExposure', label: 'Exposure (stops)', min: -12, max: 12, step: 0.05, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irInputGamma', label: 'Input Gamma', min: 0.35, max: 2, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irResponse', label: 'IR Response', min: 0, max: 1, step: 0.01, realtime: true, visibleWhen: isPowerShotNirMode },
                     { key: 'irLocalGain', label: 'Local Gain', min: 0, max: 1.5, step: 0.01, realtime: true, visibleWhen: isPowerShotInfraredMode },
@@ -1250,7 +1244,7 @@ function createPostFxGlue(deps = {}) {
 
             // Brightness / Contrast: CSS canvas filter when PowerShot is off;
             // post-ISP powershotLinearGrade when PowerShot is on (corrective,
-            // after the imager — exposure stays on the mode-specific knobs).
+            // after the imager — exposure stays on the shared PowerShot input).
             const brightnessSlider = document.getElementById('fx-tonemapping-brightness');
             const brightnessLabel = document.getElementById('fx-tonemapping-brightness-val');
             const contrastSlider = document.getElementById('fx-tonemapping-contrast');

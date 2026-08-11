@@ -443,7 +443,12 @@ function createLights(deps = {}) {
                 if (!isRuntimeOverridden('distance')) light.distance = ld.distance || 0;
                 if (!isRuntimeOverridden('decay')) light.decay = ld.decay ?? 2;
                 if (!isRuntimeOverridden('angle')) light.angle = ld.angle ?? Math.PI / 4;
-                if (!isRuntimeOverridden('penumbra')) light.penumbra = ld.penumbra ?? 0.1;
+                if (!isRuntimeOverridden('penumbra')) {
+                    const penumbra = Number(ld.penumbra);
+                    light.penumbra = Number.isFinite(penumbra)
+                        ? THREE.MathUtils.clamp(penumbra, 0, 1)
+                        : 0.1;
+                }
                 if (!isRuntimeOverridden('target')) setLightTargetFromData(light, ld);
                 break;
             case 3:

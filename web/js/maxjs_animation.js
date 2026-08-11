@@ -164,6 +164,8 @@ export function createMaxJSAnimationSystem({
     const vectorA = new THREE.Vector3();
     const vectorB = new THREE.Vector3();
     const vectorSample = new THREE.Vector3();
+    const animatedLightTargetWorld = new THREE.Vector3();
+    const ANIMATED_LIGHT_TARGET_DISTANCE = 1000;
 
     function getMixer(target) {
         let mixer = mixers.get(target);
@@ -603,6 +605,25 @@ export function createMaxJSAnimationSystem({
         }
     }
 
+    function syncAnimatedLightTarget(light) {
+        if ((!light?.isSpotLight && !light?.isDirectionalLight) || !light.target) return;
+        // Parented Max lights keep their target as a child, so the sampled node
+        // matrix already carries the beam. Free Three.js lights use a sibling
+        // target and ignore the light quaternion; rebuild that aim point from
+        // Max's exported -Y beam axis after every matrix sample.
+        if (light.target.parent === light) return;
+        light.updateMatrixWorld(true);
+        animatedLightTargetWorld
+            .set(0, -ANIMATED_LIGHT_TARGET_DISTANCE, 0)
+            .applyMatrix4(light.matrixWorld);
+        if (light.target.parent) {
+            light.target.parent.updateMatrixWorld(true);
+            light.target.parent.worldToLocal(animatedLightTargetWorld);
+        }
+        light.target.position.copy(animatedLightTargetWorld);
+        light.target.matrixWorldNeedsUpdate = true;
+    }
+
     function applyCustomEntry(entry, timeSeconds) {
         const { target, kind, path, trackDef } = entry;
         if (!target) return;
@@ -614,6 +635,7 @@ export function createMaxJSAnimationSystem({
                     target.matrix.copy(matrixSample);
                     target.matrix.decompose(target.position, target.quaternion, target.scale);
                     target.matrixWorldNeedsUpdate = true;
+                    syncAnimatedLightTarget(target);
                 }
                 break;
             case 'boolean': {

@@ -364,7 +364,12 @@ function applyLightData(light, ld, nodeMap, parent) {
         light.distance = ld.distance || 0;
         light.decay = ld.decay ?? 2;
         light.angle = ld.angle ?? Math.PI / 4;
-        light.penumbra = ld.penumbra ?? 0.1;
+        {
+            const penumbra = Number(ld.penumbra);
+            light.penumbra = Number.isFinite(penumbra)
+                ? THREE.MathUtils.clamp(penumbra, 0, 1)
+                : 0.1;
+        }
         if (light.userData.maxjsTarget?.parent === light) orientLightFromDir(light, ld, parent);
         setLightTargetFromData(light, ld, parent);
         break;

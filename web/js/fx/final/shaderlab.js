@@ -10,15 +10,36 @@
 // shader_lab_fx.js and enables it from snapshotUi.shaderLab. Loading
 // shader-lab pulls React + the library from esm.sh at runtime (needs net);
 // callers must treat enable() failure as a graceful no-FX fallback.
+//
+// Dynamic range: shader-lab's passes are LDR. Its own pipeline clamps every
+// layer to [0,1] between passes, so the shaders are written against a
+// display-referred image. Ink in particular multiplies by a fixed ~1.9 glow
+// gain and then hard-clamps with no rolloff, so feeding it our raw linear-HDR
+// native render collapses everything above ~0.5 onto a flat clipped plateau —
+// a single 1.4-range highlight smears into a solid white bar. So we tone map
+// into a [0,1] linear buffer before handing the texture over, and skip the
+// renderer's own output tone mapping on the way out so the curve lands once.
 import * as THREE from 'three';
+import {
+    texture as tslTexture,
+    toneMapping as toneMappingNode,
+    toneMappingExposure,
+    vec4,
+} from 'three/tsl';
 
 export function createShaderLabFinal({
     renderer,
     getShaderLabFx,
     getScaledPostFxSize,
     supportsScreenSpaceEffects = false,
+    toneMapInput = true,
 }) {
     let shaderLabInputTarget = null;
+    let toneMapTarget = null;
+    let toneMapQuad = null;
+    let toneMapMaterial = null;
+    let toneMapSourceNode = null;
+    let toneMapMode = null;
     let lastShaderLabFrameTime = 0;
     const drawBufferSize = new THREE.Vector2();
 
@@ -67,6 +88,71 @@ export function createShaderLabFinal({
         return shaderLabInputTarget;
     }
 
+    // r185 forces NoToneMapping whenever the destination is not screen output
+    // (Renderer.currentToneMapping), so simply setting renderer.toneMapping and
+    // rendering into a target would not apply any curve. The quad below carries
+    // the curve in its own colorNode instead.
+    function ensureToneMapChain(source, width, height) {
+        if (typeof THREE.QuadMesh !== 'function'
+            || typeof THREE.MeshBasicNodeMaterial !== 'function'
+            || !source) {
+            return null;
+        }
+
+        if (!toneMapTarget) {
+            toneMapTarget = new THREE.RenderTarget(width, height, {
+                type: THREE.HalfFloatType,
+                colorSpace: THREE.LinearSRGBColorSpace,
+                depthBuffer: false,
+                stencilBuffer: false,
+            });
+        } else if (toneMapTarget.width !== width || toneMapTarget.height !== height) {
+            toneMapTarget.setSize(width, height);
+        }
+
+        if (!toneMapMaterial) {
+            toneMapMaterial = new THREE.MeshBasicNodeMaterial();
+            toneMapMaterial.name = 'shaderlab-input-tonemap';
+            toneMapSourceNode = tslTexture(source);
+            toneMapQuad = new THREE.QuadMesh(toneMapMaterial);
+        }
+        toneMapSourceNode.value = source;
+
+        // The tone mapping type is a compile-time branch inside ToneMappingNode,
+        // so the material only gets rebuilt when the user changes the mode.
+        const mode = renderer.toneMapping ?? THREE.NoToneMapping;
+        if (toneMapMode !== mode) {
+            // "none" still has to land in [0,1] — that is what the display would
+            // do anyway, and it keeps ink's per-pass mix(blurred, lifted,
+            // intensity * 0.5) off its extrapolating branch above intensity 2.
+            toneMapMaterial.colorNode = mode === THREE.NoToneMapping
+                ? vec4(toneMapSourceNode.rgb.clamp(0, 1), 1)
+                : toneMappingNode(mode, toneMappingExposure, vec4(toneMapSourceNode.rgb, 1));
+            toneMapMaterial.needsUpdate = true;
+            toneMapMode = mode;
+        }
+
+        return toneMapTarget;
+    }
+
+    function toneMapIntoLdr(source, width, height) {
+        const mapped = ensureToneMapChain(source, width, height);
+        if (!mapped) return source;
+
+        const previousTarget = renderer.getRenderTarget?.() || null;
+        try {
+            renderer.initRenderTarget?.(mapped);
+            renderer.setRenderTarget(mapped);
+            toneMapQuad.render(renderer);
+            return mapped.texture;
+        } catch (err) {
+            console.error('[shader-lab-final] input tone map failed:', err);
+            return source;
+        } finally {
+            renderer.setRenderTarget(previousTarget);
+        }
+    }
+
     function renderFinal(renderNativeToCurrentTarget) {
         if (!hasPassEnabled()) return false;
         const target = ensureInputTarget();
@@ -100,10 +186,26 @@ export function createShaderLabFinal({
             }
         }
 
-        return getShaderLabFx().renderTexture?.(target.texture, now, delta, {
-            inputs: getInputs(),
-            outputTarget: previousTarget,
-        }) === true;
+        // Runs after the finally above so it sees the real toneMapping /
+        // toneMappingExposure again — ToneMappingNode reads exposure through a
+        // live renderer reference.
+        const shaderLabInput = toneMapInput
+            ? toneMapIntoLdr(target.texture, target.width, target.height)
+            : target.texture;
+
+        // shader-lab clamps its own output to [0,1], so letting the final blit
+        // apply the renderer's curve a second time would only crush an already
+        // display-referred image. The curve was spent on the input above.
+        const skipOutputToneMapping = shaderLabInput !== target.texture;
+        if (skipOutputToneMapping) renderer.toneMapping = THREE.NoToneMapping;
+        try {
+            return getShaderLabFx().renderTexture?.(shaderLabInput, now, delta, {
+                inputs: getInputs(),
+                outputTarget: previousTarget,
+            }) === true;
+        } finally {
+            if (skipOutputToneMapping) renderer.toneMapping = previousToneMapping;
+        }
     }
 
     return {
@@ -113,7 +215,14 @@ export function createShaderLabFinal({
         renderFinal,
         dispose() {
             try { shaderLabInputTarget?.dispose?.(); } catch (_) {}
+            try { toneMapTarget?.dispose?.(); } catch (_) {}
+            try { toneMapMaterial?.dispose?.(); } catch (_) {}
             shaderLabInputTarget = null;
+            toneMapTarget = null;
+            toneMapQuad = null;
+            toneMapMaterial = null;
+            toneMapSourceNode = null;
+            toneMapMode = null;
             lastShaderLabFrameTime = 0;
         },
     };

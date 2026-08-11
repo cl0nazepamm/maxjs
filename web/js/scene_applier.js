@@ -61,6 +61,7 @@ import {
 } from './instance_batching.js';
 import { ensureGeometryUv0ForMaterial } from './material_contract.js';
 import { markOwned, OWNER_MAX } from './layer_ownership.js';
+import { ordinaryM3GeometryStorageKey } from './instance_buckets.js';
 
 // ─── Default hooks ─────────────────────────────────────────────────────
 //
@@ -365,21 +366,6 @@ function syncNodeGeometryGroups(mesh, geom, groups, nodeMap) {
     const target = shared ? geom.clone() : geom;
     applyInstanceGeometryGroups(target, groups);
     return target;
-}
-
-// Snapshot-native Max instances remain ordinary THREE.Mesh nodes. Their M3
-// descriptors alias identical byte ranges, so decode those ranges once and
-// reuse the resulting BufferGeometry. This deliberately does not participate
-// in instOf buckets or create an InstancedMesh. jsmod/skin/morph/spline paths
-// retain independent geometry because they can carry node-owned mutations.
-function ordinaryM3GeometryReuseKey(nd) {
-    if (!nd?.geo || nd.spline || nd.skin || nd.morph || nd.jsmod) return null;
-    if (!Number.isSafeInteger(nd.geo.vOff) || !Number.isSafeInteger(nd.geo.vN) ||
-        !Number.isSafeInteger(nd.geo.iOff) || !Number.isSafeInteger(nd.geo.iN) ||
-        nd.geo.vN <= 0 || nd.geo.iN <= 0) {
-        return null;
-    }
-    return JSON.stringify([nd.geo, Array.isArray(nd.groups) ? nd.groups : null]);
 }
 
 function getInstanceTransformPayload(grp, buffer) {
@@ -733,7 +719,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
             const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
             if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
         } else if (nd.geo && !jsmodSkipGeo) {
-            const reuseKey = ordinaryM3GeometryReuseKey(nd);
+            const reuseKey = ordinaryM3GeometryStorageKey(nd);
             const reused = reuseKey ? geometryByM3Storage.get(reuseKey) : null;
             if (reused) {
                 geom = reused;

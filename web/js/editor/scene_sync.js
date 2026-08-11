@@ -51,7 +51,7 @@ function createSceneSync(deps = {}) {
             root: deps.maxRoot,
             buckets: deps.maxInstanceBuckets,
             handleToBucket: deps.maxInstanceHandleToBucket,
-            materialKey: (nd) => (nd?.mat ? deps.materialIdentityKey(nd.mat) : '__default__'),
+            materialKey: (nd) => deps.sceneMaterialSignature(nd, false),
             sourceSignature: (nd) => deps.sceneMaterialSignature(nd, false),
             buildMaterial: ({ nd, geom }) => deps.createSceneRenderableMaterial(nd, false, geom ?? null, null),
             disposeMaterial: (mat) => deps.disposeSceneMaterial(mat),

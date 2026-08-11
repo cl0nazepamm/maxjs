@@ -25,7 +25,6 @@ docs/
 !docs/
 docs/*
 !docs/M3_FORMAT.md
-!docs/RELAY_MODE.md
 figma-webapp-*.md
 dev.bat
 dev2027.bat

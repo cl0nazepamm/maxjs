@@ -701,15 +701,13 @@ function createDeformSystem({
     // call it freely without node-graph stacking or pipeline churn.
     function ensureDecorated(entry, mesh) {
         if (entry.disposed || entry.failed) return;
-        for (const material of materialsOf(mesh)) {
-            if (!material || entry.decorated.has(material)) continue;
-            if (material.isNodeMaterial !== true) {
-                if (!entry.warnedNonNode) {
-                    entry.warnedNonNode = true;
-                    debugWarn(`[ctx.deform] "${entry.key}": non-node material on "${mesh.name}" — skipped`);
-                }
-                continue;
-            }
+        const materials = materialsOf(mesh);
+        let hasNodeMaterial = false;
+        for (const material of materials) {
+            if (!material) continue;
+            if (material.isNodeMaterial !== true) continue;
+            hasNodeMaterial = true;
+            if (entry.decorated.has(material)) continue;
             let positionNode = null;
             let normalNode = null;
             try {
@@ -736,6 +734,15 @@ function createDeformSystem({
             if (normalNode) material.normalNode = normalNode;
             material.needsUpdate = true;
             entry.decorated.add(material);
+        }
+        // Mixed Multi/Sub stacks are valid: ctx.deform decorates their node
+        // slots while classic slots (for example a trunk beside node-material
+        // leaves) render normally. Warn only when the whole drawable is
+        // incompatible; warning for each intentionally classic slot falsely
+        // reported a skipped deform even though the node slots were active.
+        if (!hasNodeMaterial && materials.length > 0 && !entry.warnedNonNode) {
+            entry.warnedNonNode = true;
+            debugWarn(`[ctx.deform] "${entry.key}": no node material on "${mesh.name}" — deformation inactive for this mesh`);
         }
     }
 

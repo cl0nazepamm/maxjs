@@ -114,9 +114,14 @@ instance decoder as described below.
 - Max native object instances remain separate ordinary `nodes`. When their
   finalized geometry channels are byte-identical, the snapshot writer aliases
   their `geo` ranges to one M3 storage block, and consumers may reuse the same
-  decoded `BufferGeometry` for those ordinary meshes. This is storage/runtime
-  reuse only: it does not emit `instOf`, `forestInstances`, or require a
-  Three.js `InstancedMesh`/WebGPU instance path.
+  decoded `BufferGeometry` and typed arrays for those ordinary meshes. This
+  does not emit `instOf` or `forestInstances`. Independently, the shared
+  performance bucket engine may promote a sufficiently large alias family
+  with one material signature into a real `THREE.InstancedMesh` draw. The
+  ordinary nodes remain addressable (hidden as render substitutes), so the
+  same payload wins both storage/allocation reuse and optional GPU draw reuse.
+  Snapshot nodes with baked tracks or runtime visibility/transform overrides
+  stay ordinary so handle-targeted behavior remains authoritative.
 - Empty scenes still carry a small payload (currently four zero bytes); readers must not infer content from file size.
 - Offsets and counts must be non-negative safe integers. Check multiplication and addition for overflow before constructing a typed array.
 

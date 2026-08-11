@@ -75,7 +75,6 @@ filename. See [`docs/M3_FORMAT.md`](../docs/M3_FORMAT.md).
 Relay Mode preserves this host contract inside a broker envelope; it does not
 create a second scene format. The reusable client applies a full `scene_bin`
 baseline before any continuation frame and requests resync on a sequence gap.
-See [`docs/RELAY_MODE.md`](../docs/RELAY_MODE.md).
 
 ## JSON control messages, host → viewer (`bridge.on`)
 

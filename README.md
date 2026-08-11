@@ -143,7 +143,7 @@ The production binary contract, including units, channel encodings, MXJB deltas,
 
 Relay Mode streams the same M3 full-scene baseline and live updates into a normal Three.js/Vite project. The DCC remains the level editor and source of truth; the receiving project owns rendering, gameplay, Rapier, UI, and its normal application loop. Once a relay consumer has accepted its baseline, the Max viewer stops rendering; Blender's headless relay path opens no viewer at all, so neither host competes with the game for GPU time.
 
-Use the reusable `maxjsRelay` Vite plugin and `RelayClient`; no max.js editor page is required in the receiving project. The minimal setup, lifecycle, asset policy, and Max/headless-Blender notes are in [docs/RELAY_MODE.md](docs/RELAY_MODE.md).
+Use the reusable `maxjsRelay` Vite plugin and `RelayClient`; no max.js editor page is required in the receiving project.
 
 ## Runtime Layers
 

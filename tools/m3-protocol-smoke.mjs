@@ -18,10 +18,12 @@ import {
     updateFloatGeometryAttribute,
 } from '../web/js/scene_binary.js';
 import { applySceneBin } from '../web/js/scene_applier.js';
+import { createInstanceBuckets } from '../web/js/instance_buckets.js';
 import { analyzeSnapshotPayload } from '../web/js/snapshot_diagnostics.js';
 import {
     fetchSnapshotScenePayload,
     snapshotScenePayloadCandidates,
+    snapshotInstanceBucketExcludedHandles,
     validateM3Metadata,
     validateSnapshotScenePayloadName,
 } from '../web/js/snapshot_boot.js';
@@ -382,6 +384,122 @@ async function m3AliasedGeometryReuseSmoke() {
     assert.equal(result.reusedM3GeometryCount, 1);
 }
 
+async function m3AliasInstanceBucketSmoke() {
+    const buffer = new ArrayBuffer(48);
+    const view = new DataView(buffer);
+    [-1, -1, 0, 1, -1, 0, 0, 1, 0]
+        .forEach((value, index) => view.setFloat32(index * 4, value, true));
+    [0, 1, 2].forEach((value, index) => view.setInt32(36 + index * 4, value, true));
+
+    const geo = { vOff: 0, vN: 9, iOff: 36, iN: 3, iType: 'u32' };
+    const groups = [[0, 3, 0]];
+    const mats = [{ name: 'Bark' }];
+    const nodes = [1, 2, 3, 4].map((h) => ({
+        h,
+        n: `Tree${h}`,
+        t: [...IDENTITY.slice(0, 12), h * 2, 0, 0, 1],
+        vis: 1,
+        geo: { ...geo },
+        groups,
+        mats,
+        matRefs: [7],
+    }));
+    const nodeMap = new Map();
+    const maxRoot = new THREE.Group();
+    const scene = new THREE.Scene();
+    scene.add(maxRoot);
+    const buckets = createInstanceBuckets({
+        nodeMap,
+        root: maxRoot,
+        threshold: 4,
+        materialKey: (nd) => `refs:${nd.matRefs.join(',')}`,
+        buildMaterial: ({ nd }) => nd.mats.map(() => new THREE.MeshBasicMaterial()),
+    });
+    const bucketPlan = buckets.plan(nodes);
+    assert.equal(bucketPlan.groups.size, 1, 'exact M3 aliases form one draw bucket candidate');
+
+    await applySceneBin({
+        buffer,
+        meta: { type: 'scene_bin', nodes },
+        ctx: { nodeMap, maxRoot, scene },
+        hooks: {
+            planInstanceBuckets: () => bucketPlan,
+            getInstanceBucketFor: (handle) => buckets.getBucketFor(handle),
+            updateInstanceBucketNode: (handle, nd) => buckets.updateNode(handle, nd),
+        },
+    });
+    assert.equal(nodeMap.get(1).geometry, nodeMap.get(4).geometry,
+        'draw promotion reuses the already decoded BufferGeometry');
+    assert.equal(buckets.build(nodes, bucketPlan), true);
+    assert.deepEqual(buckets.stats(), { buckets: 1, instances: 4 });
+    const instanced = maxRoot.children.find((child) => child.isInstancedMesh);
+    assert.ok(instanced, 'eligible aliases promote to a real THREE.InstancedMesh');
+    assert.equal(instanced.count, 4);
+    assert.equal(instanced.geometry, nodeMap.get(1).geometry);
+    assert.ok(Array.isArray(instanced.material), 'multi-material aliases remain bucketable');
+    assert.equal(instanced.material.length, 1);
+    for (const nd of nodes) assert.equal(nodeMap.get(nd.h).visible, false);
+
+    buckets.dispose();
+    assert.equal(instanced.parent, null);
+    for (const nd of nodes) assert.equal(nodeMap.get(nd.h).visible, true);
+
+    // Live instOf keeps its source as a separately visible renderable; only
+    // referrers are draw-substituted. This is distinct from static M3 aliases.
+    const explicitRoot = new THREE.Group();
+    const explicitMap = new Map();
+    const sharedGeometry = new THREE.BufferGeometry();
+    sharedGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+        0, 0, 0, 1, 0, 0, 0, 1, 0,
+    ], 3));
+    sharedGeometry.setIndex([0, 1, 2]);
+    for (const h of [10, 11, 12]) {
+        const original = new THREE.Mesh(sharedGeometry, new THREE.MeshBasicMaterial());
+        explicitMap.set(h, original);
+        explicitRoot.add(original);
+    }
+    const referrerGeometry = sharedGeometry.clone();
+    referrerGeometry.clearGroups();
+    referrerGeometry.addGroup(0, 3, 0);
+    explicitMap.get(11).geometry = referrerGeometry;
+    explicitMap.get(12).geometry = referrerGeometry;
+    const explicitNodes = [
+        { h: 10, t: IDENTITY, groups, mats },
+        { h: 11, instOf: 10, t: IDENTITY, groups, mats },
+        { h: 12, instOf: 10, t: IDENTITY, groups, mats },
+    ];
+    const explicitBuckets = createInstanceBuckets({
+        nodeMap: explicitMap,
+        root: explicitRoot,
+        threshold: 2,
+        materialKey: () => 'bark',
+        buildMaterial: ({ nd }) => nd.mats.map(() => new THREE.MeshBasicMaterial()),
+    });
+    explicitBuckets.build(explicitNodes);
+    const explicitInstanced = explicitRoot.children.find((child) => child.isInstancedMesh);
+    assert.equal(explicitInstanced.geometry, referrerGeometry,
+        'multi-material instOf buckets use the referrer group-table geometry');
+    assert.equal(explicitMap.get(10).visible, true, 'live instOf source stays visible');
+    assert.equal(explicitMap.get(11).visible, false);
+    assert.equal(explicitMap.get(12).visible, false);
+    explicitBuckets.dispose();
+    sharedGeometry.dispose();
+    referrerGeometry.dispose();
+    for (const mesh of explicitMap.values()) mesh.material.dispose();
+
+    assert.deepEqual(
+        [...snapshotInstanceBucketExcludedHandles({
+            animations: { clips: [{ targets: [{ target: 'handle:2', tracks: [] }] }] },
+            runtimeScene: {
+                hideMaxSyncHandles: [3],
+                transformOverrides: [{ handle: 4 }],
+            },
+        })].sort((a, b) => a - b),
+        [2, 3, 4],
+        'handle-targeted snapshot behavior stays outside draw buckets',
+    );
+}
+
 async function loaderCompatibilitySmoke() {
     assert.equal(validateM3Metadata({ type: 'scene_bin' }).type, 'scene_bin');
     assert.equal(validateM3Metadata({
@@ -458,6 +576,7 @@ protocolGoldenSmoke();
 m3RangeSmoke();
 m3AliasedRangeDiagnosticsSmoke();
 await m3AliasedGeometryReuseSmoke();
+await m3AliasInstanceBucketSmoke();
 await loaderCompatibilitySmoke();
 sourceContractSmoke();
 console.log('M3 + MXJB protocol smoke: PASS');

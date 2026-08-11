@@ -33,7 +33,17 @@ function setOwner(resource, owner) {
     ) {
         return resource;
     }
-    resource.userData[OWNER_KEY] = owner;
+    // Runtime ownership is internal bookkeeping, not authored scene data.
+    // Keep the stamp readable for diagnostics but non-enumerable so Three.js
+    // clone/copy and ordinary userData spreads do not transfer Max ownership
+    // onto a fresh JS resource. A copied "max" stamp makes ctx.js.own reject
+    // the new resource even though it has never belonged to the Max graph.
+    Object.defineProperty(resource.userData, OWNER_KEY, {
+        value: owner,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+    });
     return resource;
 }
 

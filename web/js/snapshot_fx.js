@@ -255,6 +255,55 @@ export async function createSnapshotFx({
         },
 
         /** Editor's environmentVisible flag (HDRI shown as backdrop). */
+        /**
+         * Live DOF param write. The dof* uniforms are shared TSL nodes, so the
+         * write reaches the running pipeline immediately (no rebuild); state is
+         * updated too so the next rebuild stays consistent. Lets site motion
+         * (zoom focus pulls) drive focus per frame.
+         */
+        setDofOptions(options = {}) {
+            const u = core.ctx?.uniforms;
+            const apply = (key, uniformName) => {
+                const value = Number(options[key]);
+                if (!Number.isFinite(value)) return;
+                state.dof[key] = value;
+                const node = u?.[uniformName];
+                if (node) node.value = value;
+            };
+            apply('focusDistance', 'dofFocusDistanceU');
+            apply('focalLength', 'dofFocalLengthU');
+            apply('bokehScale', 'dofBokehScaleU');
+            return { ...state.dof };
+        },
+        isDofEnabled() {
+            return state.dof?.enabled === true;
+        },
+        /**
+         * Live PowerShot param write — the ISP equivalent of setDofOptions.
+         *
+         * The PowerShot final stage holds `state.powershot` by reference
+         * (`getOptions`) and re-reads it every frame: render() calls
+         * ensureActivePipeline(), which syncs the active mode's pipeline from
+         * the live object. So mutating state here lands on the next frame with
+         * no rebuild and no shader recompile — unlike restoreState(), which
+         * tears the whole pipeline down and is meant for scene boots.
+         *
+         * Numeric keys only, which is all a per-frame driver needs (sensor
+         * noise, exposure, softness). Mode/preset/enabled changes still go
+         * through restoreState() because they DO change the graph.
+         */
+        setPowerShotOptions(options = {}) {
+            if (!options || typeof options !== 'object') return { ...state.powershot };
+            for (const [key, raw] of Object.entries(options)) {
+                if (key === 'mode' || key === 'preset' || key === 'enabled') continue;
+                const value = Number(raw);
+                if (Number.isFinite(value)) state.powershot[key] = value;
+            }
+            return { ...state.powershot };
+        },
+        isPowerShotEnabled() {
+            return state.powershot?.enabled === true;
+        },
         setEnvironmentVisible(visible) {
             envVisible = visible !== false;
         },

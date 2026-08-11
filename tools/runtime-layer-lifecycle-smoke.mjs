@@ -43,14 +43,27 @@ maxNode.userData.jsmod = true;
 const initialMaxMaterial = maxNode.material;
 const originalMaxMap = new THREE.Texture();
 initialMaxMaterial.map = originalMaxMap;
+const mixedMaterialMaxNode = disposableMesh('mixed-material-max-node', {});
+mixedMaterialMaxNode.userData.maxjsHandle = 103;
+const mixedClassicMaterial = mixedMaterialMaxNode.material;
+const mixedNodeMaterial = new THREE.MeshBasicMaterial();
+mixedNodeMaterial.isNodeMaterial = true;
+mixedMaterialMaxNode.material = [mixedClassicMaterial, mixedNodeMaterial];
+const classicOnlyMaxNode = disposableMesh('classic-only-max-node', {});
+classicOnlyMaxNode.userData.maxjsHandle = 104;
 const anchorSource = new THREE.Group();
 anchorSource.name = 'anchor-source';
 anchorSource.userData.maxjsHandle = 102;
 const maxRoot = new THREE.Group();
 maxRoot.name = '__max_root__';
-maxRoot.add(maxNode, anchorSource);
+maxRoot.add(maxNode, anchorSource, mixedMaterialMaxNode, classicOnlyMaxNode);
 scene.add(maxRoot);
-const nodeMap = new Map([[101, maxNode], [102, anchorSource]]);
+const nodeMap = new Map([
+    [101, maxNode],
+    [102, anchorSource],
+    [103, mixedMaterialMaxNode],
+    [104, classicOnlyMaxNode],
+]);
 let visibilityEvents = 0;
 let lastVisibilityEvent = null;
 let runtimeSceneEvents = 0;
@@ -107,6 +120,41 @@ let layerCtx = null;
 const mountResult = await manager.mount('runtime-smoke', (ctx) => {
     layerCtx = ctx;
     assert.equal(ctx.runtime.isSnapshot, false, 'live layer contexts default to non-snapshot mode');
+    assert.equal(
+        JSON.stringify(initialMaxMaterial.userData).includes('maxjsOwner'),
+        false,
+        'internal ownership stamps are not serialized as authored userData',
+    );
+    const copiedOwnerWarningCount = lifecycleWarnings.length;
+    const promotedMaterial = new THREE.MeshBasicMaterial();
+    promotedMaterial.userData = { ...initialMaxMaterial.userData };
+    assert.equal(
+        promotedMaterial.userData.maxjsOwner,
+        undefined,
+        'fresh materials do not inherit Max ownership through a userData spread',
+    );
+    ctx.js.own(promotedMaterial);
+    assert.equal(promotedMaterial.userData.maxjsOwner, 'js', 'ctx.js.own accepts the fresh promoted material');
+    assert.equal(
+        lifecycleWarnings.length,
+        copiedOwnerWarningCount,
+        'owning a fresh material copied from Max userData does not emit a false warning',
+    );
+    ctx.js.own(initialMaxMaterial);
+    assert.equal(initialMaxMaterial.userData.maxjsOwner, 'max', 'ctx.js.own still refuses the real Max material');
+    assert.equal(
+        lifecycleWarnings.length,
+        copiedOwnerWarningCount + 1,
+        'attempting to own the real Max material still emits the safety warning',
+    );
+    ctx.deform.attach(103, {
+        key: 'mixed-material-deform',
+        position: ({ position }) => position,
+    });
+    ctx.deform.attach(104, {
+        key: 'classic-only-deform',
+        position: ({ position }) => position,
+    });
     params = ctx.params.define({
         speed: { type: 'slider', value: 1, min: 0, max: 2, step: 0.1 },
         lift: { type: 'float', value: 3.5, step: 0.1 },
@@ -251,6 +299,19 @@ maxNode.material = followedMaxMaterial;
 manager.update(1 / 60, 0);
 assert.equal(jsmodClone.material, followedMaxMaterial, 'jsmod clone follows a source material replacement');
 assert.equal(followedMaxMaterial.userData.maxjsOwner, 'max', 'followed Max material is protected before assignment');
+assert.equal(
+    lifecycleWarnings.some(message => message.includes('mixed-material-deform')),
+    false,
+    'ctx.deform accepts a mixed classic/node Multi/Sub stack without a false warning',
+);
+assert.ok(
+    mixedNodeMaterial.positionNode,
+    'ctx.deform still decorates the compatible slot in a mixed Multi/Sub stack',
+);
+assert.ok(
+    lifecycleWarnings.some(message => message.includes('classic-only-deform') && message.includes('deformation inactive')),
+    'ctx.deform still warns when a matched drawable has no compatible node-material slot',
+);
 
 jsmodClone.material = replacementCloneMaterial;
 manager.update(1 / 60, 1 / 60);

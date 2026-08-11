@@ -177,7 +177,7 @@ export async function fetchSnapshotScenePayload(root, meta, fetchImpl = globalTh
     for (let i = 0; i < candidates.length; i++) {
         const name = candidates[i];
         const url = `${rootUrl}/${name.replace(/^\/+/, '')}`;
-        const response = await fetchImpl(url, { cache: 'no-store' });
+        const response = await fetchImpl(url, { cache: 'no-cache' });
         if (response.ok) {
             return { buffer: await response.arrayBuffer(), name, url };
         }
@@ -375,7 +375,7 @@ function withSnapshotLinkedSkySun(env, lightsData) {
 
 // ─── Phase 1: metadata ─────────────────────────────────────────────────
 async function loadMeta(root) {
-    const response = await fetch(`${root}/snapshot.json`, { cache: 'no-store' });
+    const response = await fetch(`${root}/snapshot.json`, { cache: 'no-cache' });
     if (!response.ok) {
         throw new Error(`snapshot.json fetch failed: HTTP ${response.status}`);
     }
@@ -441,9 +441,27 @@ function snapshotNeedsTslTextures(meta) {
 // ─── Phase 2: renderer ─────────────────────────────────────────────────
 // WebGL2 snapshot renderer. WebGPU is a separate explicit target, not a
 // transparent fallback, because backend switching changes material behavior.
-async function createRenderer(canvas, features) {
+// Canvas DPR ceiling, derived from the snapshot's own quality dials. PowerShot's
+// resolutionScale is the authored undersample (analog/digital ISP) — when it is
+// meaningfully below 1 the frame's detail ceiling sits well under canvas
+// resolution, so a high-DPR canvas only multiplies work the ISP throws away.
+function computePixelRatioCap(snapshotUi) {
+    const ps = snapshotUi?.fx?.powershot;
+    const psScale = Number(ps?.resolutionScale);
+    const undersampling = ps?.enabled === true
+        && Number.isFinite(psScale) && psScale <= 0.85;
+    if (undersampling) return 1;
+    const coarse = typeof matchMedia === 'function'
+        && matchMedia('(pointer: coarse)').matches;
+    return coarse ? 1.5 : 2;
+}
+
+async function createRenderer(canvas, features, snapshotUi) {
     const backend = normalizeRendererBackend(features?.renderer_pref);
-    const { renderer, backendLabel } = await createRendererImpl(canvas, { backend });
+    const { renderer, backendLabel } = await createRendererImpl(canvas, {
+        backend,
+        pixelRatioCap: computePixelRatioCap(snapshotUi),
+    });
     renderer.userData ??= {};
     renderer.userData.maxjsBackendLabel = backendLabel;
     return renderer;
@@ -553,6 +571,7 @@ async function registerOptionalModules(features, ctx) {
             modules.audio = createMaxJSAudioSystem({
                 THREE,
                 parent: ctx.maxBasisRoot ?? ctx.scene,
+                initialMuted: ctx.initialAudioMuted === true,
                 getActiveCamera: () => ctx.renderer?.xr?.isPresenting
                     ? ctx.renderer.xr.getCamera(ctx.camera)
                     : ctx.camera,
@@ -893,18 +912,44 @@ function setGeometryVertexColorAttributes(geometry, vertexColors, buffer = null)
 // when the snapshot carries one, else an identity id for the inline payload.
 const snapshotMaterialKeyIds = new WeakMap();
 let snapshotNextMaterialKeyId = 1;
-function snapshotNodeMaterialKey(nd) {
-    if (nd?.matRef != null) return String(nd.matRef);
-    const mat = nd?.mat;
-    if (mat && typeof mat === 'object') {
-        let id = snapshotMaterialKeyIds.get(mat);
-        if (id === undefined) {
-            id = snapshotNextMaterialKeyId++;
-            snapshotMaterialKeyIds.set(mat, id);
-        }
-        return `obj${id}`;
+function snapshotMaterialObjectKey(mat) {
+    if (!mat || typeof mat !== 'object') return String(mat ?? 'default');
+    let id = snapshotMaterialKeyIds.get(mat);
+    if (id === undefined) {
+        id = snapshotNextMaterialKeyId++;
+        snapshotMaterialKeyIds.set(mat, id);
     }
+    return `obj${id}`;
+}
+function snapshotNodeMaterialKey(nd) {
+    const matRefs = Array.isArray(nd?.matRefs) ? nd.matRefs : nd?.matsRef;
+    if (Array.isArray(matRefs)) return `refs:${matRefs.join(',')}`;
+    if (nd?.matRef != null) return String(nd.matRef);
+    if (Array.isArray(nd?.mats)) {
+        return `multi:${nd.mats.map(snapshotMaterialObjectKey).join(',')}`;
+    }
+    const mat = nd?.mat;
+    if (mat && typeof mat === 'object') return snapshotMaterialObjectKey(mat);
     return 'default';
+}
+
+export function snapshotInstanceBucketExcludedHandles(meta) {
+    const excluded = new Set();
+    for (const value of meta?.runtimeScene?.hideMaxSyncHandles ?? []) {
+        const handle = Number(value);
+        if (Number.isFinite(handle)) excluded.add(handle);
+    }
+    for (const entry of meta?.runtimeScene?.transformOverrides ?? []) {
+        const handle = Number(entry?.handle);
+        if (Number.isFinite(handle)) excluded.add(handle);
+    }
+    for (const clip of meta?.animations?.clips ?? []) {
+        for (const target of clip?.targets ?? []) {
+            const match = /^handle:(\d+)$/.exec(String(target?.target ?? ''));
+            if (match) excluded.add(Number(match[1]));
+        }
+    }
+    return excluded;
 }
 
 async function applyDelta(buffer, ctx) {
@@ -917,15 +962,19 @@ async function applyDelta(buffer, ctx) {
         console.info('[snapshot_boot] empty M3 scene payload (0 nodes) — applier no-op.');
         return;
     }
-    // instOf families collapse into InstancedMesh buckets (shared engine, same
-    // as the editor's optimizeMaxInstances path). Originals stay hidden in the
-    // nodeMap, so raycasts, layer overrides and profiling keep working.
+    // Live instOf families and static exact-M3 alias families may collapse into
+    // InstancedMesh buckets (shared engine, same as optimizeMaxInstances).
+    // Originals stay hidden in nodeMap, so handle-based runtime APIs survive.
+    const excludedBucketHandles = snapshotInstanceBucketExcludedHandles(meta);
     ctx.instanceBuckets ??= createInstanceBuckets({
         nodeMap: ctx.nodeMap,
         root: ctx.maxRoot,
         materialKey: snapshotNodeMaterialKey,
         buildMaterial: ({ nd, geom }) =>
-            ctx.materialBuilder.buildForNode({ nd: { mat: nd?.mat }, geom, wantsLine: false }),
+            ctx.materialBuilder.buildForNode({ nd, geom, wantsLine: false }),
+        // Baked tracks and runtime overrides address ordinary handles directly.
+        // Keep those originals renderable; static siblings may still bucket.
+        excludeNode: (nd) => excludedBucketHandles.has(Number(nd?.h)),
     });
     const buckets = ctx.instanceBuckets;
     const result = await applySceneBin({
@@ -1677,7 +1726,7 @@ async function bindLayerProject(root, meta, layerManager, runtimeState) {
 
     try {
         const manifestUrl = new URL('./project.maxjs.json', baseUrl);
-        const response = await fetch(manifestUrl, { cache: 'no-store' });
+        const response = await fetch(manifestUrl, { cache: 'no-cache' });
         if (response.ok) {
             manifest = await response.json();
             baseUrl = new URL('./', manifestUrl);
@@ -1758,7 +1807,7 @@ async function bindLayerProject(root, meta, layerManager, runtimeState) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-function startRenderLoop({
+async function startRenderLoop({
     renderer,
     scene,
     camera,
@@ -1770,11 +1819,23 @@ function startRenderLoop({
     optionalModules,
     studioLighting,
     enforceHiddenSources,
+    fpsCap,
 }) {
     let lastTimeMs = performance.now();
     let elapsed = 0;
+    // Frame limiter: 60fps ceiling regardless of display refresh (240Hz panels
+    // otherwise quadruple GPU work for a VHS look that gains nothing from it).
+    // snapshotUi.performance.fpsCap below 60 lowers it further; never raises.
+    const capHz = Math.min(Number(fpsCap) > 0 ? Number(fpsCap) : 60, 60);
+    const minFrameMs = 1000 / capHz;
+    let nextFrameMs = 0;
     const loop = () => {
         const nowMs = performance.now();
+        if (nowMs < nextFrameMs) return;
+        // Advance by exact steps so vsync quantization (144Hz etc.) averages
+        // out to the cap instead of locking to the next-lower divisor; snap
+        // forward after a stall so we never burst to catch up.
+        nextFrameMs = (nowMs - nextFrameMs > minFrameMs ? nowMs : nextFrameMs) + minFrameMs;
         const dt = Math.min(0.25, Math.max(0, (nowMs - lastTimeMs) / 1000));
         lastTimeMs = nowMs;
         elapsed += dt;
@@ -1800,6 +1861,27 @@ function startRenderLoop({
             layerManager?.afterRender?.(elapsed);
         }
     };
+    // Shadow warmup: the fx PassNode programs bake their lighting setup at first
+    // build and never regain ShadowNode afterwards, so shadow maps never render
+    // when every frame goes through maxjsFx. One direct render here builds the
+    // shared lights node with shadows (lights are already applied); the fx
+    // pipeline's programs then inherit it.
+    //
+    // Compile those pipelines ASYNC first: createRenderPipelineAsync runs on
+    // driver worker threads, where a synchronous first render of a heavy scene
+    // compiled everything in one GPU-process stall — long enough to freeze
+    // video/audio in OTHER tabs. Cap the wait: a heavy scene (30+ materials)
+    // can take >10s to fully compile — after the cap the remainder keeps
+    // compiling in the background while the scene starts.
+    if (typeof renderer.compileAsync === 'function') {
+        try {
+            await Promise.race([
+                renderer.compileAsync(scene, camera),
+                new Promise((resolve) => setTimeout(resolve, 3000)),
+            ]);
+        } catch (_) { /* fall through to the warmup render */ }
+    }
+    renderer.render(scene, camera);
     renderer.setAnimationLoop(loop);
     return () => renderer.setAnimationLoop(null);
 }
@@ -1820,7 +1902,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     };
 
     // Phase 2: renderer
-    const renderer = await createRenderer(canvas, features);
+    const renderer = await createRenderer(canvas, features, meta.snapshotUi);
     let studioModule = null;
     if (meta.snapshotUi?.studio) {
         try {
@@ -1933,6 +2015,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     optionalModules = await registerOptionalModules(features, {
         scene, camera, renderer, layerManager, nodeMap, lightHandleMap,
         maxBasisRoot, jsRoot, overlayRoot, meta,
+        initialAudioMuted: options.initialAudioMuted === true,
     });
 
     // Phase 6: apply the metadata-declared M3 payload. Metadata-free exports
@@ -2058,7 +2141,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     if (meta.animations) {
         let animationBuffer = null;
         if (meta.animations.bin) {
-            const animResp = await fetch(`${root}/${meta.animations.bin}`, { cache: 'no-store' });
+            const animResp = await fetch(`${root}/${meta.animations.bin}`, { cache: 'no-cache' });
             if (animResp.ok) animationBuffer = await animResp.arrayBuffer();
         }
         animationSystem.loadSnapshotAnimations(meta.animations, animationBuffer);
@@ -2078,7 +2161,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     studioLighting?.refreshSceneBindings?.();
 
     // Phase 10: run
-    const stopLoop = startRenderLoop({
+    const stopLoop = await startRenderLoop({
         renderer, scene, camera, controls, layerManager,
         animationSystem,
         maxjsFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx,
@@ -2088,6 +2171,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         enforceHiddenSources: () => {
             enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);
         },
+        fpsCap: meta.snapshotUi?.performance?.fpsCap,
     });
 
     return {
@@ -2099,6 +2183,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         environment: snapshotEnvironment,
         audioSystem: optionalModules.audio ?? null,
         gltfSystem: optionalModules.gltf ?? null,
+        // Post-fx controller (setDofOptions/setSSROptions/…) — uniform-backed
+        // options apply live, so site-side motion (zoom focus pulls) can drive
+        // them per frame without touching the pipeline.
+        postFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx ?? null,
         animationSystem, maxTimeline,
         resize,
         applyDelta: async (newBuffer) => {

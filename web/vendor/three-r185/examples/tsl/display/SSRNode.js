@@ -1057,7 +1057,7 @@ class SSRNode extends TempNode {
 			// length (cheap for the short rays that dominate). Scatter needs a fixed, bounded count for
 			// coherent stochastic sampling; each step then spans the whole ray as rayVec / totalStep.
 			const totalStep = int( this.stochastic === false
-				? trunc( max( abs( xLen ), abs( yLen ) ).mul( this.quality.clamp() ) ).max( int( 1 ) ).toConst()
+				? trunc( max( abs( xLen ), abs( yLen ) ).mul( this.quality.clamp() ) ).max( float( 1 ) ).toConst()
 				: this.quality.clamp().mul( MAX_STEPS ).max( float( 1 ) ) ).toConst();
 
 			const xSpan = xLen.div( totalStep ).toVar();

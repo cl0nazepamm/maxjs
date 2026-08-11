@@ -1,11 +1,11 @@
-// instance_buckets.js — collapse plain `instOf` node families into
+// instance_buckets.js — collapse compatible ordinary node families into
 // THREE.InstancedMesh buckets: one GPU draw per (source geometry, material)
-// family instead of one draw per referring node.
+// family instead of one draw per node. Families may arrive as live `instOf`
+// references or as static snapshot nodes whose exact M3 descriptors alias the
+// same physical ranges.
 //
-// Host-neutral extraction of the editor's max-instance buckets
-// (web/js/editor/scene_sync.js, `optimizeMaxInstances`). The editor still
-// runs its own copy; migrating it onto this module is a scene_sync change
-// that must ride a Max-viewer verification pass, per AGENTS.md.
+// Host-neutral engine shared by snapshot boot and the editor's
+// `optimizeMaxInstances` path (web/js/editor/scene_sync.js).
 //
 // Fits the scene_applier hook contract:
 //
@@ -48,13 +48,27 @@ function matrixArraysAlmostEqual(a, b, eps = 1.0e-7) {
 
 const matrixScratch = new THREE.Matrix4();
 
+// The storage identity used by scene_applier's decode cache and by this draw
+// bucket planner must stay identical. Geometry aliases remain ordinary meshes
+// unless the bucket performance gate/threshold elects to promote the family.
+// Mutable node-owned geometry paths never participate.
+export function ordinaryM3GeometryStorageKey(nd) {
+    if (!nd?.geo || nd.spline || nd.skin || nd.morph || nd.jsmod) return null;
+    if (!Number.isSafeInteger(nd.geo.vOff) || !Number.isSafeInteger(nd.geo.vN)
+        || !Number.isSafeInteger(nd.geo.iOff) || !Number.isSafeInteger(nd.geo.iN)
+        || nd.geo.vN <= 0 || nd.geo.iN <= 0) {
+        return null;
+    }
+    return JSON.stringify([nd.geo, Array.isArray(nd.groups) ? nd.groups : null]);
+}
+
 /**
  * @param {object}   options
  * @param {Map}      options.nodeMap       handle → THREE.Object3D (per-node originals)
  * @param {object}   options.root          parent for bucket meshes (the max root)
  * @param {function} options.materialKey   (nd) → string; material identity for grouping
  * @param {function} options.buildMaterial ({ nd, geom }) → THREE.Material for a bucket
- *                                         (nd is the family's first referrer payload)
+ *                                         (nd is the family's first payload)
  * @param {function} [options.disposeMaterial]     (mat) → void; default disposes
  * @param {function} [options.applyMaterialScalar] (mesh, mat) → void; live scalar edits
  * @param {number|function} [options.threshold=4]  minimum family size worth a bucket;
@@ -92,14 +106,21 @@ export function createInstanceBuckets({
         const isEnabled = typeof enabled === 'function' ? enabled() : enabled;
         if (!isEnabled) return groups;
         for (const nd of nodes) {
-            if (!Number.isFinite(nd?.instOf) || nd.instOf <= 0) continue;
-            if (nd.jsmod || nd.spline || nd.skin || nd.groups || nd.mats) continue;
+            if (nd?.jsmod || nd?.spline || nd?.skin || nd?.morph) continue;
             if (excludeNode?.(nd)) continue;
-            const bucketKey = `${nd.instOf}|${materialKey(nd)}`;
+            const materialIdentity = String(materialKey(nd));
+            const isExplicitInstance = Number.isFinite(nd?.instOf) && nd.instOf > 0 && !nd.geo;
+            const storageKey = isExplicitInstance ? null : ordinaryM3GeometryStorageKey(nd);
+            if (!isExplicitInstance && !storageKey) continue;
+            const bucketKey = isExplicitInstance
+                ? `inst:${nd.instOf}|${materialIdentity}`
+                : `m3:${storageKey}|${materialIdentity}`;
             if (!groups.has(bucketKey)) {
                 groups.set(bucketKey, {
                     key: bucketKey,
-                    sourceHandle: nd.instOf,
+                    sourceHandle: isExplicitInstance ? nd.instOf : nd.h,
+                    materialKey: materialIdentity,
+                    hideSource: !isExplicitInstance,
                     nodes: [],
                 });
             }
@@ -255,25 +276,30 @@ export function createInstanceBuckets({
 
         for (const group of resolved.groups.values()) {
             const sourceMesh = nodeMap.get(group.sourceHandle);
-            if (!sourceMesh?.geometry || sourceMesh.isLine || sourceMesh.isLineSegments
-                || sourceMesh.isSkinnedMesh) continue;
-            const material = buildMaterial({ nd: group.nodes[0], geom: sourceMesh.geometry });
-            const mesh = new THREE.InstancedMesh(sourceMesh.geometry, material, group.nodes.length);
+            // Explicit instOf referrers may own a geometry clone solely for a
+            // different group table. Use the first referrer's resolved geometry
+            // for the draw, while keeping the semantic source separately visible.
+            const geometryMesh = nodeMap.get(group.nodes[0]?.h) ?? sourceMesh;
+            if (!sourceMesh || !geometryMesh?.geometry || geometryMesh.isLine
+                || geometryMesh.isLineSegments || geometryMesh.isSkinnedMesh) continue;
+            const material = buildMaterial({ nd: group.nodes[0], geom: geometryMesh.geometry });
+            const mesh = new THREE.InstancedMesh(geometryMesh.geometry, material, group.nodes.length);
             mesh.matrixAutoUpdate = false;
             mesh.frustumCulled = false;
-            mesh.castShadow = !!sourceMesh.castShadow;
-            mesh.receiveShadow = !!sourceMesh.receiveShadow;
+            mesh.castShadow = !!geometryMesh.castShadow;
+            mesh.receiveShadow = !!geometryMesh.receiveShadow;
             mesh.name = `max_instances_${group.sourceHandle}_x${group.nodes.length}`;
 
             const bucket = {
                 mesh,
                 sourceHandle: group.sourceHandle,
-                materialKey: materialKey(group.nodes[0]),
+                materialKey: group.materialKey,
+                hideSource: group.hideSource,
                 handles: new Set(),
                 handleToIndex: new Map(),
                 transforms: new Map(),
                 visible: new Map(),
-                lastMaterialScalarSignature: materialKey(group.nodes[0]),
+                lastMaterialScalarSignature: group.materialKey,
             };
 
             group.nodes.forEach((nd, index) => {
@@ -283,7 +309,7 @@ export function createInstanceBuckets({
                 bucket.visible.set(nd.h, nd.vis == null ? true : !!nd.vis);
                 handleToBucket.set(nd.h, group.key);
                 const original = nodeMap.get(nd.h);
-                if (original && original !== sourceMesh) original.visible = false;
+                if (original && (group.hideSource || original !== sourceMesh)) original.visible = false;
             });
 
             refreshVisibility(bucket);

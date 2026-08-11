@@ -34,9 +34,22 @@ export function measureCanvasSize(canvas, width, height) {
     };
 }
 
-function configureRenderer(renderer, canvas) {
+// Device pixel ratio, clamped by the cap the boot derives from the snapshot
+// (PowerShot's resolutionScale undersamples the frame on purpose — a >1 DPR
+// canvas above that ceiling is pure overdraw, worst on phones at DPR 3).
+function resolvePixelRatio(renderer) {
+    const cap = Number(renderer?.userData?.maxjsPixelRatioCap);
+    const dpr = devicePixelRatio || 1;
+    return Number.isFinite(cap) && cap > 0 ? Math.min(dpr, cap) : dpr;
+}
+
+function configureRenderer(renderer, canvas, pixelRatioCap) {
     const { width, height } = measureCanvasSize(canvas);
-    renderer.setPixelRatio(devicePixelRatio || 1);
+    renderer.userData ??= {};
+    if (Number.isFinite(pixelRatioCap) && pixelRatioCap > 0) {
+        renderer.userData.maxjsPixelRatioCap = pixelRatioCap;
+    }
+    renderer.setPixelRatio(resolvePixelRatio(renderer));
     renderer.setSize(width, height, /* updateStyle */ false);
     renderer.toneMapping = THREE.NeutralToneMapping;
     renderer.toneMappingExposure = 1.0;
@@ -56,7 +69,7 @@ async function initializeRenderer(renderer) {
  *
  * Always renders into the supplied canvas (no implicit DOM injection).
  */
-export async function createRenderer(canvas, { backend = 'webgl' } = {}) {
+export async function createRenderer(canvas, { backend = 'webgl', pixelRatioCap } = {}) {
     if (!canvas) throw new Error('createRenderer: canvas is required');
 
     const rawBackend = String(backend || 'webgl').toLowerCase();
@@ -68,7 +81,7 @@ export async function createRenderer(canvas, { backend = 'webgl' } = {}) {
         : (normalizedBackend === 'tsl_gl'
             ? createTslGlRenderer(canvas)
             : createWebGlRenderer(canvas));
-    configureRenderer(renderer, canvas);
+    configureRenderer(renderer, canvas, pixelRatioCap);
     await initializeRenderer(renderer);
 
     if (normalizedBackend === 'webgpu' && renderer.backend?.isWebGPUBackend !== true) {
@@ -246,7 +259,7 @@ export function createScene({ renderer, canvas } = {}) {
     // Resize handler — call from the wrapper on window resize / canvas changes.
     function resize(width, height) {
         const { width: w, height: h } = measureCanvasSize(canvas ?? renderer.domElement, width, height);
-        renderer.setPixelRatio(devicePixelRatio || 1);
+        renderer.setPixelRatio(resolvePixelRatio(renderer));
         renderer.setSize(w, h, /* updateStyle */ false);
         camera.aspect = w / h;
         camera.updateProjectionMatrix();

@@ -23,9 +23,6 @@ projects/
 projects/*/dist/node_modules/
 AGENTS.md
 docs/
-!docs/
-docs/*
-!docs/M3_FORMAT.md
 figma-webapp-*.md
 dev.bat
 dev2027.bat

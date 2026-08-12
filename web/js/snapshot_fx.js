@@ -384,7 +384,23 @@ export async function createSnapshotFx({
         },
 
         resize() {
-            if (pipelineReady && rendererSizeChanged()) rebuild();
+            if (!pipelineReady || !rendererSizeChanged()) return;
+            // A size change needs an OUTPUT refresh, not a rebuild: PassNode
+            // render targets resize themselves from the renderer dimensions.
+            // Rebuilding instead mints a second full set of effect targets and
+            // strands the first — measured on a resizing snapshot page as ~2
+            // textures plus ~170 NodeUniformsGroups leaked per resize, growing
+            // without bound (the viewer has never leaked here because
+            // maxjs_fx.js already does it this way; see
+            // syncRendererResizeState, which carries the same reasoning).
+            core.postProcessing.needsUpdate = true;
+            // Recording the new size HERE is half the fix, not bookkeeping:
+            // render() below runs the same rendererSizeChanged() check and
+            // WOULD rebuild on the next frame. Consuming the change now leaves
+            // it nothing to react to. That ordering is exactly why the viewer
+            // is clean — its resize path snapshots the size before the frame
+            // loop's own check ever sees it.
+            snapshotRendererSize();
         },
 
         dispose() {

@@ -1963,10 +1963,26 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const snapshotCameraClip = meta.snapshotUi?.cameraClip ?? null;
 
     const getViewportAspect = (width, height) => getCanvasAspect(canvas, width, height);
+
+    // Declared here rather than at Phase 4 (where it is populated) purely so
+    // resize() below can read it without a temporal-dead-zone risk: a
+    // ResizeObserver callback can land during any await between the two
+    // points, and a `let` declared later would throw on access rather than
+    // read undefined.
+    let optionalModules = {};
+
     const resize = (width, height) => {
         const result = sceneCtx.resize(width, height);
         applyHorizontalFovToVertical(camera, result.aspect);
         applySnapshotCameraClip(camera, snapshotCameraClip);
+        // Hand the size change to the fx layer ON THE RESIZE EVENT. Without
+        // this the only thing that notices is the per-frame check at the top
+        // of snapshot_fx.render(), and that path rebuilds the entire post-FX
+        // pipeline — stranding a full set of effect targets on every resize.
+        // The viewer has always done this (renderer_core.js calls
+        // maxjsFx.resize() from its own resize path); the snapshot host never
+        // did, which is the whole difference between the two.
+        (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.resize?.();
         return result;
     };
 
@@ -2038,7 +2054,6 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 4: layer manager. Getter closures keep the layer surface stable
     // while optional modules are loaded immediately after the manager exists.
-    let optionalModules = {};
     const layerManager = buildLayerManager({
         scene, camera, renderer, THREE,
         nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,

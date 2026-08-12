@@ -145,6 +145,7 @@
         import { maxTimeline } from '../maxjs_timeline.js';
         import { createHostBridge } from './host_bridge.js';
         import { createEditorContext } from './context.js';
+        import { installDebugBridge } from './debug_bridge.js';
         import { createPerfHud } from '../perf_hud.js';
         import { createMaxJSFxController } from '../maxjs_fx.js';
         import { createWebGLBasicFx } from '../webgl_basicfx.js';
@@ -2820,6 +2821,23 @@
         window.maxJS.time = maxTimeline;
         window.maxJS.audio = audioSystem;
         window.maxJS.gltf = gltfSystem;
+
+        // Viewer-only inspection surface (globalThis.__maxjs). The renderer,
+        // scene and camera live in this function's scope and hang off no
+        // global, so an attached CDP session could not reach them at all.
+        // Handed as thunks, never values: a backend switch REBUILDS renderer
+        // and camera, and a captured reference would read a dead device (the
+        // RULE in context.js). Snapshot builds never import js/editor/, so
+        // this cannot reach a published scene.
+        installDebugBridge({
+            ctx,
+            getRenderer: () => renderer,
+            getScene: () => scene,
+            getCamera: () => camera,
+            getControls: () => controls,
+            getFx: () => maxjsFx,
+            THREE,
+        });
         _layerManagerRef = layerManager;
         _projectRuntimeRef = projectRuntime;
         attachLayerPanelSubscriptions();

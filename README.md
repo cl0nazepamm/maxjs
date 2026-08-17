@@ -11,8 +11,6 @@
 
 Architecture is split between viewer and standalone into two optimized paths: the fully featured live viewer inside 3ds Max for authoring and the Snapshot Builder that builds a heavily optimized version of what you see in the viewer. Further optimizations can be made after export. 
 
-It does not export the advanced post processing stack yet. But it is coming soon! 
-
 ## Features
 
 - **Fast Sync** using native callbacks, shared buffer binary deltas.
@@ -44,7 +42,7 @@ max.js exposes three stable viewer pipelines:
 
 | Mode | Purpose |
 |---|---|
-| **WGL2** | Simple WebGL2 compatibility path with a small safe FX stack. Comes with the experimental pathtracer mode. |
+| **WGL2** | Simple WebGL2 compatibility path with a small safe FX stack. |
 | **WebGPU** | Main advanced renderer path for the full max.js FX stack. Supports forcing WebGL. |
 
 ## Scene Data
@@ -52,7 +50,7 @@ max.js exposes three stable viewer pipelines:
 ### Geometry
 
 - Meshes, splines, and generated geometry with vertex color, normals and UV channels.
-- Automatic instancing, includes Forest Pack and RailClone generated output.
+- Automatic instancing
 - HTML loading as a texture or scene object. You can load webpages to viewer. (uses in-canvas API)
 
 ### Materials
@@ -126,7 +124,7 @@ Exported snapshot folders can include:
 - `index.html` seeded only when missing, so user-authored standalone edits are not overwritten.
 - `snapshot.html` as the max.js-owned standalone runtime.
 - `snapshot.json` scene metadata.
-- `scene.m3` packed M3 scene payload (`scene.bin` remains readable for older exports).
+- `scene.m3` packed M3 scene payload
 - `scene_anim.bin` optional binary animation payload.
 - `assets/` copied texture/media files.
 - `project.maxjs.json` and `inlines/` for scene-local runtime replay.
@@ -139,9 +137,9 @@ max.js treats runtime files as plugin-owned and `index.html` as project-owned. R
 
 The production binary contract, including units, channel encodings, MXJB deltas, and compatibility rules, is documented in [docs/M3_FORMAT.md](docs/M3_FORMAT.md).
 
-## Relay Mode
+## Relay Mode (WIP)
 
-Relay Mode streams the same M3 full-scene baseline and live updates into a normal Three.js/Vite project. The DCC remains the level editor and source of truth; the receiving project owns rendering, gameplay, Rapier, UI, and its normal application loop. Once a relay consumer has accepted its baseline, the Max viewer stops rendering; Blender's headless relay path opens no viewer at all, so neither host competes with the game for GPU time.
+Relay Mode streams the same M3 full-scene baseline and live updates into a normal Three.js/Vite project. The DCC remains the level editor and source of truth; the receiving project owns rendering, gameplay, Rapier, UI, and its normal application loop. Once a relay consumer has accepted its baseline, the Max viewer stops rendering.
 
 Use the reusable `maxjsRelay` Vite plugin and `RelayClient`; no max.js editor page is required in the receiving project.
 

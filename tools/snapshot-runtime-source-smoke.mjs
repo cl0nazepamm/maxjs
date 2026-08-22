@@ -5,6 +5,10 @@ const source = readFileSync(
     new URL('../web/js/snapshot_boot.js', import.meta.url),
     'utf8',
 );
+const snapshotFxSource = readFileSync(
+    new URL('../web/js/snapshot_fx.js', import.meta.url),
+    'utf8',
+);
 const snapshotExportSource = readFileSync(
     new URL('../src/maxjs_panel_snapshot_export.inl', import.meta.url),
     'utf8',
@@ -96,6 +100,19 @@ assert.match(boot, /optionalModules\.gltf\?\.applyGLTFs/,
 assert.match(boot, /enforceRuntimeHiddenSources\(runtimeSceneState\.hiddenSourceHandles,\s*nodeMap\)/,
     'hidden Max sources are reasserted after animation and delta changes');
 
+const irLightGraph = functionBody('async function installSnapshotIrLightGraph(');
+assert.match(irLightGraph, /snapshotHasIrEmitters\(lights\)/,
+    'snapshot installs specialized lighting only when its payload declares IR emitters');
+assert.match(irLightGraph, /import\('\.\/max_lights_node\.js'\)/,
+    'IR snapshot lighting uses the same adaptive light graph as live max.js');
+assert.match(irLightGraph, /installMaxLightsRenderer\(renderer\)/,
+    'IR lights install MaxLightsNode even when Speedball GI and Studio are disabled');
+assert.ok(
+    boot.indexOf('installSnapshotIrLightGraph(renderer, meta.lights)')
+        < boot.indexOf('createScene({ meta, renderer, canvas })'),
+    'IR lighting installs before the snapshot scene and its materials compile',
+);
+
 const speedballReplay = functionBody('async function createSnapshotSpeedballGi(');
 assert.match(speedballReplay, /import\('speedball-gi'\)/,
     'snapshot Speedball replay resolves through the package import map');
@@ -109,6 +126,31 @@ assert.match(source, /snapshotUi\?\.speedballGi/,
     'snapshot replay reads the Speedball-branded UI state');
 assert.match(speedballReplay, /maxTimeline\.playing\?\.\(\) === true/,
     'snapshot Speedball replay observes standalone timeline playback after warmup');
+
+const nirSensingReplay = functionBody('async function createSnapshotNirSensingController(');
+assert.match(nirSensingReplay, /import\('speedball-gi'\)/,
+    'snapshot NIR replay resolves the shared direct-light gates lazily');
+assert.match(nirSensingReplay, /powerShot\.mode === 'infrared'.*powerShot\.mode === 'nightshot'/s,
+    'standalone sensing follows the same PowerShot imager modes as the editor');
+for (const consumer of [
+    'setNirDirectSensing',
+    'setNirIlluminatorGain',
+    'setNirSensing',
+    'setNirGain',
+    'setSpectralRasterSensing',
+]) {
+    assert.match(nirSensingReplay, new RegExp(`\\b${consumer}\\b`),
+        `snapshot NIR replay drives ${consumer}`);
+}
+assert.match(snapshotFxSource, /getPowerShotOptions\(\)\s*\{\s*return state\.powershot;/,
+    'snapshot PowerShot exposes its active imager state to the frame driver');
+const snapshotLoop = functionBody('async function startRenderLoop(');
+assert.ok(
+    snapshotLoop.indexOf('nirSensing.sync();') < snapshotLoop.indexOf('renderer.compileAsync'),
+    'snapshot applies NIR sensing before its first render compile',
+);
+assert.match(snapshotLoop, /renderer\.setAnimationLoop\(null\);\s*nirSensing\.dispose\(\);/,
+    'snapshot teardown resets module-shared NIR state');
 
 const animationSource = readFileSync(
     new URL('../web/js/maxjs_animation.js', import.meta.url),
@@ -134,6 +176,12 @@ for (const page of snapshotPages) {
 
 assert.match(sceneLightsSource, /THREE\.MathUtils\.clamp\(penumbra, 0, 1\)/,
     'snapshot light replay clamps old out-of-range spotlight penumbra values');
+assert.match(sceneLightsSource, /lightData\?\.emitterClass/,
+    'snapshot light replay prefers the native explicit emitter class');
+assert.match(sceneLightsSource, /_ir_\|_nir_\|_illuminator_/,
+    'legacy snapshot lights still infer IR intent from conventional names');
+assert.match(lightSyncSource, /DetectLightEmitterClass\(node\)/,
+    'native light serialization stores spectral emitter intent explicitly');
 assert.match(editorLightsSource, /THREE\.MathUtils\.clamp\(penumbra, 0, 1\)/,
     'live light replay clamps old out-of-range spotlight penumbra values');
 const transportedPenumbraClamps = lightSyncSource.match(

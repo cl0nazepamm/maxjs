@@ -380,6 +380,7 @@ async function createTexturePipeline(deps = {}) {
                     }
 
                     applyLoadedMaterialXTemplate(template, loadedMaterial, md);
+                    deps.onMaterialStructureChanged?.(template);
                     return template;
                 })
                 .catch(error => {
@@ -395,6 +396,7 @@ async function createTexturePipeline(deps = {}) {
                                 materialXIndex: 1,
                             });
                             applyLoadedTSLTemplate(template, fallback, md);
+                            deps.onMaterialStructureChanged?.(template);
                             deps.maxjsDebugWarn('[MaterialX] Falling back to TSL code for MeshTSLNodeMaterial');
                             return template;
                         } catch (fallbackError) {
@@ -406,6 +408,7 @@ async function createTexturePipeline(deps = {}) {
                     template.userData ??= {};
                     template.userData.maxjsMaterialXPending = false;
                     template.needsUpdate = true;
+                    deps.onMaterialStructureChanged?.(template);
                     return template;
                 })
                 .finally(() => {

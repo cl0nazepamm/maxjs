@@ -54,7 +54,11 @@ function createRenderLoop(deps = {}) {
             deps.syncPathTracingDofFromPostFx();
             // Default key light follows camera
             if (deps.defaultLights.visible) {
-                deps.defaultKey.position.copy(deps.getActiveCameraWorldPosition(deps.cameraPositionWorld));
+                const cameraWorldPosition = deps.getActiveCameraWorldPosition(deps.cameraPositionWorld);
+                if (!deps.defaultKey.position.equals(cameraWorldPosition)) {
+                    deps.defaultKey.position.copy(cameraWorldPosition);
+                    deps.speedballGi?.markLightsDirty?.({ defer: true });
+                }
             }
             deps.updateVolumeUniforms();
             deps.lightLinking.updateCameraConstraints();
@@ -160,14 +164,15 @@ function createRenderLoop(deps = {}) {
                 // Speedball GI probe field tick — every frame (the field idle-gates and
                 // budget-throttles itself); no-op unless enabled; never recompiles
                 // materials. ONLY camera movement marks interaction — matching the
-                // speedball standalone. Delta-sync must NOT mark it: Max edits
-                // stream serials at 30-60 Hz, which starved the 200 ms idle gate
-                // and deferred every light/geo pickup until the drag ended
-                // ("delayed" GI). The field handles live edits itself — cheap
-                // in-place light refresh + settle-debounced geometry rebuild
-                // (24-tick checks × 2 stable) that can never land mid-drag.
+                // speedball standalone. Host/layer/animation edits send explicit,
+                // coalesced dirty packets without marking camera interaction: cheap
+                // light/material/transform refits stay live during motion, while
+                // structural rebuilds retain Speedball's own rest gate. No fallback
+                // scene-signature traversals run in the editor integration.
                 const speedballNowMs = performance.now();
-                if (controlsChanged) deps.speedballGiLastInteractionMs = speedballNowMs;
+                if (controlsChanged || deps.animationSystem?.isDrivingSceneCamera?.()) {
+                    deps.speedballGiLastInteractionMs = speedballNowMs;
+                }
                 deps.speedballGi?.tick(speedballNowMs);
                 // White Phosphor = the imager senses NIR. One state, three
                 // consumers, each a no-op when unchanged so the per-frame calls

@@ -14,11 +14,20 @@ The normalization is bounded on the slow side: one update never blends in more f
 
 The live demo exposes a **normalize hysteresis** switch so you can turn the normalization off and compare against the raw per-update value.
 
+Sampling has two stable working profiles. **Gated** holds the current ray basis
+indefinitely—idle time, probe-grid size, and batch divisibility cannot rotate it—and
+uses 0.60 hysteresis for low-latency, mostly flicker-free lighting. **Monte Carlo**
+re-jitters every solve and uses 0.90 hysteresis to absorb that sample blast.
+`setJitterMode()` remembers explicit hysteresis overrides separately per mode.
+
 ## Launch live demos
 
-**[▶ Sponza GI](https://cl0nazepamm.github.io/speedball/)** · **[▶ Glass dispersion](https://cl0nazepamm.github.io/speedball/dispersion.html)**
+**[▶ Unified Sponza light-transport demo](https://cl0nazepamm.github.io/speedball/)**
 
-Locally: `npm start` then open `http://127.0.0.1:8777/` or `/dispersion.html`.
+Locally: `npm start` then open `http://127.0.0.1:8777/`. The centre sphere
+switches live between emissive-mesh NEE and reflective metal in one raster GI
+scene. Photon caustics remain available through the library API but are not run
+by the hosted demo while their projection model is being revised.
 
 Requires a WebGPU-capable browser (Chrome/Edge stable; Safari 26+).
 
@@ -36,12 +45,19 @@ import { installSpeedballGI } from 'speedball-gi';
 // At SETUP before the first render / renderer.setAnimationLoop():
 const gi = installSpeedballGI({
   renderer, scene, camera,
-  roughReflections: true, // optional glossy + rough local reflections; reuses DDGI rays
+  jitterMode: 'gated',
+  reflectionQuality: 'high', // off | rough | high | ultra; reuses DDGI rays
   // reflectionSkyFallback: true, // only when setSky() should replace a missing environment map
 });
 
 // In your render loop, once per frame:
 gi.update();
+
+function disposeScene() {
+  // Dispose GI before the renderer and scene resources.
+  gi.dispose();
+  renderer.dispose();
+}
 ```
 
 **Install before the first render / `setAnimationLoop()`.** Speedball folds a
@@ -58,19 +74,71 @@ has already run, three has cached a non-GI lights node and GI will fail.
   all-metal import reads as black GI. Opt-in; mutates materials in place. You can
   also pass `prepareMaterials: true` to `installSpeedballGI`.
 
+## Dynamic scenes and realtime editors
+
+Hosts that already know what changed should notify Speedball instead of making
+it rediscover edits by scanning the entire scene:
+
+```js
+// One ordinary Object3D moved:
+gi.markTransformsDirty(mesh);
+
+// One slot in an InstancedMesh pool moved or changed active state:
+gi.markTransformsDirty({ object: crowd, instanceIndex: 37 });
+
+// Equivalent event-oriented surface for engines and DCC bridges:
+gi.notifySceneChange({ type: 'transform', object: mesh });
+gi.notifySceneChange({ type: 'deform', object: streamedMesh });
+gi.notifySceneChange({ type: 'topology' }); // add/remove/new geometry
+```
+
+Event-complete hosts can pass `autoDetectChanges: false` to
+`installSpeedballGI()`. Explicit dirty packets still run during motion, while the
+compatibility transform/deform/topology/light signature traversals are skipped.
+Leave it at the default `true` if any scene mutation can happen without a packet.
+
+Transform packets are coalesced and consumed during continuous motion. A dirty
+object rewrites only its stable instance record(s) and the unique TLAS ancestor
+chain; unrelated objects and TLAS subtrees are not scanned, refitted, or
+uploaded. Transform events for cameras, helpers, excluded meshes, or other
+untraced objects are intentionally cheap no-ops.
+
+`InstancedMesh` allocation capacity is reserved in the TLAS at build time.
+Changing `mesh.count` within that capacity, recycling an existing matrix slot,
+or revealing a previously inactive slot needs only `markTransformsDirty()`—not
+a geometry rebuild. Growing beyond `instanceMatrix.count`, adding ordinary
+unique geometry, removing geometry, changing connectivity, or changing material
+assignment remains structural and must call `markTopologyDirty()` (or
+`notifySceneChange({ type: 'topology' })`). The automatic scene signatures remain
+enabled as a compatibility fallback for integrations that send no events.
+
 ## Local DDGI reflections
 
-Pass **`roughReflections: true`** at creation time to build rough and glossy
-local-radiance lobes from the rays Speedball already traces. It adds no reflection
-rays or BVH traversal. Diffuse, depth, and the stable power-8 rough lobe keep the
-compact 6x6 octahedral cache; smooth materials use a separate 16x16, power-64
-glossy cache with support-aware temporal history. That high-resolution resolve is
-one additional dispatch per steady probe solve while the opt-in feature is enabled;
-new atlas allocations also receive a one-time clear.
+Choose a structural **`reflectionQuality`** at creation time. Every tier builds
+local-radiance lobes from rays Speedball already traces, adding no reflection rays
+or BVH traversal:
+
+- **`off`** — zero reflection buffers, atlases, compute, or material sampling.
+- **`rough`** — the stable power-8 lobe in the compact 6x6 cache only.
+- **`high`** — rough plus an 8x8 power-64 glossy cache. Glossy texels are
+  interleaved over two solves and receivers blend continuously across eight probes.
+- **`ultra`** — the legacy `roughReflections: true` path: 16x16 glossy resolution,
+  every texel every solve, and eight glossy receiver probes.
+
+The old boolean remains compatible: `roughReflections: false` maps to `off`, and
+`roughReflections: true` maps to `ultra`. A named tier overrides the boolean.
+The bundled Sponza demo exposes the four modes under **SPEEDBALL GI → Quality →
+reflection quality**. Changing it reloads the page because the tier changes GPU
+buffers, bindings, compute kernels, and material graphs.
 
 The physical receiver reuses the diffuse gather's probe visibility, applies
 depth-moment parallax correction to each reflection lookup, and samples only the
-lobe(s) required by material roughness. The result stays in Three's native
+lobe(s) required by material roughness. Local reflections run through the full
+roughness range (`roughnessLimit` 1). Override at creation with `roughnessLimit` or
+live with `gi.setRoughnessLimit(0..1)`. Set
+`material.userData.speedballReflections = false` before material compilation for a
+zero-sampling per-material opt-out (then set `material.needsUpdate = true` if changed
+later). The result stays in Three's native
 `context.radiance` path, so Standard/Physical BRDF, metallic F0, Fresnel, and DFG
 remain Three's responsibility.
 
@@ -91,12 +159,41 @@ Changing this ownership at runtime reconverges through the normal temporal histo
 set it at creation when the layer boundary must be established before first solve.
 
 The whole feature is opt-in, so existing integrations keep their allocation,
-shader, and image path. Its live contribution is
-`gi.setReflectionIntensity(0..1)`.
+shader, and image path. `gi.setReflectionIntensity(0..1)` changes its live
+contribution; intensity zero skips receiver taps but structural `off` is the mode
+that also removes reflection compute and memory.
+
+## Clustered lighting (secondary mode)
+
+Pass **`clusteredLighting: true`** (three r185+) to draw thousands of
+non-shadowed point lights cheaply. The batched raster lights node is replaced by
+`GiClusteredLightsNode` — three's Forward+ clustered addon (compute-culled
+screen-tile × depth-slice light lists) with the same GI injection and IR-emitter
+seams — so the direct term stops caring how many small point lights the scene
+carries (the `lights` batch caps no longer apply). Directional, spot, and
+shadow-casting lights keep the stock per-light path.
+
+The GI lane switches to a fixed importance-budgeted light arena: the probes'
+NEE shades the `MAX_LIGHTS` (64) most important records — ranked by peak power ×
+spot solid-angle × proximity to the probe volume, directionals always kept —
+and light-count changes land in a count uniform + in-place refill, **never** a
+BVH rebuild. Pass an object to tune the cluster grid:
+`clusteredLighting: { maxLights: 1024, tileSize: 32, zSlices: 24, maxLightsPerCluster: 64 }`.
+
+The default (`false`) keeps the primary batched path byte-identical to previous
+releases. Use the **50 LIGHTS** scene mode in the Sponza demo — 50 lights by
+default, with a stress slider to 500 that exercises the importance cut and the
+rebuild-free count changes.
 
 ## Limitations
 
 - **WebGPU-only**
+- **Three r185** — the current release is bounded to `>=0.185.0 <0.186.0`
+  because its WebGPU/TSL integration and storage cleanup touch revision-specific
+  renderer APIs.
+- **One active probe field per module instance** — dispose the current field
+  before creating another. A second live field throws instead of silently sharing
+  atlas state across scenes or renderers.
 - **Install timing is sharp** — install before the first render / animation loop. Late install may need an explicit material recompile pass.
 - **Material support is approximate(WIP)** — the trace path uses a flattened scene
   representation. Standard PBR-ish materials are the target; exotic node graphs,
@@ -117,7 +214,7 @@ shader, and image path. Its live contribution is
 ## Beyond DDGI: the full light-transport surface
 
 Speedball is the single source for all of its GPU light transport — downstream
-apps (maxjs, powershot-threejs, sigils) import these entry points rather than
+apps (powershot-threejs, sigils) import these entry points rather than
 vendoring files:
 
 - **`speedball-gi/spectral-tracer`** — `createSpectralTracer`: progressive
@@ -128,20 +225,28 @@ vendoring files:
   presets: pure-WebGPU compute photon caustics with analytic and mesh-emission
   casters, soft t-cull (`setThrowFalloff`), and a `setCasterMesh(mesh,
   { shaper })` hook for baking procedural vertex displacement into photon
-  emission. Pass `mode: 'refract'` (plus `ior` / `dispersion` / `thickness`)
-  for glass caustics — same splat pipeline, Snell thin-slab bend, chromatic
-  R/G/B grids so dispersion fans on the receiver.
+  emission. Rigid animation uses `setCasterTransform(meshOrMatrix)` so geometry
+  and the BVH stay resident; call `setCasterMesh` again only for deformation or
+  a scale change. Pass `mode: 'refract'` (plus `ior` / `dispersion` /
+  `thickness`) for glass caustics — same splat pipeline, BVH-accelerated
+  through-mesh Snell refraction, Cauchy-style chromatic R/G/B grids, high-photon
+  convergence controls (`photonBudget`, `resolveInterval`, `setTargetPhotons`),
+  light/floor response controls (`setLightIntensity`, `setLightColor`,
+  `setReceiverAlbedo`), radiance gain (`setStrength`), and optional
+  spotlight-cone matching via `setLightCone(direction, angleRadians, penumbra)`.
 - **`speedball-gi/spectral-scene`** / **`speedball-gi/spectral-traverse`** —
   the shared scene foundation (scene → flat BVH/material/light buffers; TSL
   traversal + spectral shading emitters).
 
 All of these work from a plain CDN import map too (e.g. jsDelivr:
-`https://cdn.jsdelivr.net/npm/speedball-gi@0.5.0/js/index.js`) — that is how
-maxjs consumes them without being an npm package.
+`https://cdn.jsdelivr.net/npm/speedball-gi@0.6.7/js/index.js`)
 
 Light records are stride 17 floats (slot [16] = emitter class) and material
-records stride 28 (slot [25] = NIR albedo); these extra fields are inert for
-GI and exist for the night-vision render mode of downstream consumers.
+records stride 28 (slot [25] = NIR albedo, slot [26] = traversal flags).
+
+## Changelog
+
+Release history lives in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## License
 

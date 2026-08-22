@@ -304,6 +304,12 @@ export async function createSnapshotFx({
         isPowerShotEnabled() {
             return state.powershot?.enabled === true;
         },
+        // Match the editor facade: the standalone frame driver needs the
+        // active imager mode and IR illuminator gain to switch the scene into
+        // the same sensed band before it renders.
+        getPowerShotOptions() {
+            return state.powershot;
+        },
         setEnvironmentVisible(visible) {
             envVisible = visible !== false;
         },

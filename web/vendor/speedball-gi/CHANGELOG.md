@@ -5,13 +5,175 @@ All notable changes to Speedball GI are documented here. This project follows
 
 ## [Unreleased]
 
+- Added a compact render-buffer resolution and smoothed FPS instrument to the
+  Sponza transport deck. Telemetry updates at 2 Hz and avoids unchanged DOM writes.
+- Removed PowerShot completely from the Sponza demo, including its CDN import,
+  controls, full-resolution half-float target, develop pass, resize path, and
+  teardown. Three's built-in AgX tone mapper now presents the scene directly in
+  one render submission at a calibrated `0.7` exposure. Continuous GI is unchanged.
+- Static Sponza primitives are losslessly batched from 103 meshes to 25 material
+  draws, and four byte-identical 1K normal-map uploads share their existing sources.
+- Hardened the Sponza release demo's default frame path: the diagnostic sphere no
+  longer invalidates the full 2048² 103-caster shadow map while moving, and opaque
+  UI chrome replaces live canvas backdrop blur. The full-resolution scene pass is single-sampled instead of 4x
+  MSAA by default. Sun/light refreshes, resize allocation, and hidden Advanced GUI
+  synchronization are coalesced to frame boundaries; dead hidden FPS DOM work and
+  the internal-node probe visualizer were removed.
+- Added complete demo teardown for GI, post nodes/targets, film targets, scene
+  geometry/materials/textures, shadows, controls, GUI, listeners, and the renderer,
+  including late-GLTF guards and `pagehide` cleanup. Structural reloads remain
+  device-retirement gated and teardown is idempotent.
+- Added `autoDetectChanges` (default `true`) so event-complete hosts can disable
+  compatibility scene-signature traversals while retaining exact transform,
+  deform, material, light, and topology packets. The demo now exercises that
+  event-driven path. Installer camera gating follows world transforms, teardown
+  invalidates compiled lit materials, restores only its own lights factory, and a
+  second simultaneous probe field fails loudly instead of sharing global atlas state.
+  Sequential fields receive isolated probe nodes, and a failed fine-cascade build
+  now degrades to the valid coarse field instead of retrying every frame.
+- Bounded the Three peer dependency to the tested r185 API surface and replaced the
+  platform-specific Python demo command with a dependency-free Node static server.
+  Restored the smoke suite to source control so `npm test` is reproducible from a
+  clean clone.
+- Simplified the public Sponza page to one raster GI instrument: removed its top
+  bar and embedded path-tracer runtime, and moved Advanced into the bottom deck.
+  The package path-tracer modules and exports are unchanged.
+- Made the two sampling modes absolute at core level. Gated never automatically
+  rotates its ray or emitter-visibility basis, including during long idle solves;
+  Monte Carlo advances both every accepted C0 solve. This removes the delayed GI
+  jump and all resize/divisions/batch-size dependence. `installSpeedballGI({
+  jitterMode })` selects the mode before the first field build; mode-local history
+  defaults remain 0.60 Gated and 0.90 Monte Carlo.
+- Opt-in emissive NEE promotion ("penumbra hypothesis", tier 1): meshes with
+  `userData.giEmitter = true` emit a type-3 sphere-proxy light record (world
+  bounding sphere, power = emissive x area/4 x `giEmitterScale`, finite
+  influence range) that both NEE paths sample directly with a jittered source
+  disk, a `1/max(d^2, r^2)` near-field clamp, and a shadow ray stopped at the
+  source sphere. The traced material record is zeroed through a dedup-split
+  (`:E0`) so direct emitter light is NEE-owned with no double count; the
+  material-value lane re-applies the zeroing and routes emitter value edits to
+  the light-record refresh, emitter transforms force the same refresh, and the
+  rest-mode light signature tracks promoted emitters only. Emission moves from
+  Monte-Carlo discovery (lattice-lottery spikes) to one-sample analytic NEE:
+  small bright emitters are stable even at low hysteresis in monte carlo mode.
+  Known tier-1 trades: sphere proxy misshapes long strips, probe-space glossy
+  lobes lose emitter self-glow, and emitter add/remove is a rebuild-class count
+  change. Includes a scope fix over the delegated implementation: three
+  phantom `camera` references threw per tick during mover activity (starving
+  the solve) and silently killed the light-refresh lane.
+- Structural rebuilds are now the lowest-priority lane: a rest-held rebuild no
+  longer vetoes the continuous lanes, so explicit transform/deform packets and
+  the solve keep flowing while topology churn holds a rebuild pending (the
+  current build keeps serving until the scheduler reaches it at rest). Downstream
+  await blocks abort only on a rebuild newly armed under them, never on a
+  pre-existing held one. Verified on the churn harness with every lane running:
+  transform packets land each tick at an 8 ms worst frame while the rebuild
+  stays held, then land kernel-resident at rest.
+- Material-VALUE fast lane: scalar/color material edits (emissive strength,
+  color, roughness, ...) rewrite the affected resident uber records in place —
+  the twin of `updateLights` — and re-upload only those floats. No BVH, no
+  kernel, flows mid-motion beside the transform lane. Structural drift
+  (map-binding change, material reassignment, dedup split) fails closed to the
+  full rebuild lane. `notifySceneChange('material')` now routes here instead of
+  straight to a rebuild; new `markMaterialValuesDirty(targets)` API. Verified
+  live: one record rewritten mid-churn with zero rebuild armed.
+- `setRayBudget(raysPerTick)` / `getRayBudget()`: the per-tick trace budget the
+  cadence auto-throttle recovers toward is now a knob (default unchanged at
+  98,304). More rays/tick converges light faster for more GPU; frame pacing
+  stays owned by the controller, and a held rebuild can never dispatch beyond
+  the scratch its kernels were built with. Changing it is a rest-gated kernel
+  rebuild (cached BVH soup reused).
+- `setJitterMode('gated' | 'montecarlo')`: runtime switch between the shipped
+  pass-boundary rotation gate ("gated basis" — hysteresis stable at extreme low
+  values) and per-solve-tick re-jitter ("monte carlo" — maximum discovery rate,
+  stability owed entirely to the hysteresis dose). Default 'gated' is the exact
+  legacy condition, untouched; the switch is a CPU-side gate decision with no
+  recompile.
+- Churn harness: hysteresis + normalization, jitter-basis, and rays/tick GUI
+  rows; the emissive slider and pendant toggle now send material events so
+  value edits reach the trace live when explicit events are on.
+- Textured structural rebuilds now keep material-map `DataArrayTexture`
+  identities resident through a per-probe-field capacity arena. The six PBR
+  map types reserve 1.5x layer headroom, stage async extraction until the build
+  is accepted, and rewrite only byte-changed live layers in place; material
+  record slots 12-16/24 remain the sole layer-index authority, so spare/stale
+  layers are unreachable. Texture generations are ref-counted with scene
+  resources, and any map or scene-storage capacity rebind forks both sides so
+  staggered C0/C1 replacement stays generation-coherent. Within capacity the
+  existing kernel-resident path now covers textured scenes without adding
+  bindings or solve work; overflow/dimension/format changes retain the rare
+  full-kernel fallback. Measured on the textured Sponza demo at rest: worst
+  frame per add/remove structural churn fell from 225-575 ms to 13-29 ms, with
+  kernel-resident reuses climbing one per rebuild, zero material recompiles,
+  and zero texture rebinds; the untextured churn harness stays at its
+  hitchless baseline. Growing the light arena or resizing the probe grid
+  still takes the full rebuild path by design.
+- Hitchless structural rebuilds: the five traced-scene buffers now live in a
+  resident capacity arena (1.5× geometric headroom, device-limit capped) whose
+  BufferAttribute and TSL storage-node identities survive rebuilds; live
+  prefixes and exact traversal count/base uniforms are rewritten in place, so
+  stale capacity tails are unreachable without zeroing. Two review fixes
+  complete the design: `setAtlases` no longer bumps the node cacheToken on a
+  no-op call (an already-empty cascade disposed on every cascades=1 rebuild
+  was firing the whole-scene material-dirty pass per rebuild), and a
+  kernel-resident fast path keeps the live compute graph — bindings, pipelines
+  and all — across a within-capacity in-place rewrite when probe dims are
+  unchanged and material map textures are identity-equal, eliminating the
+  GPU-process pipeline recompile that stalled the first dispatch. Measured on
+  the churn harness at rest: worst frame per topology/enter/leave action fell
+  from ~240 ms (pre-cache) and ~110 ms (BLAS cache alone) to 4-5 ms at a
+  locked frame rate, with removal changes verified to propagate into the
+  field. Both textured and untextured scenes now take the resident path while
+  their storage and material-map capacities fit.
+- Cross-rebuild BLAS cache: a structural rebuild now pays only for the
+  geometries that actually changed. Cached cores (BVH records, soup slices,
+  BVH-ordered materials) are keyed by geometry identity × attribute
+  identity/version × per-tri material mapping, reused via per-build clones so
+  an in-flight older build can never be corrupted, and bounded by a
+  least-recently-used triangle budget. Measured on the churn harness at rest:
+  worst frame per topology/enter/leave action drops from ~240 ms to ~110 ms
+  (the remainder is pool upload + kernel work, not BLAS builds).
+- three-mesh-bvh housekeeping: demo CDN pins moved to 0.9.14, the build option
+  renamed to `targetLeafSize` (kills the per-BLAS deprecation warning during
+  churn), and the peer floor raised to `>=0.9.11` — older 0.9.x silently
+  ignored the leaf-size option under its previous names. Local BLAS bounds now
+  come from the MeshBVH build itself instead of a separate `computeBoundingBox`
+  pass: one less O(V) scan per BLAS per rebuild, and the bounds no longer
+  wrongly include the origin when invisible triangles leave zero-filled
+  duplicate vertex slots.
+- Added an event-driven dynamic-scene lane for games and realtime DCC viewers.
+  `markTransformsDirty(object | { object, instanceIndex })` coalesces host
+  transform packets and rewrites only the affected stable instance records plus
+  their unique TLAS ancestor chains during continuous motion. Unknown/untraced
+  transform targets are cheap no-ops; the rest-only full-scene signatures remain
+  as compatibility fallback. `InstancedMesh` allocation capacity is now resident
+  in the TLAS, so active-count changes and slot recycling within that capacity do
+  not rebuild the BVH. Added `markDeformsDirty()`, `markTopologyDirty()`, and the
+  generic `notifySceneChange()` event surface.
+- Packed material traversal flags in slot 26 and added an exact opaque fast path.
+  Closest-hit and shadow traversal now skip candidate-hit UV interpolation and
+  alpha texture sampling for constant opaque materials; non-shadow-blocking
+  transmission candidates also exit before alpha work.
+
+- Added structural local-reflection quality tiers: `off`, `rough`, `high`, and
+  `ultra`. The Sponza demo now uses `high`, which resolves an 8x8 glossy cache
+  on interleaved two-phase texels and blends eight glossy receiver probes; legacy
+  `roughReflections: true` maps to the unchanged 16x16/every-solve `ultra`
+  quality contract. The live receiver cutoff is `roughnessLimit` (pinned at 1,
+  hidden from the Quality panel). Added the compile-time
+  `material.userData.speedballReflections = false` opt-out. The
+  Sponza Quality panel now exposes the four structural tiers and reloads while
+  retaining scene/query state when the selection changes.
+- Fixed a hard glossy ring in `high`: normal bias now affects visibility only,
+  while glossy grid/cascade selection uses the unbiased surface position. Removed
+  the discontinuous single-dominant-probe shortcut from the high receiver.
 - Light reactivity now rides THROUGH motion: the light-signature check and
   `refreshLights()` moved out of the rest-only gate in `tick()`. Lights are
   refresh-class (in-place buffer refill — no BVH, no compile, bounded
   lights-only traverse with deadbands), so light edits and animated lights
-  update the field live during interaction and playback. The xform, deform,
-  and structure lanes stay rest-only; the idle-gate contract for heavy work
-  is unchanged.
+  update the field live during interaction and playback. Explicit host transform
+  and deform packets now have their own continuous lane; fallback xform/deform
+  scans and structural rebuilds remain rest-only.
 - IR illuminator gain: a scalar trim on emitter-class-4 lights in the sensed
   band, on top of the existing on/off gate, uniform-driven (no recompiles).
   Three consumers, one knob per host: `setNirIlluminatorGain` (direct raster

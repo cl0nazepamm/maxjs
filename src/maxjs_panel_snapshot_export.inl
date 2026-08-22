@@ -336,6 +336,66 @@
         return value;
     }
 
+    static std::wstring DetectLightEmitterClass(INode* node) {
+        if (!node) return {};
+
+        // User properties are the explicit authoring channel. Persist the
+        // normalized token into snapshot.json so standalone replay never has
+        // to rediscover spectral intent from an RGB color (true IR is black).
+        MSTR rawProps;
+        node->GetUserPropBuffer(rawProps);
+        if (rawProps.Length() > 0) {
+            const std::wstring props = LowerAsciiCopy(rawProps.data());
+            const std::wstring key = L"emitterclass";
+            size_t cursor = props.find(key);
+            while (cursor != std::wstring::npos) {
+                cursor += key.size();
+                while (cursor < props.size() && std::iswspace(props[cursor])) ++cursor;
+                if (cursor < props.size() && props[cursor] == L'=') {
+                    ++cursor;
+                    while (cursor < props.size() && std::iswspace(props[cursor])) ++cursor;
+                    const size_t start = cursor;
+                    while (cursor < props.size()) {
+                        const wchar_t ch = props[cursor];
+                        if (!(std::iswalnum(ch) || ch == L'_' || ch == L'-')) break;
+                        ++cursor;
+                    }
+                    if (cursor > start) {
+                        std::wstring value = props.substr(start, cursor - start);
+                        std::replace(value.begin(), value.end(), L'-', L'_');
+                        return value;
+                    }
+                }
+                cursor = props.find(key, cursor);
+            }
+        }
+
+        // Smart legacy fallback for existing scenes: classify conventional
+        // light names once during native serialization, then store the result
+        // explicitly. This keeps old IR_Light/NIR_Illuminator rigs working
+        // without asking artists to retrofit user properties.
+        std::wstring name = LowerAsciiCopy(node->GetName());
+        for (wchar_t& ch : name) {
+            if (std::iswspace(ch) || ch == L'-' || ch == L'.') ch = L'_';
+        }
+        const std::wstring padded = L"_" + name + L"_";
+        if (padded.find(L"_ir_") != std::wstring::npos ||
+            padded.find(L"_nir_") != std::wstring::npos ||
+            padded.find(L"_illuminator_") != std::wstring::npos) {
+            return L"ir";
+        }
+        if (padded.find(L"_led_") != std::wstring::npos) return L"led";
+        if (padded.find(L"_sodium_") != std::wstring::npos ||
+            padded.find(L"_lps_") != std::wstring::npos) return L"sodium";
+        if (padded.find(L"_inc_") != std::wstring::npos ||
+            padded.find(L"_incandescent_") != std::wstring::npos ||
+            padded.find(L"_halogen_") != std::wstring::npos ||
+            padded.find(L"_tungsten_") != std::wstring::npos) {
+            return L"incandescent";
+        }
+        return {};
+    }
+
     // True when the JSON object value for `key` has a TOP-LEVEL
     // "enabled": true member. Brace-aware and string-safe: the old
     // fixed-window scan false-negated when `enabled` sat past 768 chars

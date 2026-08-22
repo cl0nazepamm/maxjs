@@ -5,6 +5,13 @@ const material = (name, nirAlbedo) => ({
     name,
     userData: nirAlbedo == null ? {} : { nirAlbedo },
 });
+const color = value => ({
+    isColor: true,
+    value,
+    clone() { return color(this.value); },
+    copy(other) { this.value = other.value; return this; },
+    setScalar(next) { this.value = next; return this; },
+});
 const object = (name, handle, parent, materials = null) => ({
     name,
     isMesh: materials != null,
@@ -15,10 +22,21 @@ const object = (name, handle, parent, materials = null) => ({
 const leaf = material('Leaf_Oak');
 const bark = material('Bark_Oak', 0.2);
 const asphalt = material('Asphalt_Main');
+const visibleEyeColorNode = { band: 'visible-color' };
+const visibleEyeEmissiveNode = { band: 'visible-emissive' };
+const nirEyeColorNode = { band: 'nir-color' };
+const nirEyeEmissiveNode = { band: 'nir-emissive' };
+const eye = material('Procedural Eye Ultimate');
+eye.color = color(0.25);
+eye.colorNode = visibleEyeColorNode;
+eye.emissiveNode = visibleEyeEmissiveNode;
+eye.userData.maxjsNirColorNode = nirEyeColorNode;
+eye.userData.maxjsNirEmissiveNode = nirEyeEmissiveNode;
 const nodeMap = new Map([
     [1, object('Vegetation', 1, 0)],
     [2, object('Oak_01', 2, 1, [leaf, bark])],
     [3, object('Road_Main', 3, 0, asphalt)],
+    [6, object('Eye_Main', 6, 0, eye)],
 ]);
 const decorators = new Map();
 const changes = [];
@@ -36,6 +54,17 @@ const system = createSpectralMaterialSystem({
     onChange: event => changes.push(event),
 });
 const spectral = system.createLayerFacade('test', getAdapter);
+
+const eyeNir = spectral.setNirAlbedo({ materials: 'Procedural Eye Ultimate' }, 0.42);
+system.setRasterSensing(true);
+assert.equal(eye.colorNode, nirEyeColorNode);
+assert.equal(eye.emissiveNode, nirEyeEmissiveNode);
+assert.equal(eye.color.value, 0.25, 'a procedural NIR color node must bypass scalar grey');
+assert.equal(eye.needsUpdate, true);
+system.setRasterSensing(false);
+assert.equal(eye.colorNode, visibleEyeColorNode);
+assert.equal(eye.emissiveNode, visibleEyeEmissiveNode);
+eyeNir.dispose();
 
 const foliage = spectral.setNirAlbedo({
     under: 'Vegetation',

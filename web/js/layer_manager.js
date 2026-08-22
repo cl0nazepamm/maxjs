@@ -7,6 +7,7 @@ import { createCameraAdapter } from './layer_camera_adapter.js';
 import { createInputHelper, createInstancesFacade, createMaxSceneFacade, createNodeMapFacade, createRendererFacade } from './layer_facades.js';
 import { createDeformSystem } from './layer_deform.js';
 import { createLayerParamController } from './layer_params.js';
+import { createMorphSystem } from './layer_morph.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
 import { createSpectralMaterialSystem } from './layer_spectral.js';
@@ -232,6 +233,7 @@ export function createLayerManager({
         lightHandleMap,
         onRuntimeSceneChanged: (event) => notifyRuntimeSceneChanged(event),
     });
+    const morphSystem = createMorphSystem({ nodeMap, lightHandleMap });
 
     // Max selection diff — re-emitted on the shared bus as 'max:selection'.
     // Scanned only while at least one layer is subscribed; the two Sets are
@@ -1216,6 +1218,10 @@ export function createLayerManager({
                 handle => getLayerNodeAdapter(layer, handle),
                 () => isLayerCurrent(layer),
             ),
+            morph: morphSystem.createLayerFacade(
+                layer.id,
+                () => isLayerCurrent(layer),
+            ),
             anim: createLayerAnimFacade(layer),
             audio: createLayerAudioFacade(layer),
             get input() {
@@ -1456,6 +1462,7 @@ export function createLayerManager({
             // Restore live Max state before freeing layer-owned resources.
             clearMaterialOverridesForLayer(layer.id);
             clearObjectPropertyOverridesForLayer(layer.id);
+            morphSystem.clearLayer(layer.id);
         }
 
         const disposedResources = new Set();
@@ -1640,8 +1647,10 @@ export function createLayerManager({
     }
     function beforeRender(frameElapsed) {
         applyAllObjectPropertyOverrides();
+        morphSystem.applyAll();
         dispatchRenderHook('onBeforeRender', frameElapsed);
         applyAllObjectPropertyOverrides();
+        morphSystem.applyAll();
     }
     function afterRender(frameElapsed)  { dispatchRenderHook('onAfterRender',  frameElapsed); }
 
@@ -1837,6 +1846,7 @@ export function createLayerManager({
         // so layer-registered map slot overrides and node-graph decorators
         // (ctx.deform) survive fastsync rebuilds.
         applyMaterialOverrides: applyMaterialOverridesToMesh,
+        applyMorphOverrides: morphSystem.applyHandle,
         // Bridge visibility consults this so Max hide/unhide flows to jsmod
         // meshes unless a layer explicitly owns their visibility.
         hasRuntimeVisibilityOverride,

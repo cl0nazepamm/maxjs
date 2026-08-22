@@ -30,7 +30,13 @@ async function ensureGLTFLoader() {
     return _gltfLoaderPromise;
 }
 
-export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debugWarn = () => {} }) {
+export function createMaxJSGLTFSystem({
+    THREE,
+    parent,
+    getBus = () => null,
+    debugWarn = () => {},
+    onSceneChange = () => {},
+}) {
     const root = new THREE.Group();
     root.name = '__maxjs_gltf_origins__';
     root.matrixAutoUpdate = false;
@@ -39,6 +45,7 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
 
     const entryMap = new Map(); // handle -> entry
     const readyWaiters = new Map(); // handle -> Set<cb>
+    const matrixScratch = new THREE.Matrix4();
 
     function fireBus(event, payload) {
         const bus = getBus?.();
@@ -112,6 +119,7 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
             clips: [],
             mixer: null,
             actions: [],
+            traceObjects: new Set(),
             state: 'idle',
             error: null,
             loadToken: 0,
@@ -127,11 +135,27 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
     }
 
     function setMatrixFromData(entry, data) {
+        let transformChanged = false;
+        let visibilityChanged = false;
         if (Array.isArray(data?.t) && data.t.length === 16) {
-            entry.worldMatrix.fromArray(data.t);
+            matrixScratch.fromArray(data.t);
+            if (!entry.worldMatrix.equals(matrixScratch)) {
+                entry.worldMatrix.copy(matrixScratch);
+                transformChanged = true;
+            }
         }
-        if (typeof data?.v !== 'undefined') entry.visible = !(data.v === '0' || data.v === false);
+        if (typeof data?.v !== 'undefined') {
+            const nextVisible = !(data.v === '0' || data.v === false);
+            visibilityChanged = entry.visible !== nextVisible;
+            entry.visible = nextVisible;
+        }
         applyEntryTransform(entry);
+        return { transformChanged, visibilityChanged };
+    }
+
+    function notifyEntryTransform(entry) {
+        if (!entry?.traceObjects?.size) return;
+        onSceneChange({ type: 'transform', targets: entry.traceObjects });
     }
 
     function stopEntryPlayback(entry) {
@@ -241,10 +265,15 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
                 }
                 entry.container.add(loadedRoot);
                 entry.root = loadedRoot;
+                entry.traceObjects.clear();
+                loadedRoot.traverse?.(object => {
+                    if (object?.geometry) entry.traceObjects.add(object);
+                });
                 entry.clips = gltf.animations ?? [];
                 entry.state = 'ready';
                 applyEntryTransform(entry);
                 syncEntryPlayback(entry);
+                onSceneChange({ type: 'topology' });
                 fireBus('gltf:loaded', { handle: entry.handle, entry });
                 fireReadyWaiters(entry.handle, entry);
             },
@@ -279,7 +308,7 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
             entry.autoplay = data?.autoplay !== false;
         }
 
-        setMatrixFromData(entry, data);
+        const matrixChange = setMatrixFromData(entry, data);
 
         const fileChanged = prevFilePath !== entry.filePath;
         const scaleChanged = prevRootScale !== undefined && prevRootScale !== entry.rootScale;
@@ -293,11 +322,14 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
             const ratio = entry.rootScale / (prevRootScale || 1);
             if (Number.isFinite(ratio) && ratio !== 1) {
                 entry.root.scale.multiplyScalar(ratio);
+                notifyEntryTransform(entry);
             }
         }
         if (autoplayChanged || (!fileChanged && entry.root)) {
             syncEntryPlayback(entry);
         }
+        if (matrixChange.visibilityChanged && entry.root) onSceneChange({ type: 'topology' });
+        else if (matrixChange.transformChanged) notifyEntryTransform(entry);
 
         return entry;
     }
@@ -322,9 +354,9 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
     function applyGLTFTransformBinary(handle, matrix16, visible) {
         const entry = entryMap.get(handle >>> 0);
         if (!entry) return;
-        entry.worldMatrix.fromArray(matrix16);
-        entry.visible = !!visible;
-        applyEntryTransform(entry);
+        const change = setMatrixFromData(entry, { t: matrix16, v: !!visible });
+        if (change.visibilityChanged && entry.root) onSceneChange({ type: 'topology' });
+        else if (change.transformChanged) notifyEntryTransform(entry);
     }
 
     function removeEntry(handle) {
@@ -339,6 +371,7 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
         root.remove(entry.container);
         entryMap.delete(handle >>> 0);
         readyWaiters.delete(handle >>> 0);
+        if (entry.root) onSceneChange({ type: 'topology' });
     }
 
     function update(dt) {
@@ -348,6 +381,7 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
             if (!entry.mixer || !entry.autoplay) continue;
             entry.mixer.update(delta);
             entry.lastTimeSeconds += delta;
+            notifyEntryTransform(entry);
         }
     }
 
@@ -355,6 +389,7 @@ export function createMaxJSGLTFSystem({ THREE, parent, getBus = () => null, debu
         const nextTime = Number.isFinite(timeSeconds) ? Math.max(0, timeSeconds) : 0;
         for (const entry of entryMap.values()) {
             setEntryTime(entry, nextTime);
+            if (entry.mixer && entry.autoplay) notifyEntryTransform(entry);
         }
     }
 

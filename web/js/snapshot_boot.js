@@ -68,7 +68,11 @@ import {
 } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
 import { createInstanceBuckets } from './instance_buckets.js';
-import { createSceneLights } from './scene_lights.js';
+import {
+    createSceneLights,
+    isIrEmitterClass,
+    resolveLightEmitterClass,
+} from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
 import { assignGatedMaterialScalar, isProgramGatedMaterialScalar } from './material_contract.js';
@@ -467,6 +471,30 @@ async function createRenderer(canvas, features, snapshotUi) {
     return renderer;
 }
 
+function snapshotHasIrEmitters(lights) {
+    return Array.isArray(lights)
+        && lights.some(light => isIrEmitterClass(resolveLightEmitterClass(light)));
+}
+
+async function installSnapshotIrLightGraph(renderer, lights) {
+    if (!snapshotHasIrEmitters(lights)) return false;
+    if (!renderer?.lighting?.createNode) {
+        console.warn('[snapshot_boot] IR lights require the WebGPU/TSL lighting graph');
+        return false;
+    }
+    try {
+        const { installMaxLightsRenderer } = await import('./max_lights_node.js');
+        const installed = installMaxLightsRenderer(renderer);
+        if (!installed) {
+            console.warn('[snapshot_boot] failed to install the IR-aware max.js lighting graph');
+        }
+        return installed;
+    } catch (error) {
+        console.warn('[snapshot_boot] IR-aware lighting graph unavailable', error);
+        return false;
+    }
+}
+
 // ─── Phase 3: scene + camera + controls ────────────────────────────────
 // Lives in js/scene_init.js. Returns the canonical scene topology
 // (scene + maxBasisRoot/maxRoot/jsRoot/overlayRoot), a perspective camera,
@@ -698,7 +726,6 @@ function markSnapshotSpeedballGiMaterialsDirty(scene) {
         if (!material || seen.has(material)) return;
         seen.add(material);
         if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
-        if (material.visible === false) return;
         material.dispose?.();
         material.needsUpdate = true;
     };
@@ -767,9 +794,10 @@ async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
         const volumes = snapshotSpeedballVolumeBoxes(settings.volumes);
         if (volumes.length) field.setVolumes(volumes);
         field.setEnabled(true);
-        field.requestRebuild?.();
+        field.markTopologyDirty?.();
         let warmupPasses = 0;
         let tickPending = false;
+        let updateFailureWarned = false;
         // Each accepted tick blends only (1 - hysteresis) of its solve into the
         // probe atlas, so "cascades + 1" passes leaves the field at a few
         // percent of its converged radiance — the snapshot rendered as if GI
@@ -798,7 +826,7 @@ async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
         const onTexturesSettled = () => {
             if (typeof priorOnLoad === 'function') priorOnLoad();
             warmupPasses = 0;
-            field.requestRebuild?.();
+            field.markTopologyDirty?.();
         };
         loadingManager.onLoad = onTexturesSettled;
 
@@ -819,12 +847,16 @@ async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
                     playing: !warmingUp && maxTimeline.playing?.() === true,
                 }).then(() => {
                     if (field.hasData?.() && warmupPasses < requiredWarmupPasses) warmupPasses += 1;
+                }).catch((error) => {
+                    if (updateFailureWarned) return;
+                    updateFailureWarned = true;
+                    console.warn('[snapshot_boot] Speedball GI update failed', error);
                 }).finally(() => {
                     tickPending = false;
                 });
             },
             requestRebuild() {
-                field.requestRebuild?.();
+                field.markTopologyDirty?.();
             },
             dispose() {
                 if (loadHookInstalled && loadingManager.onLoad === onTexturesSettled) {
@@ -1846,6 +1878,53 @@ async function bindLayerProject(root, meta, layerManager, runtimeState) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
+async function createSnapshotNirSensingController({
+    maxjsFx,
+    layerManager,
+    speedballGi,
+} = {}) {
+    // Keep Speedball out of minimal snapshot startup. PowerShot and/or the
+    // probe field are the only standalone consumers of its shared IR gates.
+    if (typeof maxjsFx?.getPowerShotOptions !== 'function' && !speedballGi?.field) {
+        return { sync() {}, dispose() {} };
+    }
+
+    let setNirDirectSensing = null;
+    let setNirIlluminatorGain = null;
+    try {
+        ({ setNirDirectSensing, setNirIlluminatorGain } = await import('speedball-gi'));
+    } catch (error) {
+        console.warn('[snapshot_boot] NIR sensing controls unavailable', error);
+    }
+
+    let disposed = false;
+    const apply = (sensing, gain) => {
+        setNirDirectSensing?.(sensing);
+        setNirIlluminatorGain?.(gain);
+        speedballGi?.field?.setNirSensing?.(sensing);
+        speedballGi?.field?.setNirGain?.(gain);
+        layerManager?.setSpectralRasterSensing?.(sensing);
+    };
+
+    return {
+        sync() {
+            if (disposed) return;
+            const powerShot = maxjsFx?.getPowerShotOptions?.() ?? {};
+            const sensing = maxjsFx?.isPowerShotEnabled?.() === true
+                && (powerShot.mode === 'infrared' || powerShot.mode === 'nightshot');
+            const rawGain = Number(powerShot.irIlluminator);
+            apply(sensing, Number.isFinite(rawGain) ? Math.max(0, rawGain) : 1);
+        },
+        dispose() {
+            if (disposed) return;
+            disposed = true;
+            // These are module-shared uniforms. Reset them so disposing one
+            // player cannot leak NIR state into a later snapshot on the page.
+            apply(false, 1);
+        },
+    };
+}
+
 async function startRenderLoop({
     renderer,
     scene,
@@ -1860,6 +1939,15 @@ async function startRenderLoop({
     enforceHiddenSources,
     fpsCap,
 }) {
+    const nirSensing = await createSnapshotNirSensingController({
+        maxjsFx,
+        layerManager,
+        speedballGi: optionalModules?.speedballGi,
+    });
+    // Set the sensed band before compileAsync and the shadow warmup render.
+    // Otherwise true IR lights are correctly black in RGB and the first
+    // standalone frame compiles/renders as an unilluminated visible scene.
+    nirSensing.sync();
     let lastTimeMs = performance.now();
     let elapsed = 0;
     // Frame limiter: 60fps ceiling regardless of display refresh (240Hz panels
@@ -1886,6 +1974,7 @@ async function startRenderLoop({
             module?.update?.(dt, elapsed);
         }
         studioLighting?.updateCameraConstraints?.();
+        nirSensing.sync();
 
         layerManager?.beforeRender?.(elapsed);
         try {
@@ -1922,7 +2011,10 @@ async function startRenderLoop({
     }
     renderer.render(scene, camera);
     renderer.setAnimationLoop(loop);
-    return () => renderer.setAnimationLoop(null);
+    return () => {
+        renderer.setAnimationLoop(null);
+        nirSensing.dispose();
+    };
 }
 
 // ─── boot() ───────────────────────────────────────────────────────────
@@ -1942,6 +2034,11 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 2: renderer
     const renderer = await createRenderer(canvas, features, meta.snapshotUi);
+    // True IR emitters are deliberately black in RGB. Install the sensed-band
+    // light graph whenever the payload declares one, independent of GI/Studio;
+    // PowerShot's NIR gate then reveals it only in infrared/nightshot modes.
+    // This must happen before scene materials see their first lighting compile.
+    await installSnapshotIrLightGraph(renderer, meta.lights);
     let studioModule = null;
     if (meta.snapshotUi?.studio) {
         try {

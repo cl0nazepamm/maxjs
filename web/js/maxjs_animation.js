@@ -142,6 +142,7 @@ export function createMaxJSAnimationSystem({
     getViewportAspect,
     buildGeometry,
     applyMaterialScalar,
+    onSceneChange = () => {},
 }) {
     const targetRegistry = new Map();
     const mixers = new Map();
@@ -166,6 +167,77 @@ export function createMaxJSAnimationSystem({
     const vectorSample = new THREE.Vector3();
     const animatedLightTargetWorld = new THREE.Vector3();
     const ANIMATED_LIGHT_TARGET_DISTANCE = 1000;
+
+    function addTraceTargets(targets, target) {
+        if (!target || target.isCamera || target.isLight) return;
+        if (target.geometry) {
+            targets.add(target);
+            return;
+        }
+        target.traverse?.(object => {
+            if (object?.geometry) targets.add(object);
+        });
+    }
+
+    function classifyTrack(group, target, trackDef, customKind = null) {
+        if (!group || !target || !trackDef) return;
+        const path = String(trackDef.path ?? trackDef.property ?? '').replace(/^\./, '').toLowerCase();
+        if (target.isLight) {
+            group.animatesLights = true;
+            return;
+        }
+        if (target.isCamera) return;
+        // Speedball's deform lane consumes BufferGeometry attribute versions.
+        // Custom geometry-frame tracks mutate those buffers; shader-side morph
+        // weights do not, so reporting the latter would only schedule a no-op
+        // full BLAS scan every animation frame.
+        if (customKind === 'geometry') {
+            group.deforms = true;
+            return;
+        }
+        if (customKind === 'material' || path.startsWith('material.') || path.startsWith('materials[')) {
+            addTraceTargets(group.materialTargets, target);
+            return;
+        }
+        if (path === 'visible') {
+            group.visibilityTargets.add(target);
+            return;
+        }
+        if (customKind === 'matrix16' || path === 'matrix'
+            || /^(position|quaternion|rotationquaternion|rotation|scale)(?:$|\[|\.)/.test(path)) {
+            addTraceTargets(group.transformTargets, target);
+        }
+    }
+
+    function captureAnimatedVisibility({ playingOnly = true } = {}) {
+        const before = new Map();
+        for (const group of clipGroups.values()) {
+            if (playingOnly && !group.playing) continue;
+            for (const target of group.visibilityTargets) before.set(target, target.visible);
+        }
+        return before;
+    }
+
+    function emitAnimatedSceneChanges(visibilityBefore, { playingOnly = true } = {}) {
+        const transforms = new Set();
+        const materials = new Set();
+        let deform = false;
+        let topology = false;
+        let lights = false;
+        for (const group of clipGroups.values()) {
+            if (playingOnly && !group.playing) continue;
+            for (const target of group.transformTargets) transforms.add(target);
+            for (const target of group.materialTargets) materials.add(target);
+            deform ||= group.deforms;
+            lights ||= group.animatesLights;
+            for (const target of group.visibilityTargets) {
+                if (visibilityBefore?.get(target) !== target.visible) topology = true;
+            }
+        }
+        if (transforms.size || materials.size || deform || topology || lights) {
+            onSceneChange({ transforms, materials, deform, topology, lights });
+        }
+    }
 
     function getMixer(target) {
         let mixer = mixers.get(target);
@@ -521,8 +593,17 @@ export function createMaxJSAnimationSystem({
             currentIndex?.array?.length === indices.length &&
             currentIndex.array.BYTES_PER_ELEMENT >= indices.BYTES_PER_ELEMENT
         ) {
-            currentIndex.copyArray(indices);
-            currentIndex.needsUpdate = true;
+            let connectivityChanged = false;
+            for (let i = 0; i < indices.length; i++) {
+                if (currentIndex.array[i] !== indices[i]) {
+                    connectivityChanged = true;
+                    break;
+                }
+            }
+            if (connectivityChanged) {
+                currentIndex.copyArray(indices);
+                currentIndex.needsUpdate = true;
+            }
         } else {
             geometry.setIndex(new THREE.BufferAttribute(indices, 1));
         }
@@ -693,10 +774,12 @@ export function createMaxJSAnimationSystem({
     }
 
     function applyInstantPose() {
+        const visibilityBefore = captureAnimatedVisibility({ playingOnly: false });
         for (const mixer of mixers.values()) {
             mixer.update(0);
         }
         syncAnimatedTargets();
+        emitAnimatedSceneChanges(visibilityBefore, { playingOnly: false });
     }
 
     function rebuildTargetRegistry() {
@@ -738,6 +821,11 @@ export function createMaxJSAnimationSystem({
                 name: clipDef?.name || clipId,
                 entries: [],
                 customEntries: [],
+                transformTargets: new Set(),
+                materialTargets: new Set(),
+                visibilityTargets: new Set(),
+                deforms: false,
+                animatesLights: false,
                 speed: Number.isFinite(clipState?.speed) ? clipState.speed : (clipDef?.speed ?? 1),
                 playing: clipState?.playing ?? (clipDef?.autoPlay !== false),
                 loop: clipDef?.loop ?? 'repeat',
@@ -762,6 +850,7 @@ export function createMaxJSAnimationSystem({
                 for (const trackDef of (Array.isArray(targetDef?.tracks) ? targetDef.tracks : [])) {
                     const customKind = getCustomTrackKind(trackDef);
                     if (customKind) {
+                        classifyTrack(group, target, trackDef, customKind);
                         group.customEntries.push({
                             targetId,
                             target,
@@ -772,7 +861,10 @@ export function createMaxJSAnimationSystem({
                         continue;
                     }
                     const track = createTrack(THREE, trackDef);
-                    if (track) tracks.push(track);
+                    if (track) {
+                        classifyTrack(group, target, trackDef);
+                        tracks.push(track);
+                    }
                 }
                 if (tracks.length === 0) continue;
 
@@ -836,6 +928,7 @@ export function createMaxJSAnimationSystem({
             syncAnimatedTargets();
             return;
         }
+        const visibilityBefore = captureAnimatedVisibility();
         for (const mixer of mixers.values()) {
             mixer.update(deltaSeconds);
         }
@@ -844,6 +937,7 @@ export function createMaxJSAnimationSystem({
             group.time = normalizeGroupTime(group, group.time + deltaSeconds * group.speed);
         }
         syncAnimatedTargets();
+        emitAnimatedSceneChanges(visibilityBefore);
     }
 
     function setClipPlaying(clipId, playing) {

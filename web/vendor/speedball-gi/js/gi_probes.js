@@ -21,7 +21,8 @@
 import * as THREE from 'three/webgpu';
 import { LightingNode } from 'three/webgpu';
 import {
-    Fn, If, Loop, Return, instanceIndex, storage, uniform, texture, textureLevel, sharedUniformGroup, struct,
+    Fn, If, Loop, Return, instanceIndex, invocationLocalIndex, workgroupId, workgroupArray, workgroupBarrier,
+    storage, uniform, texture, textureLevel, sharedUniformGroup, struct,
     float, int, uint, vec2, vec3, vec4, uvec2,
     max as tslMax, min as tslMin, mix, clamp, floor, normalize, dot, cross, length,
     abs as tslAbs, sqrt, cos, sin, pow, exp, smoothstep, textureStore,
@@ -33,7 +34,10 @@ import {
 // importing this module for the GiProbeNode (e.g. from max_lights_node.js) does
 // NOT drag the CPU BVH builder into that module graph.
 let _buildSpectralScene = null;
-let _collectLights = null;       // cheap light re-collect for reactivity (no BVH rebuild)
+let _createBlasCache = null;
+let _rebindMaterialMapsArenaBuild = null;
+let _collectLights = null;       // cheap light/emitter re-collect for reactivity (no BVH rebuild)
+let _emissiveScaled = null;
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
@@ -49,11 +53,24 @@ const ProbeLightingSample = struct({
 const OCT_RES = 6;                 // interior octahedral resolution per probe
 const BORDER = 1;                  // 1px gutter on every side
 const TILE = OCT_RES + 2 * BORDER; // 8×8 atlas tile
-// Smooth metals need substantially more angular bandwidth than diffuse/rough DDGI.
-// Keep the proven 6×6 field untouched and give only the glossy lobe a separate,
-// independently packed directional cache.
-const GLOSSY_OCT_RES = 16;
-const GLOSSY_TILE = GLOSSY_OCT_RES + 2 * BORDER; // 18×18 atlas tile
+const PROBE_WORKGROUP_SIZE = 64;
+// Reflection quality is structural: disabled tiers allocate/bind/dispatch nothing.
+// The legacy boolean remains exact (`true` = ultra, `false` = off), while named
+// tiers let applications buy only the angular bandwidth they actually need.
+export const REFLECTION_QUALITY_TIERS = Object.freeze({
+    off: Object.freeze({ name: 'off', rough: false, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, roughnessLimit: 0 }),
+    rough: Object.freeze({ name: 'rough', rough: true, glossy: false, glossyOct: 0, glossyUpdateInterval: 0, roughnessLimit: 1 }),
+    high: Object.freeze({ name: 'high', rough: true, glossy: true, glossyOct: 8, glossyUpdateInterval: 2, roughnessLimit: 1 }),
+    ultra: Object.freeze({ name: 'ultra', rough: true, glossy: true, glossyOct: 16, glossyUpdateInterval: 1, roughnessLimit: 1 }),
+});
+
+export function resolveReflectionQuality(reflectionQuality, roughReflections = false) {
+    const fallback = roughReflections === true ? 'ultra' : 'off';
+    const name = reflectionQuality == null ? fallback : String(reflectionQuality).trim().toLowerCase();
+    const tier = REFLECTION_QUALITY_TIERS[name];
+    if (!tier) throw new RangeError(`Unknown reflectionQuality "${reflectionQuality}". Expected off, rough, high, or ultra.`);
+    return tier;
+}
 // Local-reflection lobe. Power 8 keeps enough support for the default 64 rays/probe
 // to converge temporally, while cutting the old power-4 half-width from ~33° to
 // ~24° so nearby silhouettes survive the octahedral/bilinear reconstruction.
@@ -91,7 +108,6 @@ const TARGET_PROBES_LONG_AXIS = 12;   // default probes along the longest grid a
 const MAX_PROBES_PER_AXIS = 32;
 const ATLAS_DIM_FALLBACK = 8192;      // assumed GPU maxTextureDimension2D when the device limit is unreadable
 const STORAGE_BINDING_FALLBACK = 128 * 1024 * 1024; // WebGPU baseline maxStorageBufferBindingSize
-const GLOSSY_HISTORY_BYTES_PER_PROBE = GLOSSY_TILE * GLOSSY_TILE * 4 * Float32Array.BYTES_PER_ELEMENT;
 const RAYS_PER_TICK = 98_304;       // MAX per-tick trace budget (÷ rays/probe → probes/tick).
                                     // ≈1.5k probes at 64 rays — covers the whole Sponza/city
                                     // union every tick; huge grids fall back to round-robin.
@@ -114,6 +130,12 @@ const GI_CHEBY_BIAS_CELL = 0.08;       // Chebyshev SELF-OCCLUSION tolerance as 
                                        // visibility through real walls is preserved.
 const MAX_TRIANGLES = 4_000_000;
 const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
+const GI_EMITTER_INJECT_CAP = 16;
+const GI_EMITTER_VIS_RETENTION = 0.8;
+const GI_LIGHTS_PER_CELL = 16;
+const GI_LIGHT_CELL_STRIDE = GI_LIGHTS_PER_CELL + 1;
+const GI_LIGHT_CELL_OVERFLOW = GI_LIGHTS_PER_CELL + 1;
+const giLightDataCount = () => MAX_LIGHTS * _LIGHT_STRIDE;
 // ── reactivity: respond to live light/geometry edits ──
 // There is deliberately NO global reactive/low-hysteresis burst here. Edits
 // (lights, sky, transforms, trace-side knobs, rebuilds) flow through the trace
@@ -121,11 +143,10 @@ const MAX_LIGHTS = 64;             // matches spectral_scene LIGHT_STRIDE table
 // is bounded (never below debugTempMinChangeH). A global authority drop read as
 // "flicker for a second, then settle" — a visible fade-out/in on every slider
 // touch. The temporal policy is CONSTANT at all times.
-const ROT_MIN_TICKS = 6;           // min ticks between ray-set rotations. Small grids (≤
-                                   // MAX_PROBES_PER_TICK probes = a 1-tick full pass) otherwise
-                                   // rotate the ray set EVERY tick, injecting fresh per-tick noise
-                                   // the temporal blend has to absorb. Large grids (multi-tick
-                                   // passes ≥ this) are unaffected — they already rotate per pass.
+const JITTER_HYSTERESIS_DEFAULTS = Object.freeze({
+    gated: 0.60,                   // held basis: low-latency, mostly flicker-free response
+    montecarlo: 0.90,              // fresh basis every solve: history absorbs the sample blast
+});
 const LIGHT_CHECK_INTERVAL = 6;    // ticks between light-change checks
 const XFORM_CHECK_INTERVAL = 2;    // ticks between transform checks (in-place TLAS rewrite = cheap)
 const GEO_CHECK_INTERVAL = 24;     // ticks between STRUCTURE checks (topology → full rebuild = expensive)
@@ -140,11 +161,17 @@ const DEFORM_CHECK_INTERVAL = 12;  // ticks between DEFORM checks (same-topology
 // during motion is visually lossless; it resumes and converges once the view rests.
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
+const TICK_OVERLOAD_MS = 100;      // outside the normal EMA window; require repeated misses
+const TICK_PAUSE_MS = 1000;        // tab/debugger/host gaps are pauses, not solve pressure
+const TICK_OVERLOAD_STRIKES = 2;   // ignore one unrelated stall; back off if it repeats
 const PROBE_COMPUTE_KEYS = [
-    'traceKernel', 'blendKernel', 'glossyKernel', 'uploadKernel',
-    'clearAtlasKernel', 'clearGlossyAtlasKernel', 'classifyKernel', 'uploadStateKernel',
+    'traceKernel', 'emitterVisKernel', 'blendKernel', 'glossyKernel', 'uploadKernel', 'lightGridKernel',
+    'clearAtlasKernel', 'clearGlossyAtlasKernel', 'clearEmitterVisKernel', 'classifyKernel', 'uploadStateKernel',
 ];
-const PROBE_BVH_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials', 'lights'];
+const PROBE_SCENE_BUFFER_KEYS = ['bvhNodes', 'triIndex', 'vertexData', 'triMaterial', 'materials'];
+const PROBE_SCENE_STORAGE_GROWTH = 1.5;
+const PROBE_MAP_KEYS = ['albedo', 'normal', 'roughness', 'metalness', 'emissive', 'alpha'];
+const TEXTURE_ARRAY_LAYERS_FALLBACK = 256;
 // ── denoise uplift (CORE, docs/GI_SPEEDBALL_design.md §11) tunables ──
 const GI_FILTER_K = 8.0;           // spatial filter: variance→edge-stop bandwidth
 const GI_FILTER_EPS = 0.001;       // spatial filter luma² absolute floor (avoids /0 on black)
@@ -188,6 +215,23 @@ export function probeBudgetAfterInteraction(
     return Math.min(current, resume);
 }
 
+// One accepted solve interval represents real pressure from the work submitted by
+// the previous accepted tick. Shrink immediately on a cadence miss instead of
+// waiting for an EMA tail; the controller's cooldown keeps the budget from
+// bouncing straight back up. Kept pure for source-only smoke coverage.
+export function probeBudgetAfterCadenceMiss(
+    currentBudget,
+    minBudget = RAYS_PER_TICK_MIN,
+    shrinkFactor = 0.5,
+) {
+    const min = Math.max(1, Math.floor(Number(minBudget) || 1));
+    const current = Math.max(min, Math.floor(Number(currentBudget) || min));
+    const factor = Number.isFinite(shrinkFactor)
+        ? Math.min(0.95, Math.max(0.05, shrinkFactor))
+        : 0.5;
+    return Math.max(min, Math.floor(current * factor));
+}
+
 export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
     if (!normalize) return 1;
     const dt = Number.isFinite(updateDtMs) ? Math.max(0, updateDtMs) : HYSTERESIS_DT_REF_MS;
@@ -207,6 +251,7 @@ export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
 }
 
 let _node = null;
+let _activeProbeFieldOwner = null;
 
 const _nowMs = () => (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
 
@@ -252,6 +297,10 @@ export class GiProbeNode extends LightingNode {
         this._stateAtlas = [null, null];
         this._enabled = false;
         this._structGen = 0;     // bumps on grid resize / atlas realloc / cascade-count change ONLY
+        this._roughReflectionsConfigured = false;
+        this._glossyReflectionsConfigured = false;
+        this._glossyOctRes = 1;
+        this._glossyTile = 1;
         this.intensity = 1.0;
 
         // Per-cascade grid uniforms (2-slot arrays).
@@ -287,6 +336,10 @@ export class GiProbeNode extends LightingNode {
         // multiplier. 0 preserves stock PMREM exactly; 1 lets local probe hits replace
         // PMREM in their reflected lobe. The field is opt-in at allocation time.
         this.reflectionIntensityNode = uniform(1.0);
+        // Materials rougher than this keep the stock environment and skip all local
+        // reflection parallax/atlas work. Pinned at 1 (full range) unless the
+        // roughnessLimit API overrides it.
+        this.roughnessLimitNode = uniform(1.0);
         // Runtime enable gate. The graph membership below is still the authoritative
         // on/off switch; this uniform remains as a cheap extra guard for compiled graphs.
         this.enabledNode = uniform(1.0);
@@ -313,7 +366,8 @@ export class GiProbeNode extends LightingNode {
             ...this.normalBiasNode, ...this.chebyBiasNode,
             this.samplePositionScaleNode, this.sampleNormalMixNode, this.sampleBiasScaleNode, this.sampleObjectNormalNode,
             this.detailStrengthNode,
-            this.intensityNode, this.reflectionIntensityNode, this.enabledNode, this.cascadeCountNode, this.borderBandNode,
+            this.intensityNode, this.reflectionIntensityNode, this.roughnessLimitNode,
+            this.enabledNode, this.cascadeCountNode, this.borderBandNode,
             this.chebyStrengthNode, this.classifyStrengthNode,
         ]) u.setGroup(GI_UNIFORM_GROUP);
     }
@@ -337,9 +391,11 @@ export class GiProbeNode extends LightingNode {
     // only flips the cacheToken, which never forces a recompile, so GI silently drops out.
     get active() { return this._ready; }
     get roughReflectionsReady() {
+        if (!this._roughReflectionsConfigured) return false;
         const count = Math.round(this.cascadeCountNode.value) || 1;
         for (let c = 0; c < count; c++) {
-            if (!this._roughSpecularAtlas[c] || !this._glossySpecularAtlas[c]) return false;
+            if (!this._roughSpecularAtlas[c]) return false;
+            if (this._glossyReflectionsConfigured && !this._glossySpecularAtlas[c]) return false;
         }
         return true;
     }
@@ -357,6 +413,24 @@ export class GiProbeNode extends LightingNode {
         this.reflectionIntensityNode.value = Number.isFinite(v) ? THREE.MathUtils.clamp(v, 0, 1) : 0;
         touchGiUniforms();
     }
+    setRoughnessLimit(v) {
+        this.roughnessLimitNode.value = Number.isFinite(v) ? THREE.MathUtils.clamp(v, 0, 1) : 1;
+        touchGiUniforms();
+    }
+    setReflectionConfig(config) {
+        const rough = config?.rough === true;
+        const glossy = rough && config?.glossy === true;
+        const glossyOct = glossy ? Math.max(1, Math.round(config.glossyOct) || 1) : 1;
+        const glossyTile = glossy ? glossyOct + 2 * BORDER : 1;
+        const changed = rough !== this._roughReflectionsConfigured
+            || glossy !== this._glossyReflectionsConfigured
+            || glossyOct !== this._glossyOctRes;
+        this._roughReflectionsConfigured = rough;
+        this._glossyReflectionsConfigured = glossy;
+        this._glossyOctRes = glossyOct;
+        this._glossyTile = glossyTile;
+        if (changed) this._structGen++;
+    }
     setChebyStrength(v) { if (Number.isFinite(v)) { this.chebyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
     setDetailStrength(v) { if (Number.isFinite(v)) { this.detailStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
     setClassifyStrength(v) { if (Number.isFinite(v)) { this.classifyStrengthNode.value = THREE.MathUtils.clamp(v, 0, 1); touchGiUniforms(); } }
@@ -369,12 +443,20 @@ export class GiProbeNode extends LightingNode {
         this._structGen++;   // shader tap count changes → one recompile
     }
     setAtlases(c, atlas, depthAtlas, stateAtlas, roughSpecularAtlas = null, glossySpecularAtlas = null) {
-        this._atlas[c] = atlas || null;
-        this._roughSpecularAtlas[c] = roughSpecularAtlas || null;
-        this._glossySpecularAtlas[c] = glossySpecularAtlas || null;
-        this._depthAtlas[c] = depthAtlas || null;
-        this._stateAtlas[c] = stateAtlas || null;
-        this._structGen++;
+        const a = atlas || null, d = depthAtlas || null, s = stateAtlas || null;
+        const rs = roughSpecularAtlas || null, gs = glossySpecularAtlas || null;
+        // Bump only on a real identity change. A no-op call (e.g. disposing an
+        // already-empty cascade on every cascades=1 rebuild) must NOT move the
+        // cacheToken — that fired the whole-scene material-dirty pass per
+        // rebuild and was the dominant churn hitch.
+        const changed = this._atlas[c] !== a || this._depthAtlas[c] !== d || this._stateAtlas[c] !== s
+            || this._roughSpecularAtlas[c] !== rs || this._glossySpecularAtlas[c] !== gs;
+        this._atlas[c] = a;
+        this._roughSpecularAtlas[c] = rs;
+        this._glossySpecularAtlas[c] = gs;
+        this._depthAtlas[c] = d;
+        this._stateAtlas[c] = s;
+        if (changed) this._structGen++;
     }
     // Update the grid placement uniforms only. Uniform .value writes do NOT change
     // a material cache key, so this is churn-free — the same-dim rebuild path uses
@@ -414,13 +496,13 @@ export class GiProbeNode extends LightingNode {
     }
 
     // The glossy cache is packed independently in near-square tile rows so its
-    // larger 18×18 tiles never inherit the diffuse atlas' tall resY×resZ layout.
+    // larger glossy tiles never inherit the diffuse atlas' tall resY×resZ layout.
     _glossyTileUV(px, py, pz, octUV, c) {
         const probeIndex = px.add(py.mul(this.resNode[c].x)).add(pz.mul(this.resNode[c].x.mul(this.resNode[c].y)));
         const col = probeIndex.mod(this.glossyTilesXNode[c]);
         const row = floor(probeIndex.div(this.glossyTilesXNode[c]));
-        const ox = col.mul(float(GLOSSY_TILE)).add(float(BORDER)).add(octUV.x.mul(float(GLOSSY_OCT_RES)));
-        const oy = row.mul(float(GLOSSY_TILE)).add(float(BORDER)).add(octUV.y.mul(float(GLOSSY_OCT_RES)));
+        const ox = col.mul(float(this._glossyTile)).add(float(BORDER)).add(octUV.x.mul(float(this._glossyOctRes)));
+        const oy = row.mul(float(this._glossyTile)).add(float(BORDER)).add(octUV.y.mul(float(this._glossyOctRes)));
         return vec2(ox.div(this.glossyAtlasDimNode[c].x), oy.div(this.glossyAtlasDimNode[c].y));
     }
 
@@ -544,7 +626,10 @@ export class GiProbeNode extends LightingNode {
         return Fn(() => {
             const res = this.resNode[c];
             const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
-            const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
+            // Probe interpolation is a spatial lookup and must use the actual surface
+            // position. P carries the outward normal bias exclusively for visibility;
+            // letting it drive gridF makes the selected cage move when normal bias moves.
+            const gridF = reflectionP.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
             const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
             const frac = gridF.sub(baseF).clamp(0.0, 1.0);
             const Nn = Nvis.normalize();
@@ -588,10 +673,10 @@ export class GiProbeNode extends LightingNode {
             const octR = octEncodeNode(Rn, TSL);
             const acc = vec3(0.0).toVar();
             const roughAcc = vec4(0.0).toVar();
-            const glossyAcc = vec4(0.0).toVar();
+            const glossyAcc = this._glossyReflectionsConfigured ? vec4(0.0).toVar() : null;
             const wsum = float(0.0).toVar();
             const roughWsum = float(0.0).toVar();
-            const glossyWsum = float(0.0).toVar();
+            const glossyWsum = this._glossyReflectionsConfigured ? float(0.0).toVar() : null;
             Loop({ start: uint(0), end: uint(8), type: 'uint', condition: '<' }, ({ i }) => {
                 const dx = i.bitAnd(uint(1)).toFloat();
                 const dy = i.shiftRight(uint(1)).bitAnd(uint(1)).toFloat();
@@ -606,11 +691,16 @@ export class GiProbeNode extends LightingNode {
                 const { e, w, probePos } = this._tapEW(c, P, Nn, octN, octNs, px, py, pz, wTri, true);
                 acc.addAssign(e.mul(w));
                 wsum.addAssign(w);
-                If(reflectionWeight.greaterThan(float(0.0)), () => {
+                const wantsRough = roughLobeMix.greaterThan(float(0.0));
+                const wantsGlossy = this._glossyReflectionsConfigured
+                    ? roughLobeMix.lessThan(float(1.0))
+                    : null;
+                const wantsThisTap = this._glossyReflectionsConfigured ? wantsRough.or(wantsGlossy) : wantsRough;
+                If(reflectionWeight.greaterThan(float(0.0)).and(wantsThisTap), () => {
                     const row = pz.mul(res.y).add(py);
                     // Parallax-aware probe lookup. The depth atlas gives a directional
                     // mean radius around this probe. Intersect the fragment reflection
-                    // ray P+tR with that sphere, then fetch radiance in the direction
+                    // ray reflectionP+tR with that sphere, then fetch radiance in the direction
                     // from the actual probe origin to the shared hit proxy. This makes
                     // neighbouring probes agree on local silhouettes instead of all
                     // sampling the same world direction from different origins.
@@ -649,20 +739,21 @@ export class GiProbeNode extends LightingNode {
                     // its independent high-resolution packing plus a tighter spatial
                     // weight; rough keeps the stable low-resolution DDGI blend.
                     const reflectionProbeW = w.mul(w);
-                    If(roughLobeMix.lessThan(float(1.0)), () => {
-                        const glossy = textureLevel(
-                            this._glossySpecularAtlas[c],
-                            this._glossyTileUV(px, py, pz, octSampleR, c),
-                            float(0.0),
-                        );
-                        // SSR-style confidence idea without screen-space dependence:
-                        // smooth reflections prefer the dominant local probe and probes
-                        // whose depth proxy actually supports the reprojected hit.
-                        const confidence = mix(float(0.2), float(1.0), parallaxWeight);
-                        const glossyProbeW = reflectionProbeW.mul(confidence);
-                        glossyAcc.addAssign(glossy.mul(glossyProbeW));
-                        glossyWsum.addAssign(glossyProbeW);
-                    });
+                    if (this._glossyReflectionsConfigured) {
+                        If(wantsGlossy, () => {
+                            const glossy = textureLevel(
+                                this._glossySpecularAtlas[c],
+                                this._glossyTileUV(px, py, pz, octSampleR, c),
+                                float(0.0),
+                            );
+                            // SSR-style confidence idea without screen-space dependence:
+                            // prefer probes whose depth proxy supports the reprojected hit.
+                            const confidence = mix(float(0.2), float(1.0), parallaxWeight);
+                            const glossyProbeW = reflectionProbeW.mul(confidence);
+                            glossyAcc.addAssign(glossy.mul(glossyProbeW));
+                            glossyWsum.addAssign(glossyProbeW);
+                        });
+                    }
                     If(roughLobeMix.greaterThan(float(0.0)), () => {
                         const broad = textureLevel(this._roughSpecularAtlas[c], this._tileUV(px, row, octSampleR, c), float(0.0));
                         roughAcc.addAssign(broad.mul(reflectionProbeW));
@@ -671,11 +762,13 @@ export class GiProbeNode extends LightingNode {
                 });
             });
             const den = wsum.max(float(1e-4));
-            const glossyResolved = glossyAcc.div(glossyWsum.max(float(1e-4)));
             const roughResolved = roughAcc.div(roughWsum.max(float(1e-4)));
+            const reflectionResolved = this._glossyReflectionsConfigured
+                ? mix(glossyAcc.div(glossyWsum.max(float(1e-4))), roughResolved, roughLobeMix)
+                : roughResolved;
             return ProbeLightingSample({
                 irradiance: acc.div(den),
-                roughRadiance: mix(glossyResolved, roughResolved, roughLobeMix),
+                roughRadiance: reflectionResolved,
             });
         })();
     }
@@ -683,12 +776,14 @@ export class GiProbeNode extends LightingNode {
     sampleIrradianceAndRough(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, dualDetail = false) {
         const useFine = Math.round(this.cascadeCountNode.value) >= 2
             && !!this._atlas[1] && !!this._roughSpecularAtlas[1]
-            && !!this._glossySpecularAtlas[1]
+            && (!this._glossyReflectionsConfigured || !!this._glossySpecularAtlas[1])
             && !!this._depthAtlas[1] && !!this._stateAtlas[1];
         if (!useFine) return this._sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, 0, dualDetail);
 
         return Fn(() => {
-            const f = P.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6)));
+            // Cascade ownership is spatial too; normal bias must not move a receiver
+            // across the fine-volume blend band.
+            const f = reflectionP.sub(this.gridMinNode[1]).div(this.gridSizeNode[1].max(vec3(1e-6)));
             const fLo = tslMin(tslMin(f.x, f.y), f.z);
             const fHi = tslMin(tslMin(float(1.0).sub(f.x), float(1.0).sub(f.y)), float(1.0).sub(f.z));
             const edge = tslMin(fLo, fHi);
@@ -799,14 +894,19 @@ export class GiProbeNode extends LightingNode {
         //
         // Only Physical/Standard materials expose a finite roughness scalar. Phong/Lambert
         // keep their exact old path, and the runtime branch skips all reflection atlas
-        // taps at reflection intensity 0.
-        if (this.roughReflectionsReady && Number.isFinite(material?.roughness) && builder.context.radiance) {
-            const reflectionWeight = this.reflectionIntensityNode.mul(this.enabledNode).clamp(0.0, 1.0).toVar();
-            const roughLobeMix = smoothstep(
-                float(ROUGH_LOBE_MIX_START),
-                float(ROUGH_LOBE_MIX_END),
-                roughness,
-            ).toVar();
+        // taps at reflection intensity 0. `material.userData.speedballReflections = false`
+        // is a compile-time per-material opt-out (set material.needsUpdate after changing it).
+        const materialAllowsReflections = material?.userData?.speedballReflections !== false;
+        if (this.roughReflectionsReady && materialAllowsReflections && Number.isFinite(material?.roughness) && builder.context.radiance) {
+            const roughnessParticipation = select(
+                roughness.lessThanEqual(this.roughnessLimitNode),
+                float(1.0),
+                float(0.0),
+            );
+            const reflectionWeight = this.reflectionIntensityNode.mul(this.enabledNode).mul(roughnessParticipation).clamp(0.0, 1.0).toVar();
+            const roughLobeMix = (this._glossyReflectionsConfigured
+                ? smoothstep(float(ROUGH_LOBE_MIX_START), float(ROUGH_LOBE_MIX_END), roughness)
+                : float(1.0)).toVar();
             // Orthographic-safe view direction, transformed to the same stable world
             // space as detailNormal. Match Three's EnvironmentNode roughness bend so
             // very rough lobes cannot gather radiance from behind the tangent plane.
@@ -846,19 +946,36 @@ export function createProbeField({
     renderer,
     scene,
     intensity = 1.0,
-    hysteresis = 0.95,
+    hysteresis = null,
+    jitterMode: initialJitterMode = 'gated',
     onRebuilt = null,
     divisions = TARGET_PROBES_LONG_AXIS,
     roughReflections = false,
+    reflectionQuality = null,
     reflectionIntensity = 1.0,
+    roughnessLimit = null,
     reflectionSkyFallback = false,
+    clusteredLighting = false,
+    autoDetectChanges = true,
 } = {}) {
+    if (_activeProbeFieldOwner !== null) {
+        throw new Error('createProbeField: only one active field is supported per module instance; dispose the existing field first.');
+    }
+    const fieldOwner = {};
     const node = getGiProbeNode();
+    const reflectionConfig = resolveReflectionQuality(reflectionQuality, roughReflections);
+    const roughReflectionsEnabled = reflectionConfig.rough;
+    const glossyReflectionsEnabled = reflectionConfig.glossy;
+    const glossyOctRes = glossyReflectionsEnabled ? reflectionConfig.glossyOct : 1;
+    const glossyTile = glossyReflectionsEnabled ? glossyOctRes + 2 * BORDER : 1;
+    const glossyUpdateInterval = glossyReflectionsEnabled ? reflectionConfig.glossyUpdateInterval : 0;
+    const glossyHistoryBytesPerProbe = glossyTile * glossyTile * 4 * Float32Array.BYTES_PER_ELEMENT;
+    node.setReflectionConfig(reflectionConfig);
     node.setIntensity(intensity);
     node.setReflectionIntensity(reflectionIntensity);
-    // Structural, creation-time v1 option: false keeps the historical allocation,
-    // compute graph, material graph, and image byte-for-byte unchanged.
-    const roughReflectionsEnabled = roughReflections === true;
+    node.setRoughnessLimit(Number.isFinite(roughnessLimit)
+        ? roughnessLimit
+        : reflectionConfig.roughnessLimit);
     // Live grid density: probes along the longest axis. setDivisions() updates it and
     // requests a (resize) rebuild; per-axis counts derive from it so cells stay ~cubic.
     let targetLongAxis = THREE.MathUtils.clamp(Math.round(divisions) || TARGET_PROBES_LONG_AXIS, 2, MAX_PROBES_PER_AXIS);
@@ -878,6 +995,7 @@ export function createProbeField({
     let cascades = 2;
     let solveTurn = 0;        // round-robin cascade index across ticks (C0 even, C1 odd)
     let buildStage = 0;       // staggered build phase machine (0 = build C0, 1 = build C1, 2 = done)
+    let fieldEverReady = false; // first bring-up completed once — REbuilds are rest-gated, bring-up is not
     let buildCascadeCount = 1; // effective cascade count for the CURRENT build (fitFineBox may drop to 1)
 
     // Per-cascade state (index 0 = C0 coarse full-bounds, 1 = C1 fine sub-box). The BVH
@@ -890,6 +1008,7 @@ export function createProbeField({
             probeTotal: uniform(1, 'uint'),
             probeOffset: uniform(0, 'uint'),
             updatedCount: uniform(1, 'uint'),
+            glossyPhase: uniform(0, 'uint'),
             atlasDim: uniform(new THREE.Vector2(1, 1)),
             maxDist: uniform(100.0),
             cellMin: uniform(0.1),
@@ -911,18 +1030,19 @@ export function createProbeField({
             probeCursor: 0,
             lastSolveAt: 0,
             solveDtEma: 0,
-            refreshStarted: false,
-            ticksSinceRot: 0,
+            glossyPhase: 0,
             prevAtlasW: 0, prevAtlasH: 0, prevGlossyAtlasW: 0, prevGlossyAtlasH: 0, prevProbeTotal: 0,
             needsClear: true, needsClassify: true,
             normalBias: 0.04, chebyBias: 0.0,
         };
     }
     const casc = [makeCascade(), makeCascade()];
+    const c0LightCellCount = () => Math.max(1, casc[0].res.x - 1) * Math.max(1, casc[0].res.y - 1) * Math.max(1, casc[0].res.z - 1);
 
     let continuous = true;    // DEFAULT ON: keep the bounded GPU solve running while the camera
                               // moves — heavy build steps still wait for rest, so the no-hitch
                               // guarantee holds. false opts into strict idle-gating (solve too).
+    let detectSceneChanges = autoDetectChanges !== false;
     let dirty = true;
     // Cached CPU build (BVH soup + material textures). The BVH depends ONLY on geometry,
     // so a divisions/rays change must NOT rebuild it — that ~200ms synchronous MeshBVH +
@@ -930,6 +1050,52 @@ export function createProbeField({
     // it's set by geometry/light-count/volume changes (true at start), and left FALSE by
     // setDivisions/setRays so those resize the grid/kernels off the cached soup (no hitch).
     let cachedBuilt = null;
+    let blasCache = null;    // cross-rebuild BLAS cache (created with the lazy scene builder)
+    let lastBuildSceneRewritten = false; // this build's scene landed as an in-place arena rewrite
+    // Map extraction stages CPU bytes against this per-field arena. Accepted
+    // builds either rewrite the current texture objects layer-by-layer or adopt
+    // a fresh capacity generation. The generation is reference-counted through
+    // sceneResource so staggered C0/C1 replacement cannot dispose old bindings.
+    let mapsArena = {
+        current: null,
+        nextGeneration: 0,
+        growth: PROBE_SCENE_STORAGE_GROWTH,
+        maxLayers: Number(renderer?.backend?.device?.limits?.maxTextureArrayLayers)
+            || TEXTURE_ARRAY_LAYERS_FALLBACK,
+    };
+    let mapsArenaRebinds = 0;
+    let mapsArenaRewrites = 0;
+    let mapsArenaLastUpdate = 'none';
+    let kernelResidentReuses = 0;
+    let kernelRebuilds = 0;
+    // C0/C1 trace the same scene soup. Storage lives in a capacity arena whose
+    // BufferAttribute + TSL-node identities survive structural rebuilds. Build
+    // generations remain ref-counted separately so their material-map textures
+    // stay alive through staggered C0/C1 replacement. On a capacity growth the
+    // old generation also keeps its old arena alive until both kernels move over.
+    let sceneResource = null;
+    let sceneStorageGeneration = 0;
+    let sceneStorageRebinds = 0;
+    let sceneStorageRewrites = 0;
+    let sceneStorageLastUpdate = 'none';
+    // Lights have an independent lifetime because clustered-grid resizes can
+    // replace giLightArena while the geometry/BVH arrays stay byte-identical.
+    let lightResource = null;
+    // ── clustered-lighting mode (opt-in, structural at creation) ──
+    // The raster side draws EVERY light through GiClusteredLightsNode; the GI lane
+    // budgets to a FIXED MAX_LIGHTS-slot arena. Analytic records precede the
+    // reserved emitter suffix in both modes; only clustered analytic records use
+    // importance selection. Cell-list overflow and out-of-grid hits fall back to
+    // the full arena, with type-3 records excluded from per-hit shading.
+    const clusteredGi = clusteredLighting === true;
+    let giLightArena = null;     // clustered records + C0 cell-list suffix
+    let giLegacyLightArena = null; // fixed MAX_LIGHTS records; count edits never rebuild geometry
+    let giSelectedCount = 0;
+    let giLegacyLightCount = 0;
+    let giEmitterBase = 0;
+    let giEmitterCount = 0;
+    let liveLightRecords = null; // latest collected records survive grid/ray-only kernel rebuilds
+    let giLightGridDirty = false;
     let buildDirty = true;
     // Monotonic invalidation token for the CPU soup. A native/browser scene
     // update can arrive while buildSpectralScene is yielding to material-map
@@ -937,27 +1103,58 @@ export function createProbeField({
     // older build when it resumes.
     let buildGeneration = 0;
     let manualVolumes = null; // explicit probe volumes (Probe Origin boxes); null = auto-fit scene
-    // needsClassify / needsClear / probeCursor / refreshStarted / ticksSinceRot / prev*
-    // are now PER-CASCADE (see makeCascade); frameCounter is SHARED (one ray-set rotation
-    // advanced only on C0's pass boundary — both cascades read the same U.frameJitter).
+    // needsClassify / needsClear / probeCursor / prev* are PER-CASCADE (see
+    // makeCascade); frameCounter is shared because Monte Carlo advances one basis
+    // from C0 and both cascades read the same U.frameJitter.
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
     // ── auto-throttle (the hard rule: never lag the browser). The per-tick ray budget
     // adapts to the observed tick cadence: halve when frames slip, creep back up when
     // they're comfortably fast. Measures GPU pressure on THIS machine — no tuning knob.
     let tickBudgetRays = RAYS_PER_TICK;
+    // Experimentation knob (setRayBudget): the per-tick trace budget TARGET the
+    // auto-throttle recovers toward and the kernel build sizes its scratch from.
+    // More rays/tick = faster light propagation for more GPU; frame pacing stays
+    // owned by the cadence controller either way.
+    let rayBudgetCeiling = RAYS_PER_TICK;
+    // Ray-jitter regime (setJitterMode): 'gated' (default) holds the basis and
+    // pairs with a low-latency 0.60 history; 'montecarlo' re-jitters every C0
+    // solve tick and pairs with 0.90 history to absorb the sample blast.
+    const normalizeJitterMode = (mode) => {
+        const m = String(mode ?? '').toLowerCase().replace(/[\s_-]/g, '');
+        return (m === 'montecarlo' || m === 'mc') ? 'montecarlo' : 'gated';
+    };
+    let jitterMode = normalizeJitterMode(initialJitterMode);
     let lastTickAt = 0;
     let tickDtEma = 0;
     // Temporal cadence must survive auto-throttle's deliberate tickDtEma resets.
     // Otherwise every budget adjustment injects a one-frame 60 Hz history jump.
     let hysteresisTickDtEma = 0;
     let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
+    let cadenceOverloadStreak = 0;
     let inFlight = false;
     let disposed = false;
+
+    // A canvas resize/fullscreen transition can produce one slow presentation frame even
+    // though GI workload did not change. Discard that interval from the budget controller;
+    // keep the learned ray budget and temporal history intact.
+    function resetFramePacing() {
+        lastTickAt = 0;
+        tickDtEma = 0;
+        cadenceOverloadStreak = 0;
+    }
     let frameCounter = 0;
+    let emitterVisSeedCounter = 0;   // advances with the active ray-sampling epoch
     let quantStep = 1;        // translation deadband (~quarter cell) for the geo signature (A1)
     let lightQuant = 1;       // scene-relative position deadband for the light signature (B4)
     // reactivity: self-detect live light/geometry edits and re-converge fast.
-    let baseHysteresis = THREE.MathUtils.clamp(hysteresis, 0, 0.99);
+    let baseHysteresis = Number.isFinite(hysteresis)
+        ? THREE.MathUtils.clamp(hysteresis, 0, 0.99)
+        : JITTER_HYSTERESIS_DEFAULTS[jitterMode];
+    const jitterHysteresis = {
+        gated: JITTER_HYSTERESIS_DEFAULTS.gated,
+        montecarlo: JITTER_HYSTERESIS_DEFAULTS.montecarlo,
+    };
+    jitterHysteresis[jitterMode] = baseHysteresis;
     let hysteresisNormalize = true;
     let chebyBiasScale = 1.0;
     let debugFreezeRayJitter = false;
@@ -967,14 +1164,25 @@ export function createProbeField({
     let lastXformSig = null;
     let lastDeformSig = null;
     let lastRefitCount = 0;   // BLASes refit by the most recent deform refresh (debug/stats)
+    let lastTransformInstanceCount = 0;
+    let lastTlasRefitCount = 0;
+    const pendingTransformTargets = new Set();
+    let pendingAllTransforms = false;
+    let pendingDeformRefresh = false;
+    const pendingMaterialValueTargets = new Set();
+    let pendingAllMaterialValues = false;
+    let lastMaterialValueRecords = 0;  // uber records rewritten by the most recent value refresh (debug/stats)
     let geoStable = -1;       // -1 = no pending geo change; >=0 = stable-check count since a change (debounce, A1)
     let checkCounter = 0;
     let lastIdleMs = Infinity;
     let lastMoving = false;
+    let lastPlaying = false;
     let lastRestOnly = true;
     let lastSolveList = '';
     let lastUpdatedCount = 0;
     const _sigVec = new THREE.Vector3();
+    const _sigScale = new THREE.Vector3();
+    const _sigEmissive = [0, 0, 0];
 
     // SHARED compute uniforms — a single instance, folded into BOTH cascade U blocks by
     // reference (see below), so one GUI knob writes both cascades. Per-cascade uniforms
@@ -982,12 +1190,20 @@ export function createProbeField({
     // relocClamp) live in each C.U (makeCascadeU).
     const U = {
         lightCount: uniform(0, 'uint'),
+        emitterBase: uniform(0, 'uint'),
+        emitterCount: uniform(0, 'uint'),
+        // Emitter-vis disk target follows the same sampling epoch as frameJitter:
+        // stable across a Gated pass, fresh every Monte Carlo solve tick.
+        emitterVisSeed: uniform(0.0),
         frameJitter: uniform(0.0),
         // Raw 60 Hz reference-rate retention. Adaptive signal-specific weights are
         // derived from this first, then normalized once with hysteresisExponent.
-        hysteresis: uniform(THREE.MathUtils.clamp(hysteresis, 0, 0.99)),
+        hysteresis: uniform(baseHysteresis),
         hysteresisExponent: uniform(1.0),
-        depthSharpness: uniform(50.0),  // cosine power → depth tracks nearest occluder crisply
+        // Raw cosine exponent. Seven is already a ~25 degree half-power cone and
+        // about 7.5 effective samples at the default 64 rays; the old implicit 50
+        // collapsed the estimate to roughly one ray and made visibility brittle.
+        depthSharpness: uniform(7.0),
         radianceClamp: uniform(8.0),    // cap the multibounce feedback term (anti-runaway)
         classifyStrength: uniform(0.0), // gates relocation APPLY (mirrors node.classifyStrengthNode)
         filterStrength: uniform(1.0),   // CORE denoise: 0 = filter off (harness baseline), 1 = full intra-tile spatial filter
@@ -1107,16 +1323,329 @@ export function createProbeField({
             && typeof THREE.StorageBufferAttribute === 'function';
     }
 
-    // Same-dim rebuild: free ONLY the previous build's BVH storages, ray scratch, and
-    // texture maps — the atlases + irr/depth/state buffers are handed to the new kernels
-    // via `reuse`, so they must NOT be disposed (preserves live history, keeps the
-    // material binding stable → no recompile).
-    function disposeBVHOnly(g) {
+    // The compute graph bakes exactly one thing from a specific build: the
+    // material map array textures. Identity-equal maps (including the all-null
+    // case of an untextured scene) make a live kernel fully reusable across an
+    // in-place scene rewrite.
+    function mapsCompatible(a, b) {
+        const ka = Object.keys(a || {});
+        const kb = Object.keys(b || {});
+        if (ka.length !== kb.length) return false;
+        for (const key of ka) if ((a[key] || null) !== ((b || {})[key] || null)) return false;
+        return true;
+    }
+
+    function retainSceneStorage(arena) {
+        if (arena) arena.refs++;
+        return arena;
+    }
+
+    function releaseSceneStorage(arena) {
+        if (!arena || arena.refs <= 0) return;
+        arena.refs--;
+        if (arena.refs === 0) {
+            disposeStorageAttributes(renderer, arena.buffers, PROBE_SCENE_BUFFER_KEYS);
+        }
+    }
+
+    function disposeMapsGeneration(generation) {
+        if (!generation || generation.disposed) return;
+        generation.disposed = true;
+        const disposedMaps = new Set();
+        for (const texture of Object.values(generation.textures || {})) {
+            if (!texture || disposedMaps.has(texture)) continue;
+            disposedMaps.add(texture);
+            texture.dispose?.();
+        }
+    }
+
+    function retainMapsGeneration(generation) {
+        if (generation) generation.refs++;
+        return generation;
+    }
+
+    function releaseMapsGeneration(generation) {
+        if (!generation || generation.refs <= 0) return;
+        generation.refs--;
+        if (generation.refs === 0) disposeMapsGeneration(generation);
+    }
+
+    function commitMapsArenaPlan(built) {
+        const plan = built?.mapsArenaPlan;
+        if (!plan || plan.committed) return { mapsRebound: false, mapsRewritten: false };
+        const generation = plan.generation;
+        if (!generation || generation.disposed || !mapsArena) {
+            throw new Error('SPEEDBALL GI material maps arena generation is unavailable');
+        }
+
+        if (plan.kind === 'rewrite') {
+            if (mapsArena.current !== generation) {
+                throw new Error('SPEEDBALL GI material maps arena changed during a staged rewrite');
+            }
+            const layerBytes = generation.width * generation.height * 4;
+            for (const key of PROBE_MAP_KEYS) {
+                const live = plan.liveLayers[key] | 0;
+                const texture = generation.textures[key];
+                const packed = plan.packedLayers?.[key] || null;
+                const changedLayers = plan.changedLayers?.[key] || [];
+                if (live <= 0 || !texture || !packed || changedLayers.length === 0) continue;
+                if (packed.length !== live * layerBytes) {
+                    throw new Error(`SPEEDBALL GI invalid ${key} map layer staging length`);
+                }
+                for (const layer of changedLayers) {
+                    const start = layer * layerBytes;
+                    texture.image.data.set(packed.subarray(start, start + layerBytes), start);
+                }
+                // Three WebGPU honors DataArrayTexture layerUpdates. Preserve
+                // any earlier pending layers until the renderer consumes them;
+                // add only content that actually changed in this build.
+                if (typeof texture.addLayerUpdate === 'function') {
+                    for (const layer of changedLayers) texture.addLayerUpdate(layer);
+                }
+                texture.needsUpdate = true;
+            }
+            generation.liveLayers = { ...plan.liveLayers };
+            mapsArenaRewrites++;
+            mapsArenaLastUpdate = 'rewrite';
+            plan.committed = true;
+            plan.packedLayers = null;
+            plan.changedLayers = null;
+            return { mapsRebound: false, mapsRewritten: true };
+        }
+
+        mapsArena.current = generation;
+        generation.liveLayers = { ...plan.liveLayers };
+        mapsArenaRebinds++;
+        mapsArenaLastUpdate = plan.kind;
+        plan.committed = true;
+        plan.packedLayers = null;
+        return { mapsRebound: true, mapsRewritten: false };
+    }
+
+    function retainSceneResource(resource) {
+        if (resource) resource.refs++;
+        return resource;
+    }
+
+    function releaseSceneResource(resource) {
+        if (!resource || resource.refs <= 0) return;
+        resource.refs--;
+        if (resource.refs > 0) return;
+        releaseMapsGeneration(resource.mapsGeneration);
+        releaseSceneStorage(resource.storage);
+    }
+
+    function retainLightResource(resource) {
+        if (resource) resource.refs++;
+        return resource;
+    }
+
+    function releaseLightResource(resource) {
+        if (!resource || resource.refs <= 0) return;
+        resource.refs--;
+        if (resource.refs === 0) disposeStorageAttribute(renderer, resource.buffer);
+    }
+
+    function sceneStorageMaxElements(ArrayType) {
+        const limits = renderer?.backend?.device?.limits;
+        const binding = Number(limits?.maxStorageBufferBindingSize) || STORAGE_BINDING_FALLBACK;
+        const buffer = Number(limits?.maxBufferSize) || binding;
+        return Math.max(1, Math.floor(Math.min(binding, buffer) / ArrayType.BYTES_PER_ELEMENT));
+    }
+
+    function sceneStorageCapacity(required, previous, ArrayType) {
+        const live = Math.max(1, Math.floor(Number(required) || 0));
+        const prior = Math.max(0, Math.floor(Number(previous) || 0));
+        const target = Math.max(
+            live,
+            Math.ceil(live * PROBE_SCENE_STORAGE_GROWTH),
+            prior > 0 ? Math.ceil(prior * PROBE_SCENE_STORAGE_GROWTH) : 0,
+        );
+        const limit = sceneStorageMaxElements(ArrayType);
+        // Preserve today's fail-loud behavior if a live scene itself exceeds the
+        // device binding limit. Otherwise spend all available geometric headroom.
+        return limit >= live ? Math.min(target, limit) : live;
+    }
+
+    function updateSceneTraversalUniforms(Utrav, built) {
+        Utrav.nodeCount.value = built.nodeCount >>> 0;
+        Utrav.tlasNodeCount.value = (built.tlasNodeCount ?? 0) >>> 0;
+        Utrav.instBase.value = (built.instBase ?? 0) >>> 0;
+        Utrav.tlasBase.value = (built.tlasBase ?? 0) >>> 0;
+    }
+
+    function createSceneStorage(built, previous = null) {
+        const buffers = {};
+        const capacities = {};
+        const liveLengths = {};
+        for (const key of PROBE_SCENE_BUFFER_KEYS) {
+            const source = built[key];
+            const ArrayType = source.constructor;
+            const capacity = sceneStorageCapacity(source.length, previous?.capacities?.[key], ArrayType);
+            const array = new ArrayType(capacity);
+            array.set(source);
+            buffers[key] = new THREE.StorageBufferAttribute(array, 1);
+            capacities[key] = capacity;
+            liveLengths[key] = source.length;
+        }
+        const storages = {
+            bvhNodes: storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count).toReadOnly(),
+            triIndex: storage(buffers.triIndex, 'uint', buffers.triIndex.count).toReadOnly(),
+            vertexData: storage(buffers.vertexData, 'float', buffers.vertexData.count).toReadOnly(),
+            triMaterial: storage(buffers.triMaterial, 'uint', buffers.triMaterial.count).toReadOnly(),
+            materials: storage(buffers.materials, 'float', buffers.materials.count).toReadOnly(),
+        };
+        const traversalUniforms = {
+            nodeCount: uniform(0, 'uint'),
+            tlasNodeCount: uniform(0, 'uint'),
+            instBase: uniform(0, 'uint'),
+            tlasBase: uniform(0, 'uint'),
+            envRotation: uniform(0.0),
+            envIntensity: uniform(1.0),
+        };
+        updateSceneTraversalUniforms(traversalUniforms, built);
+        return {
+            refs: 0,
+            generation: ++sceneStorageGeneration,
+            buffers,
+            storages,
+            traversalUniforms,
+            capacities,
+            liveLengths,
+        };
+    }
+
+    function sceneStorageFits(arena, built, forceRebind = false) {
+        return !forceRebind && !!arena
+            && PROBE_SCENE_BUFFER_KEYS.every((key) => built[key].length <= arena.capacities[key]);
+    }
+
+    function rewriteSceneStorage(arena, built) {
+        for (const key of PROBE_SCENE_BUFFER_KEYS) {
+            const source = built[key];
+            arena.buffers[key].array.set(source, 0);
+            arena.liveLengths[key] = source.length;
+            // Upload only the live prefix. Stale capacity tail is intentionally
+            // left untouched and is unreachable through the exact traversal
+            // count/base uniforms updated below.
+            markStorageDirty(arena.buffers[key], [[0, source.length]]);
+        }
+        updateSceneTraversalUniforms(arena.traversalUniforms, built);
+    }
+
+    function copySceneStorageRanges(key, source, ranges) {
+        const arena = sceneResource?.storage;
+        const attr = arena?.buffers?.[key];
+        if (!attr || !source || source.length > attr.array.length) return false;
+        const uploadRanges = Array.isArray(ranges) && ranges.length > 0
+            ? ranges
+            : [[0, source.length]];
+        for (const [startValue, countValue] of uploadRanges) {
+            const start = Math.max(0, Math.floor(Number(startValue) || 0));
+            const count = Math.max(0, Math.min(
+                Math.floor(Number(countValue) || 0),
+                source.length - start,
+                attr.array.length - start,
+            ));
+            if (count > 0) attr.array.set(source.subarray(start, start + count), start);
+        }
+        markStorageDirty(attr, uploadRanges);
+        return true;
+    }
+
+    function createSceneResource(built, storageArena) {
+        const arena = retainSceneStorage(storageArena);
+        const mapsGeneration = retainMapsGeneration(built.mapsArenaGeneration);
+        return {
+            built,
+            refs: 1, // active-root ref
+            storage: arena,
+            mapsGeneration,
+            buffers: arena.buffers,
+            storages: arena.storages,
+            traversalUniforms: arena.traversalUniforms,
+            maps: built.maps,
+        };
+    }
+
+    function createLightResource(array) {
+        const buffer = new THREE.StorageBufferAttribute(array, 1);
+        const storageNode = storage(buffer, 'float', buffer.count);
+        if (!clusteredGi) storageNode.toReadOnly();
+        return {
+            array,
+            refs: 1, // active-root ref
+            buffer,
+            storage: storageNode,
+        };
+    }
+
+    // Install the root owners that future cascade kernels retain. Within capacity,
+    // only the live prefixes and traversal uniforms change; the arena's attributes
+    // and TSL storage nodes remain resident. A generation wrapper keeps its own map
+    // textures alive until staggered C0/C1 replacement drops the last old kernel.
+    function prepareSharedResources(built, lightDataChanged = false) {
+        let sceneBuffersRebound = false;
+        let sceneBuffersRewritten = false;
+        if (!sceneResource || sceneResource.built !== built) {
+            const previous = sceneResource;
+            let arena = previous?.storage || null;
+            // A map-generation rebind must carry a matching scene-storage
+            // generation. Otherwise staggered C1 would see the new material
+            // layer indices through its old map bindings between C0 and C1.
+            let mapsGenerationRebound = (previous?.mapsGeneration || null)
+                !== (built.mapsArenaGeneration || null);
+            // The inverse coupling matters too: if scene storage grows while a
+            // staged map rewrite fits, old C1 still owns the old material records.
+            // Fork the map generation so its texture contents stay paired with
+            // those records until that old cascade releases both resources.
+            const rawSceneStorageFits = sceneStorageFits(arena, built, false);
+            if (!rawSceneStorageFits && !mapsGenerationRebound && previous
+                && typeof _rebindMaterialMapsArenaBuild === 'function'
+                && _rebindMaterialMapsArenaBuild(THREE, built, mapsArena)) {
+                mapsGenerationRebound = true;
+            }
+            if (!sceneStorageFits(arena, built, mapsGenerationRebound)) {
+                arena = createSceneStorage(built, arena);
+                sceneStorageRebinds++;
+                sceneStorageLastUpdate = mapsGenerationRebound && previous
+                    ? 'maps-rebind'
+                    : (previous ? 'grow' : 'allocate');
+                sceneBuffersRebound = true;
+            } else {
+                rewriteSceneStorage(arena, built);
+                sceneStorageRewrites++;
+                sceneStorageLastUpdate = 'rewrite';
+                sceneBuffersRewritten = true;
+            }
+            commitMapsArenaPlan(built);
+            sceneResource = createSceneResource(built, arena);
+            releaseSceneResource(previous);
+        }
+
+        const lightArray = clusteredGi ? giLightArena : giLegacyLightArena;
+        if (!lightArray) throw new Error('SPEEDBALL GI light storage is unavailable');
+        if (!lightResource || lightResource.array !== lightArray) {
+            const previous = lightResource;
+            lightResource = createLightResource(lightArray);
+            releaseLightResource(previous);
+        } else if (lightDataChanged) {
+            // The typed array was refilled in place; every cascade observes the
+            // same GPU attribute, so one version bump uploads it for both.
+            markStorageDirty(lightResource.buffer, null);
+        }
+        return { sceneBuffersRebound, sceneBuffersRewritten };
+    }
+
+    // Same-dim rebuild: free ONLY the previous compute graph + ray scratch and
+    // release its shared-owner refs. Atlases and history buffers were handed to
+    // the new kernels via `reuse`, so they must stay alive.
+    function disposeKernelOnly(g) {
         if (!g) return;
         disposeComputeNodes(g, PROBE_COMPUTE_KEYS);
-        disposeStorageAttributes(renderer, g.buffers, PROBE_BVH_BUFFER_KEYS);
         disposeStorageAttribute(renderer, g.rayBuffer);
-        if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
+        releaseLightResource(g.lightResource);
+        releaseSceneResource(g.sceneResource);
     }
 
     // Free ONE cascade's GPU resources (buffers + its own atlas set) and reset its
@@ -1126,20 +1655,21 @@ export function createProbeField({
         const g = C.gpu;
         if (g) {
             disposeComputeNodes(g, PROBE_COMPUTE_KEYS);
-            disposeStorageAttributes(renderer, g.buffers, PROBE_BVH_BUFFER_KEYS);
             disposeStorageAttribute(renderer, g.irrBuffer);
             disposeStorageAttribute(renderer, g.roughSpecularBuffer);
             disposeStorageAttribute(renderer, g.glossySpecularBuffer);
             disposeStorageAttribute(renderer, g.glossyWeightBuffer);
             disposeStorageAttribute(renderer, g.depthBuffer);
             disposeStorageAttribute(renderer, g.stateBuffer);
+            disposeStorageAttribute(renderer, g.emitterVisBuffer);
             disposeStorageAttribute(renderer, g.rayBuffer);
             g.atlas?.dispose?.();
             g.roughSpecularAtlas?.dispose?.();
             g.glossySpecularAtlas?.dispose?.();
             g.depthAtlas?.dispose?.();
             g.stateAtlas?.dispose?.();
-            if (g.maps) for (const t of Object.values(g.maps)) t?.dispose?.();
+            releaseLightResource(g.lightResource);
+            releaseSceneResource(g.sceneResource);
         }
         C.gpu = null;
         C.prevAtlasW = C.prevAtlasH = C.prevGlossyAtlasW = C.prevGlossyAtlasH = C.prevProbeTotal = 0;
@@ -1194,35 +1724,46 @@ export function createProbeField({
     // same-dim rebuild. Returns the gpu object; the caller stores it in C.gpu.
     function buildKernels(built, C, reuse = null) {
         const U = C.U;                       // per-cascade + shared uniforms (folded by reference)
+        const isC0 = C === casc[0];
         const probeTotal = C.probeTotal;     // shadow the old flat name → per-cascade
         const atlasW = C.atlasW, atlasH = C.atlasH;
         const res = C.res;
+        const glossyGroupsPerProbe = glossyReflectionsEnabled
+            ? Math.ceil((glossyTile * glossyTile) / PROBE_WORKGROUP_SIZE)
+            : 0;
+        // Both modes bind a fixed-capacity light arena with a contiguous emitter
+        // suffix. Clustered mode appends the C0 cell lists after that fixed arena.
+        // rebuild() prepares both root owners before C0; keep these guards so a
+        // future call-order change still lands in the shared path.
+        if (clusteredGi && !giLightArena) fillGiLightArena(recordsFromBuilt(built));
+        if (!clusteredGi && !giLegacyLightArena) fillLegacyLightArena(recordsFromBuilt(built));
+        const expectedLightArray = clusteredGi ? giLightArena : giLegacyLightArena;
+        if (sceneResource?.built !== built || lightResource?.array !== expectedLightArray) {
+            prepareSharedResources(built);
+        }
+        const sharedScene = sceneResource;
+        const sharedLights = lightResource;
         const buffers = {
-            bvhNodes: new THREE.StorageBufferAttribute(built.bvhNodes, 1),
-            triIndex: new THREE.StorageBufferAttribute(built.triIndex, 1),
-            vertexData: new THREE.StorageBufferAttribute(built.vertexData, 1),
-            triMaterial: new THREE.StorageBufferAttribute(built.triMaterial, 1),
-            materials: new THREE.StorageBufferAttribute(built.materials, 1),
-            lights: new THREE.StorageBufferAttribute(built.lights, 1),
+            ...sharedScene.buffers,
+            lights: sharedLights.buffer,
         };
-        const bvhNodes = storage(buffers.bvhNodes, 'uint', buffers.bvhNodes.count).toReadOnly();
-        const triIndex = storage(buffers.triIndex, 'uint', buffers.triIndex.count).toReadOnly();
-        const vertexData = storage(buffers.vertexData, 'float', buffers.vertexData.count).toReadOnly();
-        const triMaterial = storage(buffers.triMaterial, 'uint', buffers.triMaterial.count).toReadOnly();
-        const materials = storage(buffers.materials, 'float', buffers.materials.count).toReadOnly();
-        const lights = storage(buffers.lights, 'float', buffers.lights.count).toReadOnly();
+        // These nodes are owned by the capacity arena, not by this kernel build.
+        // A structural rebuild that fits therefore presents the exact same TSL
+        // storage-node and BufferAttribute identities to Three's binding cache.
+        const { bvhNodes, triIndex, vertexData, triMaterial, materials } = sharedScene.storages;
+        // The clustered cell lists occupy the float arena's suffix. Keeping light
+        // records and exact-small-integer indices in ONE binding is structural:
+        // the trace kernel already uses the portable WebGPU baseline of eight
+        // storage buffers, so a separate grid binding makes its pipeline invalid.
+        const lights = sharedLights.storage;
+        const lightGridCellCount = clusteredGi ? c0LightCellCount() : 0;
 
-        const Utrav = {
-            nodeCount: uniform(built.nodeCount >>> 0, 'uint'),
-            tlasNodeCount: uniform((built.tlasNodeCount ?? 0) >>> 0, 'uint'),
-            instBase: uniform((built.instBase ?? 0) >>> 0, 'uint'),
-            tlasBase: uniform((built.tlasBase ?? 0) >>> 0, 'uint'),
-            envRotation: uniform(0.0),
-            envIntensity: uniform(1.0),
-        };
+        // Live traversal sizes/bases are resident uniforms. Capacity may be
+        // larger than this build, but no walk can enter the stale tail.
+        const Utrav = sharedScene.traversalUniforms;
         const trav = buildTraversal({
             storages: { bvhNodes, triIndex, vertexData, triMaterial, materials },
-            U: Utrav, env: null, lut: null, lutRes: 0, maps: built.maps,
+            U: Utrav, env: null, lut: null, lutRes: 0, maps: sharedScene.maps,
         });
         const { fetchVert, fetchNorm, traverseClosest, traverseAny, instLocalRay, instNormalToWorld, matFloat, triVert, fetchUV, hitUV, sampleLayer, srgbToLinear, albedoTex, emissiveTex, haveAlbedoMap, haveEmissiveMap } = trav;
 
@@ -1250,12 +1791,12 @@ export function createProbeField({
         // High-resolution companion lobe for smooth/glossy receivers. Store its
         // unnormalized RGBA numerator and scalar angular support separately; weak
         // rotating ray sets must not receive the same history weight as strong ones.
-        const glossySpecularBuffer = roughReflectionsEnabled
-            ? (reuse?.glossySpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * GLOSSY_TILE * GLOSSY_TILE * 4)), 1))
+        const glossySpecularBuffer = glossyReflectionsEnabled
+            ? (reuse?.glossySpecularBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(4, probeTotal * glossyTile * glossyTile * 4)), 1))
             : null;
         const glossySpecular = glossySpecularBuffer ? storage(glossySpecularBuffer, 'float', glossySpecularBuffer.count) : null;
-        const glossyWeightBuffer = roughReflectionsEnabled
-            ? (reuse?.glossyWeightBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(1, probeTotal * GLOSSY_TILE * GLOSSY_TILE)), 1))
+        const glossyWeightBuffer = glossyReflectionsEnabled
+            ? (reuse?.glossyWeightBuffer || new THREE.StorageBufferAttribute(new Float32Array(Math.max(1, probeTotal * glossyTile * glossyTile)), 1))
             : null;
         const glossyWeight = glossyWeightBuffer ? storage(glossyWeightBuffer, 'float', glossyWeightBuffer.count) : null;
 
@@ -1281,7 +1822,7 @@ export function createProbeField({
             t.generateMipmaps = false; t.mipmapsAutoUpdate = false;
             return t;
         })()) : null;
-        const glossySpecularAtlas = roughReflectionsEnabled ? (reuse?.glossySpecularAtlas || (() => {
+        const glossySpecularAtlas = glossyReflectionsEnabled ? (reuse?.glossySpecularAtlas || (() => {
             const t = new THREE.StorageTexture(C.glossyAtlasW, C.glossyAtlasH);
             t.type = THREE.HalfFloatType; t.format = THREE.RGBAFormat;
             t.minFilter = THREE.LinearFilter; t.magFilter = THREE.LinearFilter;
@@ -1318,7 +1859,76 @@ export function createProbeField({
             return t;
         })();
 
+        const emitterVisBuffer = reuse?.emitterVisBuffer || new THREE.StorageBufferAttribute(
+            new Float32Array(Math.max(1, probeTotal * GI_EMITTER_INJECT_CAP)),
+            1,
+        );
+        const emitterVis = storage(emitterVisBuffer, 'float', emitterVisBuffer.count);
+        const emitterVisRead = storage(emitterVisBuffer, 'float', emitterVisBuffer.count).toReadOnly();
+
+        const probeTraceOrigin = (probeIndex) => {
+            const ro = probeWorldPos(probeIndex, U).toVar();
+            const mbT = probeIndex.mul(uint(4));
+            ro.addAssign(vec3(
+                stateRead.element(mbT.add(uint(1))),
+                stateRead.element(mbT.add(uint(2))),
+                stateRead.element(mbT.add(uint(3))),
+            ).mul(U.classifyStrength));
+            return ro;
+        };
+
         const loadLightVec3 = (base, off) => vec3(lights.element(base.add(uint(off))), lights.element(base.add(uint(off + 1))), lights.element(base.add(uint(off + 2))));
+        let lightGridKernel = null;
+        // The cell list is derived exclusively from C0 and lives in the shared
+        // light buffer. Building the identical list from C1 was duplicate work.
+        if (clusteredGi && isC0) {
+            const gridU = casc[0].U;
+            lightGridKernel = Fn(() => {
+                const cellIndex = instanceIndex.toVar();
+                If(cellIndex.greaterThanEqual(uint(lightGridCellCount)), () => { Return(); });
+                const cellsX = gridU.resX.sub(uint(1));
+                const cellsY = gridU.resY.sub(uint(1));
+                const ix = cellIndex.mod(cellsX);
+                const iy = cellIndex.div(cellsX).mod(cellsY);
+                const iz = cellIndex.div(cellsX.mul(cellsY));
+                const cellSize = vec3(
+                    gridU.gridSize.x.div(float(cellsX)),
+                    gridU.gridSize.y.div(float(cellsY)),
+                    gridU.gridSize.z.div(float(gridU.resZ.sub(uint(1)))),
+                );
+                const cellMin = gridU.gridMin.add(vec3(float(ix), float(iy), float(iz)).mul(cellSize));
+                const cellMax = cellMin.add(cellSize);
+                const listBase = uint(giLightDataCount()).add(cellIndex.mul(uint(GI_LIGHT_CELL_STRIDE)));
+                const count = uint(0).toVar();
+                Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
+                    const lb = li.mul(uint(_LIGHT_STRIDE));
+                    const ltype = lights.element(lb);
+                    const lpos = loadLightVec3(lb, 1);
+                    const lrange = lights.element(lb.add(uint(10)));
+                    const dx = tslMax(tslMax(cellMin.x.sub(lpos.x), float(0.0)), lpos.x.sub(cellMax.x));
+                    const dy = tslMax(tslMax(cellMin.y.sub(lpos.y), float(0.0)), lpos.y.sub(cellMax.y));
+                    const dz = tslMax(tslMax(cellMin.z.sub(lpos.z), float(0.0)), lpos.z.sub(cellMax.z));
+                    // Membership must be conservative: false positives cost work;
+                    // a boundary false negative changes radiance.
+                    const paddedRange = lrange.add(tslMax(float(1e-4), lrange.mul(float(1e-5))));
+                    const intersects = dx.mul(dx).add(dy.mul(dy)).add(dz.mul(dz)).lessThanEqual(paddedRange.mul(paddedRange));
+                    const member = ltype.lessThan(float(2.5)).and(
+                        ltype.lessThan(float(0.5)).or(lrange.lessThanEqual(float(0.0))).or(intersects),
+                    );
+                    If(member, () => {
+                        If(count.lessThan(uint(GI_LIGHTS_PER_CELL)), () => {
+                            lights.element(listBase.add(uint(1)).add(count)).assign(float(li));
+                        });
+                        count.addAssign(uint(1));
+                    });
+                });
+                lights.element(listBase).assign(float(select(
+                    count.greaterThan(uint(GI_LIGHTS_PER_CELL)),
+                    uint(GI_LIGHT_CELL_OVERFLOW),
+                    count,
+                )));
+            })().compute(lightGridCellCount);
+        }
 
         // sample the (last-frame) atlas irradiance at world (P,N) — for multibounce.
         const sampleAtlas = (P, N) => {
@@ -1363,10 +1973,7 @@ export function createProbeField({
             If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
             const k = gid.mod(uint(raysPerProbe)).toVar();
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
-            const ro = probeWorldPos(probeIndex, U).toVar();
-            // apply relocation offset (gated by classifyStrength; 0 = no relocation).
-            const mbT = probeIndex.mul(uint(4));
-            ro.addAssign(vec3(stateRead.element(mbT.add(uint(1))), stateRead.element(mbT.add(uint(2))), stateRead.element(mbT.add(uint(3)))).mul(U.classifyStrength));
+            const ro = probeTraceOrigin(probeIndex);
             const rd = normalize(rayDir(k, U.frameJitter)).toVar();
 
             const outRgb = vec3(0.0).toVar();
@@ -1447,51 +2054,119 @@ export function createProbeField({
                     });
                 }
 
-                // NEE over ALL lights (count small; loop avoids sampling noise).
-                Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
-                    // stride matches spectral_scene LIGHT_STRIDE (17: [16] is the
-                    // emitter class — probes are RGB-domain except for the band
-                    // gate below: class-4 IR illuminators only exist when the
-                    // imager senses NIR, so their promoted (k,k,k) is scaled by
-                    // U.nirGate (0 in the visible band, 1 under NV).
-                    const lb = li.mul(uint(17)).toVar();
-                    const ltype = lights.element(lb);
-                    const lpos = loadLightVec3(lb, 1);
-                    const ldir = loadLightVec3(lb, 4);
-                    const eclass = lights.element(lb.add(uint(16)));
-                    const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
-                    const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
-                    const lrange = lights.element(lb.add(uint(10)));
-                    const ldecay = lights.element(lb.add(uint(11)));
-                    const lcosAngle = lights.element(lb.add(uint(12)));
-                    const lcosPen = lights.element(lb.add(uint(13)));
-                    const isDir = ltype.lessThan(float(0.5));
-                    const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
-                    const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
-                    const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
-                    const wi = normalize(toLight);
-                    const ndl = tslMax(dot(ng, wi), float(0.0));
-                    // fold the light's peak into the gate so band-gated (black) lights
-                    // skip the shadow ray entirely, not just shade to zero.
-                    const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
-                    If(ndl.mul(lpeak).greaterThan(float(0.0)), () => {
-                        const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
-                        If(blocked.lessThan(float(0.5)), () => {
-                            const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
-                            const rr = dist.div(tslMax(lrange, float(1e-4)));
-                            const rr2 = rr.mul(rr);
-                            const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
-                            const ranged = falloff.mul(win.mul(win));
-                            const posAtten = select(lrange.greaterThan(float(0.0)), ranged, falloff);
-                            const distAtten = select(isDir, float(1.0), posAtten);
-                            const angleCos = dot(wi, ldir).mul(-1.0);
-                            const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
-                            const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
-                            const diffuse = kd.mul(float(1.0).div(float(PI)));
-                            radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
+                if (clusteredGi) {
+                    const shadeLight = (li) => {
+                        const lb = li.mul(uint(_LIGHT_STRIDE)).toVar();
+                        const ltype = lights.element(lb);
+                        If(ltype.lessThan(float(2.5)), () => {
+                            const lpos = loadLightVec3(lb, 1);
+                            const ldir = loadLightVec3(lb, 4);
+                            const lrange = lights.element(lb.add(uint(10)));
+                            const isDir = ltype.lessThan(float(0.5));
+                            const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
+                            const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
+                            const wi = normalize(toLight);
+                            const ndl = tslMax(dot(ng, wi), float(0.0));
+                            const reachesHit = isDir.or(lrange.lessThanEqual(float(0.0))).or(dist.lessThan(lrange));
+                            If(ndl.greaterThan(float(0.0)).and(reachesHit), () => {
+                                const eclass = lights.element(lb.add(uint(16)));
+                                const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
+                                const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
+                                // Band-gated lights must stay black before the shadow query.
+                                const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
+                                If(ndl.mul(lpeak).greaterThan(float(0.0)), () => {
+                                    const ldecay = lights.element(lb.add(uint(11)));
+                                    const lcosAngle = lights.element(lb.add(uint(12)));
+                                    const lcosPen = lights.element(lb.add(uint(13)));
+                                    const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
+                                    const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
+                                    If(blocked.lessThan(float(0.5)), () => {
+                                        const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                        const rr = dist.div(tslMax(lrange, float(1e-4)));
+                                        const rr2 = rr.mul(rr);
+                                        const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
+                                        const ranged = falloff.mul(win.mul(win));
+                                        const posAtten = select(lrange.greaterThan(float(0.0)), ranged, falloff);
+                                        const distAtten = select(isDir, float(1.0), posAtten);
+                                        const angleCos = dot(wi, ldir).mul(-1.0);
+                                        const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
+                                        const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
+                                        const diffuse = kd.mul(float(1.0).div(float(PI)));
+                                        radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
+                                    });
+                                });
+                            });
+                        });
+                    };
+
+                    const gridU = casc[0].U;
+                    const cellCount = vec3(float(gridU.resX), float(gridU.resY), float(gridU.resZ)).sub(vec3(1.0));
+                    const cellSize = gridU.gridSize.div(cellCount);
+                    const cellF = hitPos.sub(gridU.gridMin).div(cellSize).floor();
+                    const outside = cellF.x.lessThan(float(0.0)).or(cellF.y.lessThan(float(0.0))).or(cellF.z.lessThan(float(0.0)))
+                        .or(cellF.x.greaterThanEqual(cellCount.x)).or(cellF.y.greaterThanEqual(cellCount.y)).or(cellF.z.greaterThanEqual(cellCount.z));
+                    const safeCell = cellF.clamp(vec3(0.0), cellCount.sub(vec3(1.0)));
+                    const cx = uint(safeCell.x), cy = uint(safeCell.y), cz = uint(safeCell.z);
+                    const cellsX = gridU.resX.sub(uint(1)), cellsY = gridU.resY.sub(uint(1));
+                    const cellIndex = cz.mul(cellsX.mul(cellsY)).add(cy.mul(cellsX)).add(cx);
+                    const listBase = uint(giLightDataCount()).add(cellIndex.mul(uint(GI_LIGHT_CELL_STRIDE)));
+                    const listCount = uint(lights.element(listBase));
+                    If(outside.or(listCount.greaterThan(uint(GI_LIGHTS_PER_CELL))), () => {
+                        Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => { shadeLight(li); });
+                    }).Else(() => {
+                        Loop({ start: uint(0), end: listCount, type: 'uint', condition: '<' }, ({ i }) => {
+                            shadeLight(uint(lights.element(listBase.add(uint(1)).add(i))));
                         });
                     });
-                });
+                } else {
+                    // NEE over ALL lights (count small; loop avoids sampling noise).
+                    Loop({ start: uint(0), end: U.lightCount, type: 'uint', condition: '<' }, ({ i: li }) => {
+                        // stride matches spectral_scene LIGHT_STRIDE (17: [16] is the
+                        // emitter class — probes are RGB-domain except for the band
+                        // gate below: class-4 IR illuminators only exist when the
+                        // imager senses NIR, so their promoted (k,k,k) is scaled by
+                        // U.nirGate (0 in the visible band, 1 under NV).
+                        const lb = li.mul(uint(17)).toVar();
+                        const ltype = lights.element(lb);
+                        If(ltype.lessThan(float(2.5)), () => {
+                            const lpos = loadLightVec3(lb, 1);
+                            const ldir = loadLightVec3(lb, 4);
+                            const eclass = lights.element(lb.add(uint(16)));
+                            const isIr = tslAbs(eclass.sub(float(4.0))).lessThan(float(0.25));
+                            const lcol = loadLightVec3(lb, 7).mul(select(isIr, U.nirGate.mul(U.nirGain), float(1.0)));
+                            const lrange = lights.element(lb.add(uint(10)));
+                            const ldecay = lights.element(lb.add(uint(11)));
+                            const lcosAngle = lights.element(lb.add(uint(12)));
+                            const lcosPen = lights.element(lb.add(uint(13)));
+                            const isDir = ltype.lessThan(float(0.5));
+                            const isSpot = float(ltype.sub(float(2.0)).abs()).lessThan(float(0.5));
+                            const toLight = select(isDir, ldir.mul(-1.0), lpos.sub(hitPos));
+                            const dist = select(isDir, float(1e4), tslMax(length(toLight), float(1e-4)));
+                            const wi = normalize(toLight);
+                            const ndl = tslMax(dot(ng, wi), float(0.0));
+                            // fold the light's peak into the gate so band-gated (black) lights
+                            // skip the shadow ray entirely, not just shade to zero.
+                            const lpeak = tslMax(tslMax(lcol.x, lcol.y), lcol.z);
+                            If(ndl.mul(lpeak).greaterThan(float(0.0)).and(isDir.or(lrange.lessThanEqual(float(0.0))).or(dist.lessThan(lrange))), () => {
+                                const blocked = traverseAny(hitPos, wi, dist.sub(traceBias));
+                                If(blocked.lessThan(float(0.5)), () => {
+                                    const falloff = float(1.0).div(tslMax(pow(dist, ldecay), float(0.01)));
+                                    const rr = dist.div(tslMax(lrange, float(1e-4)));
+                                    const rr2 = rr.mul(rr);
+                                    const win = clamp(float(1.0).sub(rr2.mul(rr2)), float(0.0), float(1.0));
+                                    const ranged = falloff.mul(win.mul(win));
+                                    const posAtten = select(lrange.greaterThan(float(0.0)), ranged, falloff);
+                                    const distAtten = select(isDir, float(1.0), posAtten);
+                                    const angleCos = dot(wi, ldir).mul(-1.0);
+                                    const spotAtten = clamp(angleCos.sub(lcosAngle).div(tslMax(lcosPen.sub(lcosAngle), float(1e-4))), float(0.0), float(1.0));
+                                    const atten = distAtten.mul(select(isSpot, spotAtten, float(1.0)));
+                                    const diffuse = kd.mul(float(1.0).div(float(PI)));
+                                    radiance.addAssign(diffuse.mul(ndl).mul(lcol).mul(atten).mul(U.debugDirectScale));
+                                });
+                            });
+                        });
+                    });
+                }
 
                 // multibounce: add last frame's irradiance × albedo (the atlas is
                 // re-uploaded every tick, so this reads a valid prior field; on
@@ -1531,19 +2206,137 @@ export function createProbeField({
             rayData.element(rb.add(uint(3))).assign(hitT);
         })().compute(updatedCap() * raysPerProbe);
 
-        // ── BLEND: one thread per (updated probe, atlas texel). Cosine-gather
-        // the probe's rays for this texel's octahedral direction; hysteresis. ──
-        const blendKernel = Fn(() => {
+        const emitterVisKernel = Fn(() => {
             const gid = instanceIndex.toVar();
-            const slot = gid.div(uint(TILE * TILE)).toVar();
-            If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
-            const local = gid.mod(uint(TILE * TILE)).toVar();
-            const lx = local.mod(uint(TILE)).toVar();
-            const ly = local.div(uint(TILE)).toVar();
+            const slot = gid.div(uint(GI_EMITTER_INJECT_CAP)).toVar();
+            const emitterIndex = gid.mod(uint(GI_EMITTER_INJECT_CAP)).toVar();
+            If(slot.greaterThanEqual(U.updatedCount).or(emitterIndex.greaterThanEqual(U.emitterCount)), () => { Return(); });
+            const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
+            const ro = probeTraceOrigin(probeIndex);
+            const lb = U.emitterBase.add(emitterIndex).mul(uint(_LIGHT_STRIDE)).toVar();
+            const center = loadLightVec3(lb, 1);
+            const sourceRadius = tslMax(lights.element(lb.add(uint(14))), float(0.0));
+            const emitterAxis = center.sub(ro);
+            const dist = length(emitterAxis).toVar();
+            const sample = float(0.0).toVar();
+            If(dist.greaterThan(tslMax(sourceRadius, float(1e-3))), () => {
+                const d = emitterAxis.div(dist);
+                const emitterUp = select(tslAbs(d.y).lessThan(float(0.999)), vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0));
+                const emitterTangent = normalize(cross(emitterUp, d));
+                const emitterBitangent = cross(d, emitterTangent);
+                const emitterSeed = float(probeIndex).mul(12.9898).add(float(emitterIndex).mul(78.233)).add(U.emitterVisSeed.mul(37.719));
+                const emitterHash0 = sin(emitterSeed).mul(43758.5453);
+                const emitterHash1 = sin(emitterSeed.add(19.19)).mul(24634.6345);
+                const emitterU = emitterHash0.sub(floor(emitterHash0));
+                const emitterV = emitterHash1.sub(floor(emitterHash1));
+                const emitterDiskRadius = sqrt(emitterU).mul(sourceRadius);
+                const emitterDiskAngle = emitterV.mul(float(PI).mul(2.0));
+                const target = center.add(
+                    emitterTangent.mul(cos(emitterDiskAngle).mul(emitterDiskRadius))
+                        .add(emitterBitangent.mul(sin(emitterDiskAngle).mul(emitterDiskRadius))),
+                );
+                const shadowDir = normalize(target.sub(ro));
+                const traceBias = tslMax(
+                    U.cellMin.mul(float(TRACE_SURFACE_BIAS_CELL)).mul(U.debugTraceBiasScale),
+                    float(RAY_EPS).mul(U.debugRayEpsScale),
+                );
+                const blocked = traverseAny(
+                    ro,
+                    shadowDir,
+                    tslMax(dist.sub(sourceRadius).sub(traceBias), float(1e-4)),
+                );
+                sample.assign(select(blocked.lessThan(float(0.5)), float(1.0), float(0.0)));
+            });
+            const visIndex = probeIndex.mul(uint(GI_EMITTER_INJECT_CAP)).add(emitterIndex);
+            const vis = emitterVis.element(visIndex);
+            emitterVis.element(visIndex).assign(mix(sample, vis, float(GI_EMITTER_VIS_RETENTION)));
+        })().compute(updatedCap() * GI_EMITTER_INJECT_CAP);
+
+        const injectEmitterVirtualRays = ({
+            probeIndex, texelDir, acc, hit = null, wsum,
+            lAcc = null, lAcc2 = null,
+            secondaryAcc = null, secondaryHit = null, secondaryWsum = null,
+            primaryWeight, secondaryWeight = null,
+        }) => {
+            If(U.emitterCount.greaterThan(uint(0)), () => {
+                const ro = probeTraceOrigin(probeIndex);
+                Loop({ start: uint(0), end: U.emitterCount, type: 'uint', condition: '<' }, ({ i: emitterIndex }) => {
+                    const lb = U.emitterBase.add(emitterIndex).mul(uint(_LIGHT_STRIDE)).toVar();
+                    const center = loadLightVec3(lb, 1);
+                    const sourceRadius = tslMax(lights.element(lb.add(uint(14))), float(0.0));
+                    const emitterAxis = center.sub(ro);
+                    const dist = length(emitterAxis).toVar();
+                    If(dist.greaterThan(tslMax(sourceRadius, float(1e-3))), () => {
+                        const d = emitterAxis.div(dist);
+                        // Solid angle from the record's Cauchy projected area (slot 15):
+                        // (A/4)/d^2 equals the sphere solid angle in the far field but
+                        // does not blow up to a hemisphere when a long thin emitter's
+                        // bounding sphere swallows the probe. Color slots are surface
+                        // RADIANCE, so Omega carries ALL of the geometry term.
+                        const projArea = tslMax(lights.element(lb.add(uint(15))), float(0.0));
+                        const Omega = tslMin(float(2.0 * PI), projArea.div(dist.mul(dist)));
+                        const kVirtual = tslMin(
+                            float(raysPerProbe),
+                            float(raysPerProbe).mul(Omega).div(float(4.0 * PI)),
+                        );
+                        const visIndex = probeIndex.mul(uint(GI_EMITTER_INJECT_CAP)).add(emitterIndex);
+                        const L = loadLightVec3(lb, 7).mul(emitterVisRead.element(visIndex));
+                        const w = primaryWeight(texelDir, d);
+                        const wk = w.mul(kVirtual);
+                        acc.addAssign(L.mul(wk));
+                        wsum.addAssign(wk);
+                        if (hit) hit.addAssign(wk);
+                        if (lAcc && lAcc2) {
+                            const lum = dot(L, vec3(0.2126, 0.7152, 0.0722));
+                            lAcc.addAssign(lum.mul(wk));
+                            lAcc2.addAssign(lum.mul(lum).mul(wk));
+                        }
+                        if (secondaryAcc && secondaryHit && secondaryWsum && secondaryWeight) {
+                            const secondaryWk = secondaryWeight(texelDir, d).mul(kVirtual);
+                            secondaryAcc.addAssign(L.mul(secondaryWk));
+                            secondaryHit.addAssign(secondaryWk);
+                            secondaryWsum.addAssign(secondaryWk);
+                        }
+                    });
+                });
+            });
+        };
+
+        // ── BLEND: one 64-thread workgroup per updated probe. Every lane first
+        // caches its share of ray scratch/directions, then the 36 interior lanes
+        // cosine-gather the unique 6×6 oct texels. Upload mirrors those texels into
+        // the 28 gutter positions, so evaluating gutters here was pure duplicate
+        // work (and repeated every ray load + trig operation 28 extra times).
+        const blendKernel = Fn(() => {
+            const rayCache = workgroupArray('vec4', raysPerProbe);
+            const dirCache = workgroupArray('vec4', raysPerProbe);
+            const slot = workgroupId.x;
+            const lane = invocationLocalIndex;
+            const activeProbe = slot.lessThan(U.updatedCount);
+            const loadK = lane.toVar();
+            Loop(loadK.lessThan(uint(raysPerProbe)), () => {
+                If(activeProbe, () => {
+                    const rb = slot.mul(uint(raysPerProbe)).add(loadK).mul(uint(4));
+                    rayCache.element(loadK).assign(vec4(
+                        rayData.element(rb), rayData.element(rb.add(uint(1))),
+                        rayData.element(rb.add(uint(2))), rayData.element(rb.add(uint(3))),
+                    ));
+                    dirCache.element(loadK).assign(vec4(normalize(rayDir(loadK, U.frameJitter)), 0.0));
+                });
+                loadK.addAssign(uint(PROBE_WORKGROUP_SIZE));
+            });
+            workgroupBarrier();
+
+            // A barrier forbids invocation-local early returns. Guard all output
+            // work after every lane has reached it.
+            If(activeProbe.and(lane.lessThan(uint(OCT_RES * OCT_RES))), () => {
+            const lx = lane.mod(uint(OCT_RES)).add(uint(BORDER)).toVar();
+            const ly = lane.div(uint(OCT_RES)).add(uint(BORDER)).toVar();
+            const local = ly.mul(uint(TILE)).add(lx).toVar();
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
 
-            // texel direction (border texels get slightly-out-of-range uv → a
-            // natural octahedral gutter; continuous under HW bilinear for MVP).
+            // Interior texel direction; upload builds the canonical mirrored
+            // gutter from these unique samples.
             const u = float(lx).sub(float(BORDER)).add(0.5).div(float(OCT_RES));
             const v = float(ly).sub(float(BORDER)).add(0.5).div(float(OCT_RES));
             const dir = octDecodeNode(vec2(u, v), TSL).toVar();
@@ -1559,11 +2352,17 @@ export function createProbeField({
             const sHit = roughReflectionsEnabled ? float(0.0).toVar() : null;
             const sWsum = roughReflectionsEnabled ? float(0.0).toVar() : null;
             const LUMA = vec3(0.2126, 0.7152, 0.0722);
+            const skyEnabled = roughReflectionsEnabled
+                ? select(U.skyIntensity.greaterThan(float(0.0)), float(1.0), float(0.0))
+                : null;
+            const skyValid = roughReflectionsEnabled
+                ? U.reflectionSkyFallback.mul(U.skyConfigured).mul(skyEnabled)
+                : null;
             Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
-                const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4));
-                const rrgb = vec3(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))));
-                const hitT = rayData.element(rb.add(uint(3)));
-                const rdir = normalize(rayDir(k, U.frameJitter));
+                const cachedRay = rayCache.element(k).toVar();
+                const rrgb = cachedRay.xyz;
+                const hitT = cachedRay.w;
+                const rdir = dirCache.element(k).xyz;
                 const cd = tslMax(dot(dir, rdir), float(0.0));
                 const cw = pow(cd, U.debugCosinePower.max(float(1e-4)));
                 acc.addAssign(rrgb.mul(cw));
@@ -1588,8 +2387,6 @@ export function createProbeField({
                     // Local hits are always valid. A true miss (-1) can explicitly use
                     // the injected SH sky; encoded unshaded metal/glass hits (< -1.5)
                     // leave prior radiance unchanged so other layers can own them.
-                    const skyEnabled = select(U.skyIntensity.greaterThan(float(0.0)), float(1.0), float(0.0));
-                    const skyValid = U.reflectionSkyFallback.mul(U.skyConfigured).mul(skyEnabled);
                     const valid = select(
                         hitT.greaterThanEqual(float(0.0)),
                         float(1.0),
@@ -1599,6 +2396,27 @@ export function createProbeField({
                     sHit.addAssign(sw.mul(valid));
                     sWsum.addAssign(sw);
                 }
+            });
+            injectEmitterVirtualRays({
+                probeIndex,
+                texelDir: dir,
+                acc,
+                wsum,
+                lAcc,
+                lAcc2,
+                secondaryAcc: sAcc,
+                secondaryHit: sHit,
+                secondaryWsum: sWsum,
+                primaryWeight: (texelDir, emitterDir) => {
+                    const cd = tslMax(dot(texelDir, emitterDir), float(0.0));
+                    return pow(cd, U.debugCosinePower.max(float(1e-4)));
+                },
+                secondaryWeight: roughReflectionsEnabled ? ((texelDir, emitterDir) => {
+                    const cd = tslMax(dot(texelDir, emitterDir), float(0.0));
+                    const cd2 = cd.mul(cd);
+                    const cd4 = cd2.mul(cd2);
+                    return cd4.mul(cd4);
+                }) : null,
             });
             const meanRad = acc.div(wsum.max(float(1e-4)));
             const curL = lAcc.div(wsum.max(float(1e-4)));
@@ -1644,11 +2462,19 @@ export function createProbeField({
             // once by elapsed time. (No global reactive ramp: constant policy.)
             const steadyReflectionH = pow(rawNoiseH.clamp(1e-6, 1.0), U.hysteresisExponent);
             const h = select(wasBlack, float(0.0), hEff);
-            const band = sigma.mul(U.tempClampSigma);
+            // Firefly clamp — AUTHORITATIVE, banded by PRIOR variance only. Two
+            // dead-knob traps in the old form: (1) the changeW mix escaped to the
+            // raw mean, so any spike past σ1 bypassed the clamp entirely and
+            // tempClampSigma had no effect above ~σ1; (2) the band folded in
+            // curVar, so a single-tick firefly inflated its own clamp gate.
+            // changeW keeps its retention role (rawHEff above). Real changes
+            // still release fast: the m2 history below blends the RAW current
+            // moments, so prevVar inflates on the first clamped update and the
+            // band widens geometrically over the next few revisits.
+            const band = sqrt(prevVar.add(varFloor)).mul(U.tempClampSigma);
             const clampScale = tslMin(float(1.0), band.div(absDelta.max(float(1e-6))));
             const clipped = prev.add(meanRad.sub(prev).mul(clampScale));
-            const candidate0 = mix(clipped, meanRad, changeW);
-            const candidate = select(wasBlack, meanRad, candidate0);
+            const candidate = select(wasBlack, meanRad, clipped);
             const blended = mix(candidate, prev, h);
             irr.element(ib).assign(blended.x);
             irr.element(ib.add(uint(1))).assign(blended.y);
@@ -1695,25 +2521,52 @@ export function createProbeField({
             const dblended = mix(vec2(meanR, meanR2), dprev, dh);
             depthS.element(db).assign(dblended.x);
             depthS.element(db.add(uint(1))).assign(dblended.y);
-        })().compute(updatedCap() * TILE * TILE);
+            });
+        })().compute(updatedCap() * PROBE_WORKGROUP_SIZE, [PROBE_WORKGROUP_SIZE]);
 
         // ── GLOSSY: high-angular-resolution resolve from the SAME ray scratch.
         // It is a fourth dispatch but performs no BVH traversal and traces no rays.
         // Numerator/support history is accumulated before division so sparse power-64
         // ray sets converge without giving one weak sample a full frame of authority.
-        const glossyKernel = roughReflectionsEnabled ? Fn(() => {
-            const gid = instanceIndex.toVar();
-            const slot = gid.div(uint(GLOSSY_TILE * GLOSSY_TILE)).toVar();
-            If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
+        const glossyKernel = glossyReflectionsEnabled ? Fn(() => {
+            const rayCache = workgroupArray('vec4', raysPerProbe);
+            const dirCache = workgroupArray('vec4', raysPerProbe);
+            const group = workgroupId.x;
+            const lane = invocationLocalIndex;
+            const slot = group.div(uint(glossyGroupsPerProbe)).toVar();
+            const local = group.mod(uint(glossyGroupsPerProbe))
+                .mul(uint(PROBE_WORKGROUP_SIZE)).add(lane).toVar();
+            const activeProbe = slot.lessThan(U.updatedCount);
+            const loadK = lane.toVar();
+            Loop(loadK.lessThan(uint(raysPerProbe)), () => {
+                If(activeProbe, () => {
+                    const rb = slot.mul(uint(raysPerProbe)).add(loadK).mul(uint(4));
+                    rayCache.element(loadK).assign(vec4(
+                        rayData.element(rb), rayData.element(rb.add(uint(1))),
+                        rayData.element(rb.add(uint(2))), rayData.element(rb.add(uint(3))),
+                    ));
+                    dirCache.element(loadK).assign(vec4(normalize(rayDir(loadK, U.frameJitter)), 0.0));
+                });
+                loadK.addAssign(uint(PROBE_WORKGROUP_SIZE));
+            });
+            workgroupBarrier();
+
+            let resolvesTexel = activeProbe.and(local.lessThan(uint(glossyTile * glossyTile)));
+            // High quality interleaves directional texels across two solves. Every
+            // probe still receives service on every batch (no round-robin starvation),
+            // while half of the expensive 64-ray lobe loops stay inactive.
+            if (glossyUpdateInterval > 1) {
+                resolvesTexel = resolvesTexel.and(local.mod(uint(glossyUpdateInterval)).equal(U.glossyPhase));
+            }
+            If(resolvesTexel, () => {
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
-            const local = gid.mod(uint(GLOSSY_TILE * GLOSSY_TILE)).toVar();
-            const lx = local.mod(uint(GLOSSY_TILE)).toVar();
-            const ly = local.div(uint(GLOSSY_TILE)).toVar();
+            const lx = local.mod(uint(glossyTile)).toVar();
+            const ly = local.div(uint(glossyTile)).toVar();
 
             // Canonical mirrored oct gutter, resolved before evaluating direction.
-            const edge = uint(GLOSSY_TILE - 1);
+            const edge = uint(glossyTile - 1);
             const lo = uint(BORDER);
-            const hi = uint(BORDER + GLOSSY_OCT_RES - 1);
+            const hi = uint(BORDER + glossyOctRes - 1);
             const onLeft = lx.equal(uint(0));
             const onRight = lx.equal(edge);
             const onTop = ly.equal(uint(0));
@@ -1731,18 +2584,20 @@ export function createProbeField({
                 select(onTop, hi, lo),
                 select(onRowBorder, select(onTop, lo, hi), select(onColumnBorder, edge.sub(ly), ly)),
             ).toVar();
-            const u = float(sx).sub(float(BORDER)).add(0.5).div(float(GLOSSY_OCT_RES));
-            const v = float(sy).sub(float(BORDER)).add(0.5).div(float(GLOSSY_OCT_RES));
+            const u = float(sx).sub(float(BORDER)).add(0.5).div(float(glossyOctRes));
+            const v = float(sy).sub(float(BORDER)).add(0.5).div(float(glossyOctRes));
             const dir = octDecodeNode(vec2(u, v), TSL).toVar();
 
             const gAcc = vec3(0.0).toVar();
             const gHit = float(0.0).toVar();
             const gWsum = float(0.0).toVar();
+            const skyEnabled = select(U.skyIntensity.greaterThan(float(0.0)), float(1.0), float(0.0));
+            const skyValid = U.reflectionSkyFallback.mul(U.skyConfigured).mul(skyEnabled);
             Loop({ start: uint(0), end: uint(raysPerProbe), type: 'uint', condition: '<' }, ({ i: k }) => {
-                const rb = slot.mul(uint(raysPerProbe)).add(k).mul(uint(4));
-                const rrgb = vec3(rayData.element(rb), rayData.element(rb.add(uint(1))), rayData.element(rb.add(uint(2))));
-                const hitT = rayData.element(rb.add(uint(3)));
-                const rdir = normalize(rayDir(k, U.frameJitter));
+                const cachedRay = rayCache.element(k).toVar();
+                const rrgb = cachedRay.xyz;
+                const hitT = cachedRay.w;
+                const rdir = dirCache.element(k).xyz;
                 const cd = tslMax(dot(dir, rdir), float(0.0));
                 const cd2 = cd.mul(cd);
                 const cd4 = cd2.mul(cd2);
@@ -1750,8 +2605,6 @@ export function createProbeField({
                 const cd16 = cd8.mul(cd8);
                 const cd32 = cd16.mul(cd16);
                 const gw = cd32.mul(cd32); // power 64
-                const skyEnabled = select(U.skyIntensity.greaterThan(float(0.0)), float(1.0), float(0.0));
-                const skyValid = U.reflectionSkyFallback.mul(U.skyConfigured).mul(skyEnabled);
                 const valid = select(
                     hitT.greaterThanEqual(float(0.0)),
                     float(1.0),
@@ -1761,8 +2614,24 @@ export function createProbeField({
                 gHit.addAssign(gw.mul(valid));
                 gWsum.addAssign(gw);
             });
+            injectEmitterVirtualRays({
+                probeIndex,
+                texelDir: dir,
+                acc: gAcc,
+                hit: gHit,
+                wsum: gWsum,
+                primaryWeight: (texelDir, emitterDir) => {
+                    const cd = tslMax(dot(texelDir, emitterDir), float(0.0));
+                    const cd2 = cd.mul(cd);
+                    const cd4 = cd2.mul(cd2);
+                    const cd8 = cd4.mul(cd4);
+                    const cd16 = cd8.mul(cd8);
+                    const cd32 = cd16.mul(cd16);
+                    return cd32.mul(cd32);
+                },
+            });
 
-            const gt = probeIndex.mul(uint(GLOSSY_TILE * GLOSSY_TILE)).add(local).toVar();
+            const gt = probeIndex.mul(uint(glossyTile * glossyTile)).add(local).toVar();
             const gb = gt.mul(uint(4)).toVar();
             const prevNum = vec4(
                 glossySpecular.element(gb), glossySpecular.element(gb.add(uint(1))),
@@ -1784,7 +2653,10 @@ export function createProbeField({
             const glossyReferenceH = U.hysteresis.add(
                 float(1.0).sub(U.hysteresis).mul(U.debugTempNoiseHBoost),
             );
-            const glossyH = pow(glossyReferenceH.clamp(1e-6, 1.0), U.hysteresisExponent);
+            const glossyH = pow(
+                glossyReferenceH.clamp(1e-6, 1.0),
+                U.hysteresisExponent.mul(float(glossyUpdateInterval)),
+            );
             const gh = select(empty, float(0.0), glossyH);
             const num = mix(curNum, prevNum, gh).toVar();
             const den = mix(curDen, prevDen, gh).max(float(1e-6)).toVar();
@@ -1796,11 +2668,15 @@ export function createProbeField({
 
             const col = probeIndex.mod(uint(C.glossyTilesX));
             const row = probeIndex.div(uint(C.glossyTilesX));
-            const tx = col.mul(uint(GLOSSY_TILE)).add(lx);
-            const ty = row.mul(uint(GLOSSY_TILE)).add(ly);
+            const tx = col.mul(uint(glossyTile)).add(lx);
+            const ty = row.mul(uint(glossyTile)).add(ly);
             const resolved = vec4(num.xyz.div(den), num.w.div(den).clamp(0.0, 1.0));
             textureStore(glossySpecularAtlas, uvec2(tx, ty), resolved).toWriteOnly();
-        })().compute(updatedCap() * GLOSSY_TILE * GLOSSY_TILE) : null;
+            });
+        })().compute(
+            updatedCap() * glossyGroupsPerProbe * PROBE_WORKGROUP_SIZE,
+            [PROBE_WORKGROUP_SIZE],
+        ) : null;
 
         // ── CLEAR: new StorageTextures are not assumed zeroed. Do this once per
         // rebuild before the round-robin batch uploads start populating live probes.
@@ -1823,118 +2699,144 @@ export function createProbeField({
             textureStore(depthAtlas, uvec2(tx, ty), vec4(0.0, 0.0, 0.0, 1.0)).toWriteOnly();
         })().compute(probeTotal * TILE * TILE);
 
-        const clearGlossyAtlasKernel = roughReflectionsEnabled ? Fn(() => {
+        const clearGlossyAtlasKernel = glossyReflectionsEnabled ? Fn(() => {
             const gid = instanceIndex.toVar();
-            const total = uint(probeTotal * GLOSSY_TILE * GLOSSY_TILE);
+            const total = uint(probeTotal * glossyTile * glossyTile);
             If(gid.greaterThanEqual(total), () => { Return(); });
-            const probeIndex = gid.div(uint(GLOSSY_TILE * GLOSSY_TILE)).toVar();
-            const local = gid.mod(uint(GLOSSY_TILE * GLOSSY_TILE)).toVar();
-            const lx = local.mod(uint(GLOSSY_TILE)).toVar();
-            const ly = local.div(uint(GLOSSY_TILE)).toVar();
+            const probeIndex = gid.div(uint(glossyTile * glossyTile)).toVar();
+            const local = gid.mod(uint(glossyTile * glossyTile)).toVar();
+            const lx = local.mod(uint(glossyTile)).toVar();
+            const ly = local.div(uint(glossyTile)).toVar();
             const col = probeIndex.mod(uint(C.glossyTilesX));
             const row = probeIndex.div(uint(C.glossyTilesX));
             textureStore(
                 glossySpecularAtlas,
-                uvec2(col.mul(uint(GLOSSY_TILE)).add(lx), row.mul(uint(GLOSSY_TILE)).add(ly)),
+                uvec2(col.mul(uint(glossyTile)).add(lx), row.mul(uint(glossyTile)).add(ly)),
                 vec4(0.0),
             ).toWriteOnly();
-        })().compute(probeTotal * GLOSSY_TILE * GLOSSY_TILE) : null;
+        })().compute(probeTotal * glossyTile * glossyTile) : null;
 
-        // ── UPLOAD: copy the updated probes into the atlas StorageTexture. Unchanged
-        // probes keep their previous atlas texels; uploading the full field every tick
-        // caused avoidable WebGPU stalls on larger rooms.
-        const uploadKernel = Fn(() => {
+        const clearEmitterVisKernel = Fn(() => {
             const gid = instanceIndex.toVar();
-            const slot = gid.div(uint(TILE * TILE)).toVar();
-            If(slot.greaterThanEqual(U.updatedCount), () => { Return(); });
+            const total = uint(probeTotal * GI_EMITTER_INJECT_CAP);
+            If(gid.greaterThanEqual(total), () => { Return(); });
+            emitterVis.element(gid).assign(float(0.0));
+        })().compute(probeTotal * GI_EMITTER_INJECT_CAP);
+
+        // ── UPLOAD: one workgroup per updated probe. The 36 interior lanes run
+        // the expensive 3×3 bilateral filter once, cache the final values, then all
+        // 64 lanes write the canonical interior/gutter destinations. Previously the
+        // 28 gutter lanes repeated an identical filter for their mirrored source.
+        const uploadKernel = Fn(() => {
+            const irradianceCache = workgroupArray('vec4', OCT_RES * OCT_RES);
+            const roughCache = roughReflectionsEnabled
+                ? workgroupArray('vec4', OCT_RES * OCT_RES)
+                : null;
+            const depthCache = workgroupArray('vec4', OCT_RES * OCT_RES);
+            const slot = workgroupId.x;
+            const lane = invocationLocalIndex;
+            const activeProbe = slot.lessThan(U.updatedCount);
             const probeIndex = U.probeOffset.add(slot).mod(U.probeTotal).toVar();
-            const local = gid.mod(uint(TILE * TILE)).toVar();
-            const lx = local.mod(uint(TILE)).toVar();
-            const ly = local.div(uint(TILE)).toVar();
-            const col = probeIndex.mod(U.resX);
-            const row = probeIndex.div(U.resX.mul(U.resY)).mul(U.resY).add(probeIndex.div(U.resX).mod(U.resY));
-            const tx = col.mul(uint(TILE)).add(lx);
-            const ty = row.mul(uint(TILE)).add(ly);
-            // Canonical octahedral gutter: mirror final INTERIOR edge/corner texels
-            // into the 1px border. Evaluating out-of-range oct coordinates produces a
-            // close direction, but not the exact opposite-edge sample; worse, that raw
-            // border disagrees with the filtered interior and exposes the lower-
-            // hemisphere fold as a world-axis cross.
-            const edge = uint(TILE - 1);
-            const lo = uint(BORDER);
-            const hi = uint(BORDER + OCT_RES - 1);
-            const onLeft = lx.equal(uint(0));
-            const onRight = lx.equal(edge);
-            const onTop = ly.equal(uint(0));
-            const onBottom = ly.equal(edge);
-            const onColumnBorder = onLeft.or(onRight);
-            const onRowBorder = onTop.or(onBottom);
-            const onCorner = onColumnBorder.and(onRowBorder);
-            const sx = select(
-                onCorner,
-                select(onLeft, hi, lo),
-                select(onRowBorder, edge.sub(lx), select(onColumnBorder, select(onLeft, lo, hi), lx)),
-            ).toVar();
-            const sy = select(
-                onCorner,
-                select(onTop, hi, lo),
-                select(onRowBorder, select(onTop, lo, hi), select(onColumnBorder, edge.sub(ly), ly)),
-            ).toVar();
-            // ── intra-tile variance/edge-stopped spatial filter (CORE splotch killer).
-            // Reads the read-only irrBuffer and writes the write-only atlas, so the
-            // denoised result never feeds back into history (no over-blur, no RAW
-            // hazard). Border threads filter the mirrored interior source, making the
-            // gutter identical to its final edge texel. Taps stay inside THIS probe's
-            // tile → cannot mix radiance across a wall.
-            const LUMA = vec3(0.2126, 0.7152, 0.0722);
             const probeBase = probeIndex.mul(uint(TILE * TILE)).toVar();
-            const probeTexel = probeBase.add(sy.mul(uint(TILE))).add(sx).toVar();
-            const ib = probeTexel.mul(uint(4));
-            const eC = vec3(irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2)))).toVar();
-            const lumaC = dot(eC, LUMA);
-            const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
-            const sxI = int(sx); const syI = int(sy);
-            const facc = vec3(0.0).toVar();
-            const fwsum = float(0.0).toVar();
-            // UI "Smoothness" (U.filterSmooth) widens the variance-adaptive edge stop so more
-            // neighbours are trusted → stronger blur that kills GI splotch. 0 = baseline
-            // bandwidth (original directional detail), 1 = ~7× wider (very smooth).
-            const smW = float(1.0).add(U.filterSmooth.mul(float(6.0)));
-            const kEff = float(GI_FILTER_K).mul(smW).mul(U.debugFilterKScale);
-            const relEff = float(GI_FILTER_REL).mul(smW).mul(U.debugFilterRelScale);
-            for (let jy = -1; jy <= 1; jy++) {
-                for (let jx = -1; jx <= 1; jx++) {
-                    const gw = Math.exp(-(jx * jx + jy * jy) * 0.5); // separable 3×3 gaussian (JS const)
-                    const nx = sxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
-                    const ny = syI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
-                    const nIb = probeBase.add(ny.mul(uint(TILE))).add(nx).mul(uint(4));
-                    const en = vec3(irrRead.element(nIb), irrRead.element(nIb.add(uint(1))), irrRead.element(nIb.add(uint(2))));
-                    const dLum = dot(en, LUMA).sub(lumaC);
-                    // variance-adaptive edge stop: noisy texel (high var) → wide trust →
-                    // blur; converged texel (var→0) → narrow → preserve directional detail.
-                    const es = exp(dLum.mul(dLum).div(varC.mul(kEff).add(tslMax(float(GI_FILTER_EPS).mul(U.debugFilterEpsScale), lumaC.mul(lumaC).mul(relEff))).max(float(1e-8))).mul(-1.0));
-                    const w = float(gw).mul(es);
-                    facc.addAssign(en.mul(w));
-                    fwsum.addAssign(w);
+
+            If(activeProbe.and(lane.lessThan(uint(OCT_RES * OCT_RES))), () => {
+                const sx = lane.mod(uint(OCT_RES)).add(uint(BORDER)).toVar();
+                const sy = lane.div(uint(OCT_RES)).add(uint(BORDER)).toVar();
+                const probeTexel = probeBase.add(sy.mul(uint(TILE))).add(sx).toVar();
+                // Reads the read-only history and writes only workgroup memory, so
+                // denoising never feeds back into temporal accumulation.
+                const LUMA = vec3(0.2126, 0.7152, 0.0722);
+                const ib = probeTexel.mul(uint(4));
+                const eC = vec3(
+                    irrRead.element(ib), irrRead.element(ib.add(uint(1))), irrRead.element(ib.add(uint(2))),
+                ).toVar();
+                const lumaC = dot(eC, LUMA);
+                const varC = tslMax(irrRead.element(ib.add(uint(3))).sub(lumaC.mul(lumaC)), float(0.0));
+                const sxI = int(sx); const syI = int(sy);
+                const facc = vec3(0.0).toVar();
+                const fwsum = float(0.0).toVar();
+                const smW = float(1.0).add(U.filterSmooth.mul(float(6.0)));
+                const kEff = float(GI_FILTER_K).mul(smW).mul(U.debugFilterKScale);
+                const relEff = float(GI_FILTER_REL).mul(smW).mul(U.debugFilterRelScale);
+                for (let jy = -1; jy <= 1; jy++) {
+                    for (let jx = -1; jx <= 1; jx++) {
+                        const gw = Math.exp(-(jx * jx + jy * jy) * 0.5);
+                        const nx = sxI.add(int(jx)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                        const ny = syI.add(int(jy)).clamp(int(BORDER), int(BORDER + OCT_RES - 1)).toUint();
+                        const nIb = probeBase.add(ny.mul(uint(TILE))).add(nx).mul(uint(4));
+                        const en = vec3(
+                            irrRead.element(nIb), irrRead.element(nIb.add(uint(1))), irrRead.element(nIb.add(uint(2))),
+                        );
+                        const dLum = dot(en, LUMA).sub(lumaC);
+                        const es = exp(dLum.mul(dLum).div(
+                            varC.mul(kEff).add(tslMax(
+                                float(GI_FILTER_EPS).mul(U.debugFilterEpsScale),
+                                lumaC.mul(lumaC).mul(relEff),
+                            )).max(float(1e-8)),
+                        ).mul(-1.0));
+                        const w = float(gw).mul(es);
+                        facc.addAssign(en.mul(w));
+                        fwsum.addAssign(w);
+                    }
                 }
-            }
-            const filtered = facc.div(fwsum.max(float(1e-4)));
-            const outE = mix(eC, filtered, U.filterStrength);
-            textureStore(atlas, uvec2(tx, ty), vec4(outE, float(1.0))).toWriteOnly();
-            if (roughReflectionsEnabled) {
-                // The power-8 solve + temporal history + HW bilinear are already a broad
-                // filter. Copy directly so local silhouettes do not get blurred twice.
-                const sb = probeTexel.mul(uint(4));
-                const s = vec4(
-                    roughSpecularRead.element(sb), roughSpecularRead.element(sb.add(uint(1))),
-                    roughSpecularRead.element(sb.add(uint(2))), roughSpecularRead.element(sb.add(uint(3))),
-                );
-                textureStore(roughSpecularAtlas, uvec2(tx, ty), s).toWriteOnly();
-            }
-            const db = probeTexel.mul(uint(2));
-            const dd = vec2(depthRead.element(db), depthRead.element(db.add(uint(1))));
-            textureStore(depthAtlas, uvec2(tx, ty), vec4(dd.x, dd.y, float(0.0), float(1.0))).toWriteOnly();
-        })().compute(updatedCap() * TILE * TILE);
+                const filtered = facc.div(fwsum.max(float(1e-4)));
+                irradianceCache.element(lane).assign(vec4(mix(eC, filtered, U.filterStrength), 1.0));
+
+                if (roughReflectionsEnabled) {
+                    const sb = probeTexel.mul(uint(4));
+                    roughCache.element(lane).assign(vec4(
+                        roughSpecularRead.element(sb), roughSpecularRead.element(sb.add(uint(1))),
+                        roughSpecularRead.element(sb.add(uint(2))), roughSpecularRead.element(sb.add(uint(3))),
+                    ));
+                }
+                const db = probeTexel.mul(uint(2));
+                depthCache.element(lane).assign(vec4(
+                    depthRead.element(db), depthRead.element(db.add(uint(1))), 0.0, 1.0,
+                ));
+            });
+            workgroupBarrier();
+
+            If(activeProbe, () => {
+                const local = lane;
+                const lx = local.mod(uint(TILE)).toVar();
+                const ly = local.div(uint(TILE)).toVar();
+                const col = probeIndex.mod(U.resX);
+                const row = probeIndex.div(U.resX.mul(U.resY)).mul(U.resY)
+                    .add(probeIndex.div(U.resX).mod(U.resY));
+                const tx = col.mul(uint(TILE)).add(lx);
+                const ty = row.mul(uint(TILE)).add(ly);
+
+                // Canonical octahedral gutter: mirror final interior edge/corner
+                // values into the border, now by indexing the workgroup cache.
+                const edge = uint(TILE - 1);
+                const lo = uint(BORDER);
+                const hi = uint(BORDER + OCT_RES - 1);
+                const onLeft = lx.equal(uint(0));
+                const onRight = lx.equal(edge);
+                const onTop = ly.equal(uint(0));
+                const onBottom = ly.equal(edge);
+                const onColumnBorder = onLeft.or(onRight);
+                const onRowBorder = onTop.or(onBottom);
+                const onCorner = onColumnBorder.and(onRowBorder);
+                const sx = select(
+                    onCorner,
+                    select(onLeft, hi, lo),
+                    select(onRowBorder, edge.sub(lx), select(onColumnBorder, select(onLeft, lo, hi), lx)),
+                ).toVar();
+                const sy = select(
+                    onCorner,
+                    select(onTop, hi, lo),
+                    select(onRowBorder, select(onTop, lo, hi), select(onColumnBorder, edge.sub(ly), ly)),
+                ).toVar();
+                const sourceLane = sy.sub(uint(BORDER)).mul(uint(OCT_RES))
+                    .add(sx.sub(uint(BORDER))).toVar();
+                textureStore(atlas, uvec2(tx, ty), irradianceCache.element(sourceLane)).toWriteOnly();
+                if (roughReflectionsEnabled) {
+                    textureStore(roughSpecularAtlas, uvec2(tx, ty), roughCache.element(sourceLane)).toWriteOnly();
+                }
+                textureStore(depthAtlas, uvec2(tx, ty), depthCache.element(sourceLane)).toWriteOnly();
+            });
+        })().compute(updatedCap() * PROBE_WORKGROUP_SIZE, [PROBE_WORKGROUP_SIZE]);
 
         // ── CLASSIFY: one thread per probe. Fixed full-sphere rays; if too many
         // hit BACKFACES the probe is buried in geometry → mark INACTIVE. ──
@@ -2003,14 +2905,33 @@ export function createProbeField({
             )).toWriteOnly();
         })().compute(probeTotal);
 
-        return {
-            buffers, traceKernel, blendKernel, glossyKernel, uploadKernel,
-            clearAtlasKernel, clearGlossyAtlasKernel, classifyKernel, uploadStateKernel,
+        const solveKernels = [traceKernel, emitterVisKernel, blendKernel];
+        if (glossyKernel) solveKernels.push(glossyKernel);
+        solveKernels.push(uploadKernel);
+
+        const gpu = {
+            buffers, traceKernel, emitterVisKernel, blendKernel, glossyKernel, uploadKernel,
+            solveKernels,
+            clearAtlasKernel, clearGlossyAtlasKernel, clearEmitterVisKernel, classifyKernel, uploadStateKernel, lightGridKernel,
             atlas, roughSpecularAtlas, glossySpecularAtlas, depthAtlas, stateAtlas,
             irrBuffer, roughSpecularBuffer, glossySpecularBuffer, glossyWeightBuffer,
-            depthBuffer, stateBuffer, rayBuffer,
-            maps: built.maps, lightCount: built.lightCount,
+            depthBuffer, stateBuffer, emitterVisBuffer, rayBuffer,
+            lightGridCellCount,
+            glossyGroupsPerProbe,
+            sceneResource: sharedScene,
+            lightResource: sharedLights,
+            maps: sharedScene.maps,
+            lightCount: clusteredGi ? giSelectedCount : giLegacyLightCount,
+            // Scratch + compute grids above were sized from updatedCap() at THIS
+            // moment; the tick clamps its dispatch to this snapshot so a raised
+            // budget ceiling cannot overrun a held (not-yet-rebuilt) kernel set.
+            probeCapBuilt: updatedCap(),
         };
+        // Retain only after the complete graph exists. If TSL construction throws,
+        // the active roots remain the sole owners and no half-built cascade leaks a ref.
+        retainSceneResource(sharedScene);
+        retainLightResource(sharedLights);
+        return gpu;
     }
 
     function totalUnionProbes() {
@@ -2026,7 +2947,7 @@ export function createProbeField({
         // is why re-convergence took ~10 s and low hysteresis was the only way to speed
         // it up... at the price of flicker). Also sizes the per-cascade ray scratch —
         // this is the BUILD-TIME ceiling; the live per-tick count is tickCap() below.
-        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.floor(RAYS_PER_TICK / Math.max(1, raysPerProbe))));
+        return Math.max(1, Math.min(MAX_PROBES_PER_TICK, Math.floor(rayBudgetCeiling / Math.max(1, raysPerProbe))));
     }
     // Live per-tick probe count under the AUTO-THROTTLED ray budget (≤ updatedCap()).
     function tickCap() {
@@ -2105,7 +3026,16 @@ export function createProbeField({
         if (!_buildSpectralScene) {
             const mod = await import('./spectral_scene.js');
             _buildSpectralScene = mod.buildSpectralScene;
-            _collectLights = mod.collectLights || null;
+            _createBlasCache = mod.createBlasCache || null;
+            _rebindMaterialMapsArenaBuild = mod.rebindMaterialMapsArenaBuild || null;
+            const collectAnalyticLights = mod.collectLights || null;
+            const collectEmitterRecords = mod.collectEmitterRecords || null;
+            _collectLights = collectAnalyticLights ? (three, root, renderCamera = null) => {
+                const records = collectAnalyticLights(three, root, renderCamera);
+                if (collectEmitterRecords) records.push(...collectEmitterRecords(three, root, renderCamera));
+                return records;
+            } : null;
+            _emissiveScaled = mod.emissiveScaled || null;
             if (Number.isFinite(mod.LIGHT_STRIDE)) _LIGHT_STRIDE = mod.LIGHT_STRIDE;
         }
         return _buildSpectralScene;
@@ -2151,8 +3081,8 @@ export function createProbeField({
         const maxGlossyBytes = _maxGlossyHistoryBytes();
         const exceedsLimits = () => resVec.x * TILE > maxDim
             || resVec.y * resVec.z * TILE > maxDim
-            || (roughReflectionsEnabled
-                && resVec.x * resVec.y * resVec.z * GLOSSY_HISTORY_BYTES_PER_PROBE > maxGlossyBytes);
+            || (glossyReflectionsEnabled
+                && resVec.x * resVec.y * resVec.z * glossyHistoryBytesPerProbe > maxGlossyBytes);
         for (let g = 0; g < 32 && exceedsLimits(); g++) {
             resVec.set(Math.max(2, Math.floor(resVec.x * 0.85)), Math.max(2, Math.floor(resVec.y * 0.85)), Math.max(2, Math.floor(resVec.z * 0.85)));
         }
@@ -2162,16 +3092,21 @@ export function createProbeField({
     function setGlossyLayout(C) {
         // Near-square packing is independent of probe XYZ. Texture dimensions and
         // the larger RGBA32F history binding are both guarded by fitAtlas().
+        if (!glossyReflectionsEnabled) {
+            C.glossyTilesX = C.glossyTilesY = 1;
+            C.glossyAtlasW = C.glossyAtlasH = 1;
+            return;
+        }
         C.glossyTilesX = Math.max(1, Math.ceil(Math.sqrt(C.probeTotal)));
         C.glossyTilesY = Math.max(1, Math.ceil(C.probeTotal / C.glossyTilesX));
-        C.glossyAtlasW = C.glossyTilesX * GLOSSY_TILE;
-        C.glossyAtlasH = C.glossyTilesY * GLOSSY_TILE;
+        C.glossyAtlasW = C.glossyTilesX * glossyTile;
+        C.glossyAtlasH = C.glossyTilesY * glossyTile;
     }
 
     // Build (or same-dim-reuse) ONE cascade's kernels+resources and wire its uniforms +
     // node bindings. Handles both the reuse (churn-free) path and the full recompile path
     // for that cascade independently. Does NOT fire onRebuilt (the caller sequences that).
-    function buildOneCascade(built, c) {
+    function buildOneCascade(built, c, opts = {}) {
         const C = casc[c];
         const gridMin = C.gridMin, gridSize = C.gridSize, res = C.res;
         const minCell = C.minCell;
@@ -2184,18 +3119,55 @@ export function createProbeField({
         const sameDim = !!C.gpu
             && atlasW === C.prevAtlasW && atlasH === C.prevAtlasH
             && C.glossyAtlasW === C.prevGlossyAtlasW && C.glossyAtlasH === C.prevGlossyAtlasH
-            && probeTotal === C.prevProbeTotal;
+            && probeTotal === C.prevProbeTotal
+            && (!clusteredGi || C.gpu.lightGridCellCount === c0LightCellCount());
         if (sameDim) {
             const prev = C.gpu;
+            // Kernel-resident fast path: a within-capacity in-place scene rewrite
+            // leaves every binding of the live compute graph valid — the arena
+            // owns the storage nodes and traversal uniforms, the dims are
+            // unchanged, and the material map textures are identity-equal.
+            // Keeping the graph avoids the GPU-process pipeline recompile that
+            // stalls the first dispatch (~190 ms measured on churn.html) even
+            // while the JS thread shows no work at all.
+            if (opts.sceneRewritten && sceneResource
+                && mapsCompatible(prev.sceneResource?.maps, built.maps)) {
+                if (prev.sceneResource !== sceneResource) {
+                    retainSceneResource(sceneResource);
+                    releaseSceneResource(prev.sceneResource);
+                    prev.sceneResource = sceneResource;
+                }
+                C.U.gridMin.value.copy(gridMin);
+                C.U.gridSize.value.copy(gridSize);
+                C.U.lightCount.value = Math.min(MAX_LIGHTS,
+                    clusteredGi ? giSelectedCount : giLegacyLightCount) >>> 0;
+                C.U.maxDist.value = gridSize.length();
+                C.U.cellMin.value = Math.max(1e-4, minCell);
+                C.U.relocClamp.value = 0.45 * minCell;
+                node.updateGridUniforms(
+                    c, gridMin, gridSize, res, atlasW, atlasH,
+                    C.glossyAtlasW, C.glossyAtlasH, C.glossyTilesX,
+                    normalBias, chebyBias,
+                );
+                C.probeCursor = 0;
+                C.lastSolveAt = 0;
+                C.solveDtEma = 0;
+                C.glossyPhase = 0;
+                C.needsClear = false;             // keep the live atlas history (no black flash)
+                C.needsClassify = true;           // refresh per-probe state for the new geometry
+                kernelResidentReuses++;
+                return false;                     // graph kept — no recompile anywhere
+            }
             const reuse = {
                 atlas: prev.atlas, roughSpecularAtlas: prev.roughSpecularAtlas, glossySpecularAtlas: prev.glossySpecularAtlas,
                 depthAtlas: prev.depthAtlas, stateAtlas: prev.stateAtlas,
                 irrBuffer: prev.irrBuffer, roughSpecularBuffer: prev.roughSpecularBuffer,
                 glossySpecularBuffer: prev.glossySpecularBuffer, glossyWeightBuffer: prev.glossyWeightBuffer,
-                depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer,
+                depthBuffer: prev.depthBuffer, stateBuffer: prev.stateBuffer, emitterVisBuffer: prev.emitterVisBuffer,
             };
             C.gpu = buildKernels(built, C, reuse);
-            disposeBVHOnly(prev);   // free ONLY the old BVH storages + ray scratch + maps
+            kernelRebuilds++;
+            disposeKernelOnly(prev); // release old graph/scratch; shared scene data stays resident
             C.U.gridMin.value.copy(gridMin);
             C.U.gridSize.value.copy(gridSize);
             C.U.lightCount.value = Math.min(MAX_LIGHTS, C.gpu.lightCount) >>> 0;
@@ -2211,7 +3183,7 @@ export function createProbeField({
             C.probeCursor = 0;
             C.lastSolveAt = 0;
             C.solveDtEma = 0;
-            C.refreshStarted = false;
+            C.glossyPhase = 0;
             C.needsClear = false;             // reuse the live atlas history (no black flash)
             C.needsClassify = true;           // refresh per-probe state for the new geometry
             return false;                     // no recompile occurred
@@ -2220,6 +3192,7 @@ export function createProbeField({
         // Resize / first-enable path for this cascade: fresh resources + one recompile.
         disposeCascadeGPU(c);
         C.gpu = buildKernels(built, C);
+        kernelRebuilds++;
         C.U.gridMin.value.copy(gridMin);
         C.U.gridSize.value.copy(gridSize);
         C.U.resX.value = res.x >>> 0; C.U.resY.value = res.y >>> 0; C.U.resZ.value = res.z >>> 0;
@@ -2241,10 +3214,19 @@ export function createProbeField({
         C.probeCursor = 0;
         C.lastSolveAt = 0;
         C.solveDtEma = 0;
-        C.refreshStarted = false;
+        C.glossyPhase = 0;
         C.needsClear = true;      // fresh StorageTextures aren't guaranteed zeroed
         C.needsClassify = true;
         return true;              // recompile occurred
+    }
+
+    async function flushGiLightGrid() {
+        if (!clusteredGi) return;
+        const kernel = casc[0]?.gpu?.lightGridKernel;
+        if (!kernel) return;
+        // Clear before submission so a concurrent light refill cannot be lost.
+        giLightGridDirty = false;
+        await renderer.computeAsync(kernel);
     }
 
     // STAGE 0 of the staggered build: (re)compute BOTH cascades' dims off the SHARED soup
@@ -2253,6 +3235,13 @@ export function createProbeField({
     // comes online (stage 1). Returns false on a failed/empty build.
     function disposeUninstalledBuild(built) {
         built?.disposeDeformUpdates?.();
+        if (built?.mapsArenaGeneration) {
+            const generation = built.mapsArenaGeneration;
+            if (generation.refs === 0 && generation !== mapsArena?.current) {
+                disposeMapsGeneration(generation);
+            }
+            return;
+        }
         if (!built?.maps) return;
         const disposedMaps = new Set();
         for (const texture of Object.values(built.maps)) {
@@ -2282,8 +3271,19 @@ export function createProbeField({
             // async texture extraction are validated below.
             scene.updateMatrixWorld(true);
             const startedGeneration = buildGeneration;
-            const startedGeoSig = geoSignature();
-            built = await buildSpectralScene({ THREE, scene, maxTriangles: MAX_TRIANGLES });
+            const startedGeoSig = detectSceneChanges ? geoSignature() : null;
+            if (!blasCache && _createBlasCache) blasCache = _createBlasCache();
+            if (mapsArena) {
+                mapsArena.maxLayers = Number(renderer?.backend?.device?.limits?.maxTextureArrayLayers)
+                    || mapsArena.maxLayers;
+            }
+            built = await buildSpectralScene({
+                THREE,
+                scene,
+                maxTriangles: MAX_TRIANGLES,
+                blasCache,
+                mapsArena,
+            });
             if (disposed) {
                 disposeUninstalledBuild(built);
                 return false;
@@ -2295,7 +3295,7 @@ export function createProbeField({
             }
 
             scene.updateMatrixWorld(true);
-            if (geoSignature() !== startedGeoSig) return retryFreshBuild(built);
+            if (detectSceneChanges && geoSignature() !== startedGeoSig) return retryFreshBuild(built);
 
             // Vertex buffers and transforms may advance while material images
             // are decoded. Catch the fresh build up in place before publishing
@@ -2324,10 +3324,10 @@ export function createProbeField({
             // Establish all signature baselines from the exact scene state that
             // was installed. The first idle checks can now detect—not silently
             // baseline—an edit that arrives immediately after this point.
-            lastGeoSig = geoSignature();
-            lastDeformSig = deformSignature();
-            lastXformSig = xformSignature();
-            lastLightSig = lightSignature();
+            lastGeoSig = detectSceneChanges ? geoSignature() : null;
+            lastDeformSig = detectSceneChanges ? deformSignature() : null;
+            lastXformSig = detectSceneChanges ? xformSignature() : null;
+            lastLightSig = detectSceneChanges ? lightSignature() : null;
             geoStable = -1;
         }
 
@@ -2358,6 +3358,24 @@ export function createProbeField({
         curMinCell = C0.minCell;                                 // setNormalBias() lives off C0's cell
         quantStep = Math.max(1e-4, C0.minCell * 0.25);          // A1: geo-signature translation deadband
         lightQuant = Math.max(1e-3, C0.gridSize.length() * 0.003); // B4: light-signature position deadband
+
+        // Clustered mode: budget the GI lane into the fixed arena BEFORE any kernel
+        // binds it. Records come from the build snapshot itself (no re-collect), so
+        // the arena is byte-consistent with what the legacy path would have bound;
+        // the light lane's refreshLights keeps it current from there.
+        const sceneGenerationChanged = sceneResource?.built !== built;
+        if (sceneGenerationChanged || !liveLightRecords) {
+            try {
+                liveLightRecords = _collectLights ? _collectLights(THREE, scene) : recordsFromBuilt(built);
+            } catch {
+                liveLightRecords = recordsFromBuilt(built);
+            }
+        }
+        const lightDataChanged = clusteredGi
+            ? fillGiLightArena(liveLightRecords).recordDataChanged
+            : fillLegacyLightArena(liveLightRecords).recordDataChanged;
+        const { sceneBuffersRebound, sceneBuffersRewritten } = prepareSharedResources(built, lightDataChanged);
+        lastBuildSceneRewritten = sceneBuffersRewritten && !sceneBuffersRebound;
 
         // ── C1 dims: fine sub-box via the CPU triangle-density histogram (idle-gated). ──
         // A flat/degenerate histogram → treat as cascades=1 for placement (safe fallback).
@@ -2400,12 +3418,18 @@ export function createProbeField({
         const c1WasReady = !!casc[1].gpu;
         const c1SameDim = c1WasReady && buildCascadeCount >= 2
             && casc[1].atlasW === casc[1].prevAtlasW && casc[1].atlasH === casc[1].prevAtlasH && casc[1].probeTotal === casc[1].prevProbeTotal;
-        const recompiled = buildOneCascade(built, 0);
+        const recompiled = buildOneCascade(built, 0, { sceneRewritten: lastBuildSceneRewritten });
+        if (clusteredGi) {
+            giLightGridDirty = true;
+            await flushGiLightGrid();
+            if (disposed) return false;
+        }
         if (buildCascadeCount < 2) {
             // No fine cascade this build → single-grid shader + dispose C1, finish now.
             node.setCascadeCount(1);
             disposeCascadeGPU(1);
             buildStage = 2;
+            fieldEverReady = true;
         } else if (c1SameDim) {
             // C1 stays live at its current dims → keep it bound (no recompile), rebuild its
             // BVH-bound kernels next idle tick without dropping the blend.
@@ -2419,19 +3443,20 @@ export function createProbeField({
         // Fire the one-shot recompile the frame C0's data first exists (resize/first-enable
         // path OR a cascade-count change to 1). The same-dim path with no structGen change
         // needs no recompile.
-        if ((recompiled || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
+        if ((recompiled || sceneBuffersRebound || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
         return true;
     }
 
     // STAGE 1: build C1 only (one idle tick after C0), then flip cascadeCountNode to 2 so
     // the fragment starts blending the fine cascade. Runs behind the SAME idle gate as C0.
-    function advanceBuildStageC1() {
+    async function advanceBuildStageC1() {
         const built = cachedBuilt;
-        if (!built) { buildStage = 2; return; }
+        if (!built) { buildStage = 2; fieldEverReady = true; return; }
         const genBefore = node._structGen;
-        const recompiled = buildOneCascade(built, 1);
+        const recompiled = buildOneCascade(built, 1, { sceneRewritten: lastBuildSceneRewritten });
         node.setCascadeCount(2);  // C1 online → fragment blends fine cascade
         buildStage = 2;
+        fieldEverReady = true;
         // C1's setGrid/setAtlases + setCascadeCount bump _structGen only on the full path;
         // a same-dim C1 reuse changes nothing → no recompile needed (churn-free).
         if ((recompiled || node._structGen !== genBefore) && typeof onRebuilt === 'function') { try { onRebuilt(); } catch (e) { /* non-fatal */ } }
@@ -2449,13 +3474,19 @@ export function createProbeField({
         const playing = opts.playing === true;
         const moving = idleMs < GI_IDLE_MS || playing;
         const wasMoving = lastMoving;
+        const wasPlaying = lastPlaying;
         lastIdleMs = idleMs;
         lastMoving = moving;
-        if (!moving && wasMoving) {
+        lastPlaying = playing;
+        if (!moving && wasMoving && (!continuous || wasPlaying)) {
             // Scrub/playback release can expose a geometry catch-up/refit on
             // the same first idle frames. Never resume a strict-idle field at
             // its stale pre-interaction maximum ray budget and make those
-            // bounded CPU slices compete with a full GPU solve.
+            // bounded CPU slices compete with a full GPU solve. Continuous-mode
+            // GUI/camera interaction never paused the solve, though: clamping
+            // that live budget on release creates a visible full-pass -> sparse-
+            // batch cadence cliff, so leave it untouched unless playback itself
+            // just stopped and the rest-only scene scans may need to catch up.
             tickBudgetRays = probeBudgetAfterInteraction(tickBudgetRays);
             tickDtEma = 0;
             lastTickAt = 0;
@@ -2474,11 +3505,34 @@ export function createProbeField({
         // synchronous build every tick.
         if (rebuildBackoff > 0) rebuildBackoff--;
 
-        if (dirty || !casc[0].gpu) {
-            if (!restOnly) return;   // never (re)build the soup/kernels mid-motion (hitch source)
+        // Topology is the RAREST change class, so a pending rest-gated rebuild
+        // gets the LOWEST scheduling priority — never a veto over the lanes
+        // beneath it. While the host keeps playing, the tick falls through:
+        // transform/deform packets and the solve keep working against the
+        // current build, and the rebuild lands at the next rest window. The
+        // FIRST bring-up still builds immediately even mid-motion: a host
+        // playing from frame 0 never gets a rest window, and there is no
+        // converged GI to disturb yet, so the one-time boot hitch is the
+        // cheaper failure mode by construction.
+        const buildHeld = !restOnly && fieldEverReady && !!casc[0].gpu;
+        if ((dirty || !casc[0].gpu) && !buildHeld) {
+            // A CPU soup/kernel build is not evidence that the previous GPU
+            // solve was too expensive. Keep it out of the cadence interval.
+            resetFramePacing();
             if (rebuildBackoff > 0) return;
             inFlight = true; let ok = false;
-            try { ok = await rebuild(); } finally { inFlight = false; }
+            try {
+                ok = await rebuild();
+            } catch (e) {
+                if (disposed) return;
+                console.warn('SPEEDBALL GI rebuild failed:', e);
+                dirty = false;
+                rebuildBackoff = REBUILD_BACKOFF_TICKS;
+                return;
+            } finally {
+                inFlight = false;
+            }
+            if (disposed) return;
             if (ok === 'retry') return; // newer scene state stays armed; retry at the next idle tick
             if (!ok) { dirty = false; rebuildBackoff = REBUILD_BACKOFF_TICKS; return; }
             return;   // stage 0 done this tick; the solve waits for the next tick
@@ -2487,10 +3541,28 @@ export function createProbeField({
 
         // (A2/#2) Staggered build: advance exactly ONE build stage per idle tick so no
         // single frame does 2× the build. C1 comes online one idle tick after C0. Held for rest.
-        if (buildStage < 2) {
-            if (!restOnly) return;
+        if (buildStage < 2 && !buildHeld) {
+            resetFramePacing();
             inFlight = true;
-            try { advanceBuildStageC1(); } finally { inFlight = false; }
+            const genBefore = node._structGen;
+            try {
+                await advanceBuildStageC1();
+            } catch (error) {
+                if (!disposed) {
+                    console.warn('SPEEDBALL GI fine cascade build failed; continuing with the coarse cascade:', error);
+                    disposeCascadeGPU(1);
+                    node.setCascadeCount(1);
+                    buildCascadeCount = 1;
+                    buildStage = 2;
+                    fieldEverReady = true;
+                    if (node._structGen !== genBefore && typeof onRebuilt === 'function') {
+                        try { onRebuilt(); } catch (e) { /* non-fatal */ }
+                    }
+                }
+            } finally {
+                inFlight = false;
+            }
+            if (disposed) return;
             return;
         }
 
@@ -2502,22 +3574,38 @@ export function createProbeField({
         const tNow = _nowMs();
         if (lastTickAt > 0) {
             const dt = tNow - lastTickAt;
-            if (dt > 0 && dt < 100) {
+            if (dt > 0 && dt < TICK_OVERLOAD_MS) {
+                cadenceOverloadStreak = 0;
                 hysteresisTickDtEma = hysteresisTickDtEma > 0 ? hysteresisTickDtEma * 0.8 + dt * 0.2 : dt;
                 tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
                 if (budgetCooldown > 0) budgetCooldown--;
                 if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = Math.max(RAYS_PER_TICK_MIN, Math.floor(tickBudgetRays * 0.5));
+                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
                     tickDtEma = 0;        // re-measure only the budget controller at the new cap
                     budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
                                           // scene that misses 60 fps at ANY budget otherwise
                                           // saw-tooths between floor and max
-                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < RAYS_PER_TICK) {
-                    tickBudgetRays = Math.min(RAYS_PER_TICK, tickBudgetRays + 1024);
+                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < rayBudgetCeiling) {
+                    tickBudgetRays = Math.min(rayBudgetCeiling, tickBudgetRays + 1024);
+                }
+            } else if (dt >= TICK_OVERLOAD_MS && dt < TICK_PAUSE_MS) {
+                // computeAsync submits without waiting for GPU completion, so this is
+                // presentation cadence rather than a direct solve timer. One long gap
+                // may be unrelated; repeated accepted gaps still mean the browser is
+                // not making progress and must make the bounded GI workload back off.
+                tickDtEma = 0;
+                cadenceOverloadStreak = Math.min(
+                    TICK_OVERLOAD_STRIKES,
+                    cadenceOverloadStreak + 1,
+                );
+                if (cadenceOverloadStreak >= TICK_OVERLOAD_STRIKES && tickBudgetRays > RAYS_PER_TICK_MIN) {
+                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
+                    budgetCooldown = 120;
                 }
             } else {
                 tickDtEma = 0;
                 hysteresisTickDtEma = 0;
+                cadenceOverloadStreak = 0;
             }
         }
         lastTickAt = tNow;
@@ -2533,16 +3621,53 @@ export function createProbeField({
         checkCounter++;
         // LIGHTS are the exception: refresh-class, not rebuild-class.
         // refreshLights() is an in-place buffer refill (no BVH, no compile)
-        // and lightSignature() is a bounded lights-only traverse with
+        // and lightSignature() only reads analytic lights plus opted-in emitters with
         // deadbands, so this lane rides THROUGH motion. Rest-gating it made
         // every host light edit read as "GI stopped solving" while the
         // interactive raster light updated live (maxjs 2026-07-24).
-        if (checkCounter % LIGHT_CHECK_INTERVAL === 0) {
+        if (detectSceneChanges && checkCounter % LIGHT_CHECK_INTERVAL === 0) {
             const ls = lightSignature();
             if (lastLightSig !== null && ls !== lastLightSig) refreshLights();
             lastLightSig = ls;
         }
-        if (restOnly) {
+        if (clusteredGi && giLightGridDirty) {
+            const dirtyBefore = dirty;
+            inFlight = true;
+            try { await flushGiLightGrid(); } finally { inFlight = false; }
+            // Abort only on state that changed UNDER the await — a rebuild that
+            // was already pending (held for rest) must not stall this tick.
+            if (disposed || (dirty && !dirtyBefore) || giLightGridDirty) return;
+        }
+        // Explicit host changes bypass the scene-wide/rest-only signature
+        // scans. One moving object rewrites only its stable instance rows and
+        // exact TLAS ancestors while the game or DCC viewport is still moving.
+        if (pendingAllTransforms || pendingTransformTargets.size > 0) {
+            const targets = pendingAllTransforms ? null : Array.from(pendingTransformTargets);
+            pendingAllTransforms = false;
+            pendingTransformTargets.clear();
+            if (!refreshTransforms(targets)) return;
+            // The next rest-only signature pass establishes a fresh baseline;
+            // it must not replay this already-committed packet as a full refit.
+            lastXformSig = null;
+        }
+        // Material-value packets ride THROUGH motion like transforms; no
+        // signature baseline exists to reset (no fallback scan reads values).
+        if (pendingAllMaterialValues || pendingMaterialValueTargets.size > 0) {
+            const targets = pendingAllMaterialValues ? null : Array.from(pendingMaterialValueTargets);
+            pendingAllMaterialValues = false;
+            pendingMaterialValueTargets.clear();
+            if (!refreshMaterialValues(targets)) return;
+        }
+        if (pendingDeformRefresh) {
+            pendingDeformRefresh = false;
+            const dirtyBefore = dirty;
+            inFlight = true;
+            try { await refreshDeforms(); } finally { inFlight = false; }
+            // Same rule as above: a pre-existing held rebuild does not abort.
+            if (disposed || (dirty && !dirtyBefore)) return;
+            lastDeformSig = null;
+        }
+        if (restOnly && detectSceneChanges) {
             if (checkCounter % XFORM_CHECK_INTERVAL === 0) {
                 const xs = xformSignature();
                 if (lastXformSig !== null && xs !== lastXformSig) refreshTransforms();
@@ -2602,7 +3727,7 @@ export function createProbeField({
                 const gpu = C.gpu;
                 if (!gpu) continue;
 
-                const updated = Math.min(tickCap(), C.probeTotal);
+                const updated = Math.min(tickCap(), gpu.probeCapBuilt ?? Infinity, C.probeTotal);
                 // Normalize per CASCADE from its accepted service cadence. In partial
                 // mode C0/C1 alternate and may have very different sizes, so the old
                 // union-wide ceil(total/cap) coefficient could make the fine grid boil
@@ -2629,26 +3754,29 @@ export function createProbeField({
                 );
                 C.U.probeOffset.value = C.probeCursor >>> 0;
                 C.U.updatedCount.value = updated >>> 0;
-                // (B1) Ray-set rotation shares ONE frameJitter, advanced ONLY on C0's pass
-                // boundary. Both cascades read the same U.frameJitter, so rayDir(k,jitter)
-                // stays byte-identical between trace and blend for whichever cascade runs
-                // this tick (rotation happens BEFORE any dispatch). When the WHOLE union
-                // solves every tick, rotate EVERY tick: re-blending the same deterministic
-                // ray set for ROT_MIN_TICKS pulls each texel ~26% toward that one estimate
-                // and then steps to the next — a visible ~10 Hz pulse, worst on the fine
-                // cascade (near-wall probes swing hard between ray sets). A fresh set per
-                // tick is a proper 5%-per-update Monte-Carlo accumulation instead. Multi-
-                // tick (round-robin) passes keep the ROT_MIN_TICKS spacing as before.
-                C.ticksSinceRot++;
-                if (ci === 0 && C.probeCursor === 0 && (fullPassPerTick || C.ticksSinceRot >= ROT_MIN_TICKS)) {
-                    if (C.refreshStarted && !debugFreezeRayJitter) {
+                // (B1) The product contract is binary and independent of idle time,
+                // probe count, batch size, or resize cadence:
+                //   Gated      — hold the current ray/emitter sampling basis forever.
+                //   Monte Carlo — advance it on every accepted C0 solve.
+                // Both cascades read the same shared uniforms, so trace and blend
+                // remain byte-identical for whichever cascade runs this tick.
+                const rotateRaySet = ci === 0 && jitterMode === 'montecarlo';
+                // Keep every stochastic input in the selected regime. Gated holds
+                // the emitter target indefinitely; Monte Carlo advances it on every
+                // C0 solve tick along with the ray basis.
+                if (rotateRaySet && !debugFreezeRayJitter) {
+                    emitterVisSeedCounter = (emitterVisSeedCounter + 1) >>> 0;
+                    U.emitterVisSeed.value = (emitterVisSeedCounter * 0.61803398875) % 1;
+                }
+                // Monte Carlo changes sampling epoch every C0 solve by definition;
+                // this block is unreachable in Gated mode.
+                if (rotateRaySet) {
+                    if (!debugFreezeRayJitter) {
                         frameCounter = (frameCounter + 1) >>> 0;
                         U.frameJitter.value = debugFrameJitterOverride ?? ((frameCounter * 0.61803398875) % 1);
                     } else if (debugFrameJitterOverride !== null) {
                         U.frameJitter.value = debugFrameJitterOverride;
                     }
-                    C.refreshStarted = true;
-                    C.ticksSinceRot = 0;
                 }
                 C.probeCursor = C.probeTotal > 0 ? (C.probeCursor + updated) % C.probeTotal : 0;
 
@@ -2660,33 +3788,54 @@ export function createProbeField({
                 if (C.needsClear || C.needsClassify) {
                     const prep = [];
                     if (C.needsClear) {
-                        prep.push(renderer.computeAsync(gpu.clearAtlasKernel));
-                        if (gpu.clearGlossyAtlasKernel) prep.push(renderer.computeAsync(gpu.clearGlossyAtlasKernel));
+                        prep.push(gpu.clearAtlasKernel);
+                        if (gpu.clearGlossyAtlasKernel) prep.push(gpu.clearGlossyAtlasKernel);
+                        prep.push(gpu.clearEmitterVisKernel);
                         C.needsClear = false;
                     }
                     if (C.needsClassify) {
-                        if (U.classifyStrength.value > 0) prep.push(renderer.computeAsync(gpu.classifyKernel));
-                        prep.push(renderer.computeAsync(gpu.uploadStateKernel));
+                        if (U.classifyStrength.value > 0) prep.push(gpu.classifyKernel);
+                        prep.push(gpu.uploadStateKernel);
                         C.needsClassify = false;
                     }
-                    await Promise.all(prep);
+                    // One ordered compute pass: classify writes stateBuffer and
+                    // uploadState consumes it later in the same pass. Separate
+                    // computeAsync calls only created extra encoders/submissions;
+                    // they were never GPU-parallel.
+                    if (prep.length > 0) await renderer.computeAsync(prep);
+                    if (disposed) return;
                 }
-                // (A6/#1) Submit trace→low blend→glossy resolve→upload for cascade C in order WITHOUT awaiting
-                // between them — same-queue order preserves the data dependency, so one
-                // trailing await suffices. Cascades run in order, never interleaved.
-                const solve = [
-                    renderer.computeAsync(gpu.traceKernel),
-                    renderer.computeAsync(gpu.blendKernel),
-                ];
-                if (gpu.glossyKernel) solve.push(renderer.computeAsync(gpu.glossyKernel));
-                solve.push(renderer.computeAsync(gpu.uploadKernel));
-                await Promise.all(solve);
+                // Match the dispatch envelope to the LIVE auto-throttled batch.
+                // Count sizes each live dispatch without recompiling. Barrier
+                // kernels cannot use Three's generated early-return guard, so their
+                // exact 64-aligned counts plus activeProbe protect every access.
+                gpu.traceKernel.count = updated * raysPerProbe;
+                gpu.emitterVisKernel.count = U.emitterCount.value > 0
+                    ? updated * GI_EMITTER_INJECT_CAP
+                    : 0;
+                gpu.blendKernel.count = updated * PROBE_WORKGROUP_SIZE;
+                if (gpu.glossyKernel) {
+                    gpu.glossyKernel.count = updated * gpu.glossyGroupsPerProbe * PROBE_WORKGROUP_SIZE;
+                }
+                gpu.uploadKernel.count = updated * PROBE_WORKGROUP_SIZE;
+
+                // (A6/#1) One ordered compute pass for trace→emitter visibility→blend→glossy→upload.
+                // This keeps all storage dependencies on the same queue/pass while
+                // removing three command encoders and submissions per solve.
+                if (gpu.glossyKernel) {
+                    C.U.glossyPhase.value = C.glossyPhase >>> 0;
+                    C.glossyPhase = (C.glossyPhase + 1) % glossyUpdateInterval;
+                }
+                await renderer.computeAsync(gpu.solveKernels);
+                if (disposed) return;
                 C.lastSolveAt = tNow;
                 C.solveDtEma = nextSolveDtEma;
             }
         } catch (e) {
-            console.warn('max.js SPEEDBALL GI probe tick failed:', e);
-            dirty = true;
+            if (!disposed) {
+                console.warn('SPEEDBALL GI probe tick failed:', e);
+                dirty = true;
+            }
         } finally {
             inFlight = false;
         }
@@ -2703,6 +3852,80 @@ export function createProbeField({
             cachedBuilt?.cancelDeformUpdates?.();
             buildDirty = true;
             buildGeneration++;
+        }
+    }
+
+    // Event-driven scene updates for games, realtime DCC bridges, and other
+    // hosts that already know what changed. Legacy signatures remain as a
+    // compatibility fallback; explicit transform/deform notifications are
+    // consumed during continuous motion instead of waiting for an idle scan.
+    function markTransformsDirty(targets = null) {
+        if (targets == null) {
+            pendingAllTransforms = true;
+            pendingTransformTargets.clear();
+            return;
+        }
+        if (pendingAllTransforms) return;
+        const list = Array.isArray(targets) || targets instanceof Set ? targets : [targets];
+        for (const target of list) if (target != null) pendingTransformTargets.add(target);
+    }
+    function markDeformsDirty() {
+        pendingDeformRefresh = true;
+    }
+    // Value-only material edits (emissive, color, roughness, …). targets may be
+    // materials or meshes (expanded to their materials); null refreshes every
+    // record. Structural material changes self-escalate inside the refresh.
+    function markMaterialValuesDirty(targets = null) {
+        if (targets == null) {
+            pendingAllMaterialValues = true;
+            pendingMaterialValueTargets.clear();
+            return;
+        }
+        if (pendingAllMaterialValues) return;
+        const list = Array.isArray(targets) || targets instanceof Set ? targets : [targets];
+        for (const target of list) if (target != null) pendingMaterialValueTargets.add(target);
+    }
+    function markTopologyDirty() {
+        requestRebuild(true);
+    }
+    function notifySceneChange(change) {
+        if (Array.isArray(change)) {
+            for (const entry of change) notifySceneChange(entry);
+            return true;
+        }
+        const type = typeof change === 'string' ? change : change?.type;
+        switch (String(type || '').toLowerCase()) {
+            case 'transform':
+            case 'xform':
+                markTransformsDirty(change?.objects ?? change?.object ?? change?.target ?? null);
+                return true;
+            case 'deform':
+            case 'vertices':
+                markDeformsDirty();
+                return true;
+            case 'light':
+            case 'lighting':
+                forceLightingRefresh();
+                return true;
+            // Value lane, not the rebuild lane: the refresh itself detects
+            // structural material changes (reassignment, map binding, dedup
+            // split) and escalates to the full rebuild, so hosts just say
+            // "material changed" and get the cheapest correct path.
+            case 'material':
+            case 'materials':
+                markMaterialValuesDirty(change?.materials ?? change?.material ?? change?.objects ?? change?.target ?? null);
+                return true;
+            case 'add':
+            case 'added':
+            case 'remove':
+            case 'removed':
+            case 'topology':
+            case 'geometry':
+            case 'structure':
+                markTopologyDirty();
+                return true;
+            default:
+                return false;
         }
     }
     // Set explicit probe volume(s) — e.g. synced "SPEEDBALL GI Probe Grid" helpers. Each
@@ -2747,21 +3970,88 @@ export function createProbeField({
         return id;
     }
     function lightSignature() {
-        let s = '', n = 0;
+        // Numeric rolling hash — NO per-light string build. This lane deliberately
+        // runs THROUGH motion every LIGHT_CHECK_INTERVAL ticks, so at hundreds of
+        // lights (clustered mode) the old concatenated-string signature became a
+        // real per-check CPU + GC tax. Two independent 32-bit accumulators make a
+        // missed edit a ~2^-64 event; the light count stays explicit in the return
+        // value so count↔hash aliasing is impossible. Order-sensitive like the old
+        // string (two lights swapping records must re-fill the buffer).
         // (B4) Scene-relative deadbands so sub-perceptual delta-sync jitter does NOT
         // trigger a refresh every check; a genuine edit still changes the signature.
+        let n = 0, h1 = 0x9e3779b9 | 0, h2 = 0x85ebca6b | 0;
         const q = lightQuant > 1e-6 ? lightQuant : 1;
         scene.traverseVisible((o) => {
-            if (!o.isLight || o.isAmbientLight || o.isHemisphereLight) return;
+            if (o.isLight && !o.isAmbientLight && !o.isHemisphereLight) {
+                // Excluded lights never reach collectLights (objectIsRenderable) → their
+                // edits must not churn the lane (same rule 2abc2cd applied to the
+                // geo/deform/xform signatures for excluded meshes).
+                if (o.userData?.maxjsVisible === false) return;
+                o.updateWorldMatrix?.(true, false);
+                o.getWorldPosition(_sigVec);
+                const c = o.color;
+                let v = Math.round(_sigVec.x / q);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round(_sigVec.y / q);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round(_sigVec.z / q);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0;
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round((o.intensity || 0) * 4);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round((o.angle || 0) * 50);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                // range/decay were missing from the old string signature — a distance
+                // edit silently never reached the GI records until something else moved.
+                v = Math.round((o.distance || 0) * 4);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                v = Math.round((o.decay || 0) * 8);
+                h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+                n++;
+                return;
+            }
+            if (o.userData?.giEmitter !== true || (!o.isMesh && !o.isInstancedMesh)
+                || o.isSkinnedMesh || o.name === '__maxjs_sky__' || o.userData?.maxjsVisible === false) return;
+            const position = o.geometry?.attributes?.position;
+            if (!position || position.count < 3 || position.itemSize < 3 || !position.array) return;
+            const materials = Array.isArray(o.material) ? o.material : [o.material];
+            if (!materials.some((m) => m && m.visible !== false && (!Number.isFinite(m.opacity) || m.opacity > 1e-4))) return;
+            const material = materials[0];
+            if (!material || material.visible === false || (Number.isFinite(material.opacity) && material.opacity <= 1e-4)
+                || !_emissiveScaled) return;
+            const em = _emissiveScaled(material, _sigEmissive);
+            if (Math.max(em[0], em[1], em[2]) <= 0) return;
+            if (!o.geometry.boundingSphere) {
+                try { o.geometry.computeBoundingSphere(); } catch { return; }
+            }
+            const sphere = o.geometry.boundingSphere;
+            if (!sphere || !Number.isFinite(sphere.radius)) return;
             o.updateWorldMatrix?.(true, false);
-            o.getWorldPosition(_sigVec);
-            const c = o.color;
-            s += `${Math.round(_sigVec.x / q)},${Math.round(_sigVec.y / q)},${Math.round(_sigVec.z / q)}|`
-               + `${c ? Math.round((c.r * 7 + c.g * 11 + c.b * 13) * 16) : 0}|`
-               + `${Math.round((o.intensity || 0) * 4)}|${Math.round((o.angle || 0) * 50)};`;
+            _sigVec.copy(sphere.center).applyMatrix4(o.matrixWorld);
+            o.getWorldScale(_sigScale);
+            const radius = sphere.radius * Math.max(Math.abs(_sigScale.x), Math.abs(_sigScale.y), Math.abs(_sigScale.z));
+            if (!Number.isFinite(radius)) return;
+            const emitterScale = Number.isFinite(o.userData?.giEmitterScale) ? o.userData.giEmitterScale : 1;
+            let v = Math.round(_sigVec.x / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(_sigVec.y / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(_sigVec.z / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(em[0] * 16);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(em[1] * 16);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(em[2] * 16);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(emitterScale * 16);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
+            v = Math.round(radius / q);
+            h1 = (Math.imul(h1, 31) + v) | 0; h2 = Math.imul(h2 ^ v, 0x45d9f3b) | 0;
             n++;
         });
-        return n + ':' + s;
+        return n + ':' + h1 + ':' + h2;
     }
     // STRUCTURE signature: topology / connectivity / instance-set identity —
     // anything that invalidates the pooled BLAS soup and needs a full rebuild.
@@ -2789,7 +4079,11 @@ export function createProbeField({
             const idx = o.geometry.index;
             meshes++;
             prims += idx ? idx.count : p.count;
-            const instanceCount = o.isInstancedMesh ? Math.max(0, o.count | 0) : 1;
+            // InstancedMesh allocation capacity is structural; its live count
+            // is transform-state and rides the reserved-slot TLAS fast path.
+            const instanceCapacity = o.isInstancedMesh
+                ? Math.max(0, (o.instanceMatrix?.count ?? o.count) | 0)
+                : 1;
             hash = ((hash * 31) + structureId(o)) | 0;
             hash = ((hash * 31) + structureId(o.geometry)) | 0;
             // Replacing a same-sized position attribute is still a DEFORM.
@@ -2797,7 +4091,7 @@ export function createProbeField({
             // structure lane only needs the vertex count here.
             hash = ((hash * 31) + p.count) | 0;
             hash = ((hash * 31) + structureId(idx) + (idx ? ((idx.version | 0) + idx.count) : 0)) | 0;
-            hash = ((hash * 31) + instanceCount) | 0;
+            hash = ((hash * 31) + instanceCapacity) | 0;
             const groups = o.geometry.groups || [];
             hash = ((hash * 31) + groups.length) | 0;
             for (const group of groups) {
@@ -2848,7 +4142,10 @@ export function createProbeField({
                 h = ((h * 33) + Math.round(e[13] / q)) | 0;
                 h = ((h * 33) + Math.round(e[14] / q)) | 0;
             }
-            if (o.isInstancedMesh && o.instanceMatrix) h = ((h * 33) + (o.instanceMatrix.version | 0)) | 0;
+            if (o.isInstancedMesh && o.instanceMatrix) {
+                h = ((h * 33) + (o.instanceMatrix.version | 0)) | 0;
+                h = ((h * 33) + Math.max(0, o.count | 0)) | 0;
+            }
         });
         return h;
     }
@@ -2857,20 +4154,42 @@ export function createProbeField({
     // small materials buffer. No soup rewrite, no MeshBVH rebuild, no shader
     // recompile — probes re-trace the moved geometry on the next solve pass.
     // A null result means the instance set changed under us → full rebuild.
-    function refreshTransforms() {
+    function refreshTransforms(objects = null) {
         const built = cachedBuilt;
-        if (!built?.updateTransforms || !casc[0].gpu) return;
+        if (!built?.updateTransforms || !casc[0].gpu) return false;
+        if (sceneResource?.built !== built) { requestRebuild(); return false; }
         let res = null;
-        try { res = built.updateTransforms(); } catch { res = null; }
-        if (!res) { requestRebuild(); return; }
+        try { res = built.updateTransforms(objects == null ? undefined : { objects }); } catch { res = null; }
+        if (!res) { requestRebuild(); return false; }
         if (res.bounds && built.bounds?.copy) built.bounds.copy(res.bounds);
-        const matStart = built.instBase | 0;
-        const matCount = Math.max(0, (built.tlasBase | 0)
-            + ((built.tlasNodeCount | 0) * (built.strides?.TLAS_STRIDE_F32 || 12)) - matStart);
-        for (const C of casc) {
-            const g = C.gpu; if (!g) continue;
-            markStorageDirty(g.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
+        lastTransformInstanceCount = res.updatedInstances | 0;
+        lastTlasRefitCount = res.refittedTlasNodes | 0;
+        if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
+            copySceneStorageRanges('materials', built.materials, res.materialRanges);
         }
+        if (res.emitterTransformsTouched) forceLightingRefresh();
+        return true;
+    }
+    // Material-VALUE fast path: as long as the probes keep tracing, a
+    // non-structural material edit is FREE — the affected resident uber records
+    // are rewritten in place (spectral_scene updateMaterialValues) and those few
+    // floats re-uploaded; the field re-converges through the bounded per-texel
+    // change detector, multi-bounce included. No soup rewrite, no MeshBVH, no
+    // recompile. Structural drift (map binding, material reassignment, dedup
+    // split) fails closed to the full rebuild lane at its usual lowest priority.
+    function refreshMaterialValues(targets = null) {
+        const built = cachedBuilt;
+        if (!built?.updateMaterialValues || !casc[0].gpu) return false;
+        if (sceneResource?.built !== built) { requestRebuild(); return false; }
+        let res = null;
+        try { res = built.updateMaterialValues(targets == null ? undefined : { materials: targets }); } catch { res = null; }
+        if (!res) { requestRebuild(); return false; }
+        lastMaterialValueRecords = res.updatedRecords | 0;
+        if (Array.isArray(res.materialRanges) && res.materialRanges.length > 0) {
+            copySceneStorageRanges('materials', built.materials, res.materialRanges);
+        }
+        if (res.emitterValuesTouched) forceLightingRefresh();
+        return true;
     }
     // Deforming-object fast path: re-gather the deformed BLAS vertex slices +
     // refit their node bounds in place (spectral_scene updateDeforms — no
@@ -2883,6 +4202,7 @@ export function createProbeField({
     async function refreshDeforms() {
         const built = cachedBuilt;
         if ((!built?.updateDeformsAsync && !built?.updateDeforms) || !casc[0].gpu) return false;
+        if (sceneResource?.built !== built) { requestRebuild(); return false; }
         let res = null;
         try {
             res = typeof built.updateDeformsAsync === 'function'
@@ -2898,13 +4218,10 @@ export function createProbeField({
         const matStart = built.instBase | 0;
         const matCount = Math.max(0, (built.tlasBase | 0)
             + ((built.tlasNodeCount | 0) * (built.strides?.TLAS_STRIDE_F32 || 12)) - matStart);
-        for (const C of casc) {
-            const g = C.gpu; if (!g) continue;
-            markStorageDirty(g.buffers.vertexData, res.vertRanges);
-            if (res.refitted) {
-                markStorageDirty(g.buffers.bvhNodes, res.nodeRanges);
-                markStorageDirty(g.buffers.materials, matCount > 0 ? [[matStart, matCount]] : null);
-            }
+        copySceneStorageRanges('vertexData', built.vertexData, res.vertRanges);
+        if (res.refitted) {
+            copySceneStorageRanges('bvhNodes', built.bvhNodes, res.nodeRanges);
+            copySceneStorageRanges('materials', built.materials, matCount > 0 ? [[matStart, matCount]] : null);
         }
         return true;
     }
@@ -2925,26 +4242,159 @@ export function createProbeField({
         }
         attr.needsUpdate = true;
     }
-    // re-collect lights into EACH cascade's light buffer (no BVH rebuild). Count change →
-    // full rebuild. Both cascades bind their own copy of the light soup, so update both.
+    // ── clustered mode: importance top-K into the fixed arena ──
+    function giLightImportance(rec, bmin, bmax) {
+        if (rec[0] < 0.5) return Infinity;                    // directional: always keep
+        const power = Math.max(rec[7], rec[8], rec[9]);       // records store color × intensity
+        const cone = Math.abs(rec[0] - 2) < 0.5 ? Math.max(0.02, (1 - rec[12]) * 0.5) : 1;
+        const dx = Math.max(bmin.x - rec[1], 0, rec[1] - bmax.x);
+        const dy = Math.max(bmin.y - rec[2], 0, rec[2] - bmax.y);
+        const dz = Math.max(bmin.z - rec[3], 0, rec[3] - bmax.z);
+        return (power * cone) / (1 + dx * dx + dy * dy + dz * dz);
+    }
+    const _selMax = new THREE.Vector3();
+    function selectGiLights(records, budget) {
+        if (records.length <= budget) return records;
+        const C0 = casc[0];
+        const bmin = C0.gridMin;
+        const bmax = _selMax.copy(C0.gridMin).add(C0.gridSize);
+        const scored = records.map((rec, i) => [giLightImportance(rec, bmin, bmax), i]);
+        scored.sort((a, b) => (b[0] - a[0]) || (a[1] - b[1]));   // score desc, index asc (deterministic)
+        scored.length = budget;
+        return scored.map(([, i]) => records[i]);
+    }
+    function selectGiLightRecords(records, importanceRanked) {
+        const analytic = [];
+        const emitters = [];
+        for (const rec of records) {
+            if (Math.abs(rec[0] - 3) < 0.5) emitters.push(rec);
+            else if (rec[0] < 2.5) analytic.push(rec);
+        }
+        const emitterCount = Math.min(GI_EMITTER_INJECT_CAP, emitters.length);
+        const analyticBudget = MAX_LIGHTS - emitterCount;
+        const selectedAnalytic = importanceRanked
+            ? selectGiLights(analytic, analyticBudget)
+            : analytic.slice(0, analyticBudget);
+        return {
+            records: selectedAnalytic.concat(emitters.slice(0, emitterCount)),
+            emitterBase: selectedAnalytic.length,
+            emitterCount,
+        };
+    }
+    function updateEmitterRegion(selection) {
+        giEmitterBase = selection.emitterBase;
+        giEmitterCount = selection.emitterCount;
+        U.emitterBase.value = giEmitterBase >>> 0;
+        U.emitterCount.value = giEmitterCount >>> 0;
+    }
+    function fillLegacyLightArena(records) {
+        const need = giLightDataCount();
+        const selection = selectGiLightRecords(records, false);
+        const selected = selection.records;
+        const count = selected.length;
+        const resized = !giLegacyLightArena || giLegacyLightArena.length !== need;
+        if (resized) giLegacyLightArena = new Float32Array(need);
+        let recordDataChanged = resized || count !== giLegacyLightCount;
+        if (!recordDataChanged) {
+            outer: for (let i = 0; i < count; i++) {
+                const rec = selected[i];
+                const base = i * _LIGHT_STRIDE;
+                for (let k = 0; k < _LIGHT_STRIDE; k++) {
+                    if (giLegacyLightArena[base + k] !== rec[k]) {
+                        recordDataChanged = true;
+                        break outer;
+                    }
+                }
+            }
+        }
+        giLegacyLightArena.fill(0);
+        for (let i = 0; i < count; i++) giLegacyLightArena.set(selected[i], i * _LIGHT_STRIDE);
+        giLegacyLightCount = count;
+        updateEmitterRegion(selection);
+        return { resized, recordDataChanged };
+    }
+    function fillGiLightArena(records) {
+        // Float32 represents every small cell count/index exactly. Packing the
+        // lists after the fixed record arena avoids a ninth storage binding.
+        const need = giLightDataCount() + c0LightCellCount() * GI_LIGHT_CELL_STRIDE;
+        const selection = selectGiLightRecords(records, true);
+        const selected = selection.records;
+        const resized = !giLightArena || giLightArena.length !== need;
+        if (resized) giLightArena = new Float32Array(need);
+        let recordDataChanged = resized || selected.length !== giSelectedCount;
+        if (!recordDataChanged) {
+            outer: for (let i = 0; i < selected.length; i++) {
+                const rec = selected[i];
+                const base = i * _LIGHT_STRIDE;
+                for (let k = 0; k < _LIGHT_STRIDE; k++) {
+                    if (giLightArena[base + k] !== rec[k]) {
+                        recordDataChanged = true;
+                        break outer;
+                    }
+                }
+            }
+        }
+        giLightArena.fill(0);
+        for (let i = 0; i < selected.length; i++) giLightArena.set(selected[i], i * _LIGHT_STRIDE);
+        giSelectedCount = selected.length;
+        updateEmitterRegion(selection);
+        return { resized, recordDataChanged };
+    }
+    // Build-snapshot records (stride slices of the packed buffer) — keeps the arena
+    // byte-consistent with the build without a second scene traverse.
+    function recordsFromBuilt(built) {
+        const n = built.lightCount | 0, out = [];
+        for (let i = 0; i < n; i++) out.push(built.lights.subarray(i * _LIGHT_STRIDE, (i + 1) * _LIGHT_STRIDE));
+        return out;
+    }
+    // Re-collect into the one fixed-capacity light buffer shared by both cascades.
+    // Count changes update the uniform and buffer in place; they never rebuild BVHs.
     function refreshLights() {
         if (!casc[0].gpu || !_collectLights) return;
         let records;
+        // No camera in this scope by design: the build path collects with
+        // camera = null too, so refresh and build stay filter-consistent.
         try { records = _collectLights(THREE, scene); } catch { return; }
-        if (records.length !== casc[0].gpu.lightCount) { requestRebuild(); return; }
+        liveLightRecords = records;
+        if (clusteredGi) {
+            // Fixed arena: count drift lands in the count uniform + an in-place
+            // refill — never a rebuild. U.lightCount is the SHARED uniform folded
+            // into both cascade blocks, so one write serves C0 and C1.
+            const previousArena = giLightArena;
+            fillGiLightArena(records);
+            if (previousArena !== giLightArena || lightResource?.array !== giLightArena) {
+                // This can only happen after a C0 grid-size change. Existing
+                // kernels cannot rebind a differently-sized storage attribute.
+                requestRebuild(false);
+                return;
+            }
+            U.lightCount.value = Math.min(MAX_LIGHTS, giSelectedCount) >>> 0;
+            for (const C of casc) {
+                const g = C.gpu; if (!g) continue;
+                g.lightCount = giSelectedCount;
+            }
+            markStorageDirty(lightResource.buffer, null);
+            giLightGridDirty = true;
+            return;
+        }
+        const previousArena = giLegacyLightArena;
+        fillLegacyLightArena(records);
+        if (previousArena !== giLegacyLightArena || lightResource?.array !== giLegacyLightArena) {
+            requestRebuild(false);
+            return;
+        }
+        U.lightCount.value = giLegacyLightCount >>> 0;
         for (const C of casc) {
             const g = C.gpu; if (!g) continue;
-            const arr = g.buffers.lights.array;
-            arr.fill(0);
-            for (let i = 0; i < records.length; i++) arr.set(records[i], i * _LIGHT_STRIDE);
-            g.buffers.lights.needsUpdate = true;
+            g.lightCount = giLegacyLightCount;
         }
+        markStorageDirty(lightResource.buffer, null);
     }
 
     function forceLightingRefresh() {
         scene.updateMatrixWorld?.(true);
         refreshLights();
-        lastLightSig = lightSignature();
+        lastLightSig = detectSceneChanges ? lightSignature() : null;
         touchGiUniforms();
     }
 
@@ -3058,30 +4508,53 @@ export function createProbeField({
     }
 
     function dispose() {
+        if (disposed) return;
         disposed = true;
+        if (_activeProbeFieldOwner === fieldOwner) _activeProbeFieldOwner = null;
         // Invalidates any build currently awaiting material texture extraction.
         // Its continuation observes disposed before publishing cachedBuilt or
         // allocating cascade resources and disposes its uninstalled maps.
         buildGeneration++;
         cachedBuilt?.disposeDeformUpdates?.();
         disposeGPU();
+        releaseLightResource(lightResource);
+        releaseSceneResource(sceneResource);
+        lightResource = null;
+        sceneResource = null;
+        liveLightRecords = null;
         cachedBuilt = null;
+        blasCache = null;
+        if (mapsArena) mapsArena.current = null;
+        mapsArena = null;
+        pendingTransformTargets.clear();
+        pendingAllTransforms = false;
+        pendingDeformRefresh = false;
+        pendingMaterialValueTargets.clear();
+        pendingAllMaterialValues = false;
         buildDirty = true;
         node.setEnabled(false);
+        // Old handles retain this node reference, so detach the module singleton.
+        // A later field receives a fresh node that a disposed handle cannot mutate.
+        if (_node === node) _node = null;
     }
 
-    return {
+    const api = {
         node,
         tick,
+        resetFramePacing,
         setEnabled,
         setIntensity: (v) => node.setIntensity(v),
         // Uniform/live. The structural atlas allocation is chosen once with
-        // createProbeField({ roughReflections }) to keep the disabled path zero-cost.
+        // createProbeField({ reflectionQuality }) to keep the disabled path zero-cost.
         setReflectionIntensity: (v) => node.setReflectionIntensity(v),
         getReflectionIntensity: () => node.reflectionIntensityNode.value,
+        setRoughnessLimit: (v) => node.setRoughnessLimit(v),
+        getRoughnessLimit: () => node.roughnessLimitNode.value,
         setReflectionSkyFallback,
         getReflectionSkyFallback: () => U.reflectionSkyFallback.value > 0.5,
         hasRoughReflections: () => roughReflectionsEnabled,
+        hasGlossyReflections: () => glossyReflectionsEnabled,
+        getReflectionQuality: () => reflectionConfig.name,
         setChebyStrength: (v) => node.setChebyStrength(v),
         setNormalDetail: (v) => node.setDetailStrength(v),  // GI normal-map detail on trusted materials (0 = smooth, 1 = full)
         setClassifyStrength: (v) => {
@@ -3111,20 +4584,51 @@ export function createProbeField({
             requestRebuild(false); // ray budget only → reuse cached BVH+textures (kernel rebuild, no MeshBVH stall)
         },
         getRays: () => raysPerProbe,
+        // ── STRUCTURAL knob: per-tick trace budget. More rays/tick = faster light
+        // propagation for more GPU; the cadence controller still shrinks the live
+        // budget on frame-time pressure, so pacing is protected at any target.
+        // Kernel rebuild only (scratch is budget-sized) — cached BVH soup reused.
+        // Note MAX_PROBES_PER_TICK (2048) still bounds probes/tick, so at low
+        // rays/probe a very high budget saturates early (e.g. 131k rays @64).
+        setRayBudget: (v) => {
+            if (!Number.isFinite(v)) return;
+            const budget = THREE.MathUtils.clamp(Math.round(v), RAYS_PER_TICK_MIN, 524_288);
+            if (budget === rayBudgetCeiling) return;
+            rayBudgetCeiling = budget;
+            tickBudgetRays = budget;   // take effect now; the throttle pulls back if the GPU can't
+            requestRebuild(false);
+        },
+        getRayBudget: () => rayBudgetCeiling,
         // ── UNIFORM knobs (apply INSTANTLY — no recompile, no rebuild). ──
         setFilterStrength: (v) => { if (Number.isFinite(v)) U.filterStrength.value = THREE.MathUtils.clamp(v, 0, 1); }, // CORE denoise: 0 = off (harness baseline), 1 = full
         setSmoothness: (v) => { if (Number.isFinite(v)) U.filterSmooth.value = THREE.MathUtils.clamp(v, 0, 1); }, // UI "Smoothness": widen the denoise edge-stop
         setHysteresis: (v) => {
             if (!Number.isFinite(v)) return;
             baseHysteresis = THREE.MathUtils.clamp(v, 0, 0.99); // steady-state temporal blend (higher = more stable/slower)
+            jitterHysteresis[jitterMode] = baseHysteresis;      // each sampling mode remembers its deliberate override
             U.hysteresis.value = baseHysteresis;                // apply now; tick() re-asserts it every solve
         },
+        getHysteresis: () => baseHysteresis,
         setHysteresisNormalization: (on) => {
             hysteresisNormalize = on !== false;
             U.hysteresis.value = baseHysteresis;
             if (!hysteresisNormalize) U.hysteresisExponent.value = 1;
         },
         getHysteresisNormalization: () => hysteresisNormalize,
+        // Ray-jitter regime: 'gated' (GATED BASIS, default) vs 'montecarlo'.
+        // Switching restores that mode's remembered hysteresis profile. Both
+        // writes are live uniforms/CPU state — instant, no recompile or rebuild.
+        setJitterMode: (mode) => {
+            const m = String(mode ?? '').toLowerCase().replace(/[\s_-]/g, '');
+            const nextMode = (m === 'gated' || m === 'gatedbasis') ? 'gated'
+                : (m === 'montecarlo' || m === 'mc') ? 'montecarlo' : null;
+            if (!nextMode || nextMode === jitterMode) return;
+            jitterHysteresis[jitterMode] = baseHysteresis;
+            jitterMode = nextMode;
+            baseHysteresis = jitterHysteresis[jitterMode];
+            U.hysteresis.value = baseHysteresis;
+        },
+        getJitterMode: () => jitterMode,
         setNormalBias: (v) => {
             if (!Number.isFinite(v)) return;
             normalBiasScale = THREE.MathUtils.clamp(v, 0, 8);   // × the auto minCell·SURFACE_NORMAL_BIAS_CELL offset
@@ -3198,7 +4702,14 @@ export function createProbeField({
         // heavy rebuilds still wait for rest, so the no-hitch guarantee holds). false = idle-gated.
         setContinuous: (on) => { continuous = on === true; },
         getContinuous: () => continuous,
+        setAutoDetectChanges: (on) => { detectSceneChanges = on !== false; },
+        getAutoDetectChanges: () => detectSceneChanges,
         requestRebuild,
+        markTransformsDirty,
+        markDeformsDirty,
+        markMaterialValuesDirty,
+        markTopologyDirty,
+        notifySceneChange,
         setBounds,
         setVolumes,
         isSupported,
@@ -3209,11 +4720,15 @@ export function createProbeField({
             probes: C.probeTotal, res: C.res.clone(), atlas: [C.atlasW, C.atlasH],
             rays: raysPerProbe, oct: OCT_RES, tile: TILE, active: node.active,
             roughReflections: roughReflectionsEnabled,
+            reflectionQuality: reflectionConfig.name,
+            roughnessLimit: node.roughnessLimitNode.value,
             roughSpecularPower: roughReflectionsEnabled ? ROUGH_SPECULAR_POWER : 0,
-            glossySpecularPower: roughReflectionsEnabled ? GLOSSY_SPECULAR_POWER : 0,
-            glossyOct: roughReflectionsEnabled ? GLOSSY_OCT_RES : 0,
-            glossyTile: roughReflectionsEnabled ? GLOSSY_TILE : 0,
-            glossyAtlas: roughReflectionsEnabled ? [C.glossyAtlasW, C.glossyAtlasH] : [0, 0],
+            glossySpecularPower: glossyReflectionsEnabled ? GLOSSY_SPECULAR_POWER : 0,
+            glossyOct: glossyReflectionsEnabled ? glossyOctRes : 0,
+            glossyTile: glossyReflectionsEnabled ? glossyTile : 0,
+            glossyUpdateInterval,
+            glossyProbeGather: glossyReflectionsEnabled ? 8 : 0,
+            glossyAtlas: glossyReflectionsEnabled ? [C.glossyAtlasW, C.glossyAtlasH] : [0, 0],
             cascades, cascade: ci, budgetRays: tickBudgetRays,
         }; },
         getResolution: (ci = 0) => (casc[ci] || casc[0]).res.clone(),
@@ -3225,9 +4740,11 @@ export function createProbeField({
         _debugDepthAtlas: (ci = 0) => casc[ci]?.gpu?.depthAtlas || null,
         _debugStateAtlas: (ci = 0) => casc[ci]?.gpu?.stateAtlas || null,
         _debugStateBuffer: (ci = 0) => casc[ci]?.gpu?.stateBuffer || null,
+        _debugBuffers: (ci = 0) => casc[ci]?.gpu?.buffers || null,
         _debugState: () => ({
             idleMs: lastIdleMs,
             moving: lastMoving,
+            playing: lastPlaying,
             restOnly: lastRestOnly,
             continuous,
             dirty,
@@ -3241,13 +4758,53 @@ export function createProbeField({
             hysteresisExponent: U.hysteresisExponent.value,
             frameJitter: U.frameJitter.value,
             frameCounter,
+            jitterMode,
+            jitterHysteresis: { ...jitterHysteresis },
             tickBudgetRays,
             tickDtEma,
+            sceneResourceRefs: sceneResource?.refs || 0,
+            sceneStorageGeneration: sceneResource?.storage?.generation || 0,
+            sceneStorageRebinds,
+            sceneStorageRewrites,
+            sceneStorageLastUpdate,
+            sceneStorageCapacities: sceneResource?.storage
+                ? { ...sceneResource.storage.capacities }
+                : null,
+            sceneStorageLiveLengths: sceneResource?.storage
+                ? { ...sceneResource.storage.liveLengths }
+                : null,
+            mapsArenaGeneration: mapsArena?.current?.generation || 0,
+            mapsArenaRebinds,
+            mapsArenaRewrites,
+            mapsArenaLastUpdate,
+            mapsArenaCapacities: mapsArena?.current
+                ? { ...mapsArena.current.capacities }
+                : null,
+            mapsArenaLiveLayers: mapsArena?.current
+                ? { ...mapsArena.current.liveLayers }
+                : null,
+            kernelResidentReuses,
+            kernelRebuilds,
+            lightResourceRefs: lightResource?.refs || 0,
+            sharedSceneBuffers: !!casc[0].gpu && !!casc[1].gpu
+                && PROBE_SCENE_BUFFER_KEYS.every((key) => casc[0].gpu.buffers[key] === casc[1].gpu.buffers[key]),
+            sharedLightBuffer: !!casc[0].gpu && !!casc[1].gpu
+                && casc[0].gpu.buffers.lights === casc[1].gpu.buffers.lights,
             hysteresisTickDtEma,
             budgetCooldown,
+            cadenceOverloadStreak,
             checkCounter,
             geoStable,
             lastRefitCount,
+            lastTransformInstanceCount,
+            lastTlasRefitCount,
+            blasCache: blasCache
+                ? { hits: blasCache.hits, misses: blasCache.misses, triangles: blasCache.triangles, entries: blasCache.map.size }
+                : null,
+            pendingTransformCount: pendingAllTransforms ? -1 : pendingTransformTargets.size,
+            pendingDeformRefresh,
+            pendingMaterialValueCount: pendingAllMaterialValues ? -1 : pendingMaterialValueTargets.size,
+            lastMaterialValueRecords,
             solveList: lastSolveList,
             updatedCount: lastUpdatedCount,
             cascades: cascades,
@@ -3257,8 +4814,6 @@ export function createProbeField({
                 solveDtEma: C.solveDtEma,
                 needsClear: C.needsClear,
                 needsClassify: C.needsClassify,
-                refreshStarted: C.refreshStarted,
-                ticksSinceRot: C.ticksSinceRot,
                 hasGpu: !!C.gpu,
                 minCell: C.minCell,
             })),
@@ -3278,6 +4833,8 @@ export function createProbeField({
         _debugLightCount: (ci = 0) => casc[ci]?.gpu?.lightCount,
         dispose,
     };
+    _activeProbeFieldOwner = fieldOwner;
+    return api;
 }
 
 export default createProbeField;

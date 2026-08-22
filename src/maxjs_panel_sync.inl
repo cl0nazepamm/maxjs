@@ -6486,6 +6486,12 @@
         appendComma();
         ss << L"\"name\":\"" << EscapeJson(node->GetName()) << L'"';
 
+        const std::wstring emitterClass = DetectLightEmitterClass(node);
+        if (!emitterClass.empty()) {
+            appendComma();
+            ss << L"\"emitterClass\":\"" << EscapeJson(emitterClass.c_str()) << L'"';
+        }
+
         appendComma();
         ss << L"\"type\":" << static_cast<int>(ltype);
         ss << L",\"pos\":[" << pos.x << L',' << pos.y << L',' << pos.z << L']';

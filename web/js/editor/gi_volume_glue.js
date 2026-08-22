@@ -94,6 +94,8 @@ function createGiVolumeGlue(deps = {}) {
         const GI_VOLUME_NATIVE_WAIT_MS = 160;
         let lightProbeSceneRevision = 0;
         let lightProbeGridActive = null;
+        let speedballLightingDirty = false;
+        let speedballLightingImmediate = false;
 
         const isAdvancedWebGpuLighting = deps.isStudioMode && deps.renderer.backend?.isWebGPUBackend === true;
         const isWebGpuBackend = deps.renderer.backend?.isWebGPUBackend === true;
@@ -331,12 +333,46 @@ function createGiVolumeGlue(deps = {}) {
 
         function markLightProbeLightsDirty() {
             lightProbeSceneRevision += 1;
+            markSpeedballLightsDirty();
             scheduleGiVolumeFromCurrentScene({
                 delay: deps.maxTimeline.playing() ? GI_VOLUME_PLAYBACK_DEBOUNCE_MS : GI_VOLUME_LIGHT_DEBOUNCE_MS,
                 refresh: false,
                 lightRefresh: true,
                 reason: 'lights',
             });
+        }
+
+        // max.js already receives authoritative scene deltas from the host. Feed
+        // those exact edits to Speedball so its compatibility scene scanners can
+        // stay off. The field coalesces transform/material/deform packets itself;
+        // lights are additionally coalesced here because refreshing their packed
+        // arena updates world matrices and must not run inside a raw host callback.
+        function markSpeedballTransformsDirty(targets = null) {
+            deps.speedballGi?.field?.markTransformsDirty?.(targets);
+        }
+
+        function markSpeedballDeformsDirty() {
+            deps.speedballGi?.field?.markDeformsDirty?.();
+        }
+
+        function markSpeedballMaterialsDirty(targets = null) {
+            deps.speedballGi?.field?.markMaterialValuesDirty?.(targets);
+        }
+
+        function markSpeedballTopologyDirty() {
+            deps.speedballGi?.field?.markTopologyDirty?.();
+        }
+
+        function markSpeedballLightsDirty({ defer = false } = {}) {
+            speedballLightingDirty = true;
+            if (!defer) speedballLightingImmediate = true;
+        }
+
+        function flushSpeedballLightingDirty(field, { allowDeferred = false } = {}) {
+            if (!speedballLightingDirty || !field || (!speedballLightingImmediate && !allowDeferred)) return;
+            speedballLightingDirty = false;
+            speedballLightingImmediate = false;
+            field.forceLightingRefresh?.();
         }
 
         // THE global recompile hammer: needsUpdate on every scene material
@@ -353,7 +389,6 @@ function createGiVolumeGlue(deps = {}) {
                 if (!material || seen.has(material)) return;
                 seen.add(material);
                 if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
-                if (material.visible === false) return;
                 material.needsUpdate = true;
             };
             deps.scene.traverse((object) => {
@@ -748,10 +783,11 @@ function createGiVolumeGlue(deps = {}) {
         }
 
         function noteGiVolumeCameraSync(cam) {
-            if (!deps.giVolume || !deps.giVolume.isSupported?.() || !deps.giVolume.hasData?.()) return;
             const signature = giVolumeCameraSignature(cam);
             if (!signature || signature === giVolumeLastCameraSignature) return;
             giVolumeLastCameraSignature = signature;
+            deps.speedballGiLastInteractionMs = performance.now();
+            if (!deps.giVolume || !deps.giVolume.isSupported?.() || !deps.giVolume.hasData?.()) return;
             scheduleGiVolumeFromCurrentScene({
                 delay: GI_VOLUME_CAMERA_DEBOUNCE_MS,
                 refresh: false,
@@ -997,6 +1033,22 @@ function createGiVolumeGlue(deps = {}) {
                 let speedballField = null;
                 let speedballSkyInput = null;
                 let speedballSkyIntensity = 2.0;
+                let speedballTickFailureWarned = false;
+                let speedballDrawingWidth = -1;
+                let speedballDrawingHeight = -1;
+                const speedballDrawingSize = new THREE.Vector2();
+                const syncSpeedballPresentationSize = () => {
+                    if (typeof deps.renderer.getDrawingBufferSize !== 'function') return;
+                    deps.renderer.getDrawingBufferSize(speedballDrawingSize);
+                    const width = Math.round(speedballDrawingSize.x);
+                    const height = Math.round(speedballDrawingSize.y);
+                    if (speedballDrawingWidth >= 0
+                        && (width !== speedballDrawingWidth || height !== speedballDrawingHeight)) {
+                        speedballField?.resetFramePacing?.();
+                    }
+                    speedballDrawingWidth = width;
+                    speedballDrawingHeight = height;
+                };
                 const syncSpeedballSkyState = () => {
                     speedballField?.setSky?.(speedballSkyInput);
                     speedballField?.setSkyIntensity?.(speedballSkyIntensity);
@@ -1010,6 +1062,7 @@ function createGiVolumeGlue(deps = {}) {
                 const createConfiguredSpeedballField = () => createSpeedballProbeField({
                     renderer: deps.renderer,
                     scene: deps.scene,
+                    autoDetectChanges: false,
                     intensity: speedballGiSettings.intensity,
                     hysteresis: speedballGiSettings.hysteresis,
                     divisions: speedballGiSettings.divisions,
@@ -1111,6 +1164,11 @@ function createGiVolumeGlue(deps = {}) {
                     setBounds: (box) => speedballField?.setBounds?.(box),     // single Probe Origin box; null = auto-fit
                     setVolumes: (boxes) => speedballField?.setVolumes?.(boxes), // multiple Probe Origin boxes (unioned for now)
                     getStats: () => speedballField?.getStats?.() ?? { active: false, available: false },
+                    markTransformsDirty: markSpeedballTransformsDirty,
+                    markDeformsDirty: markSpeedballDeformsDirty,
+                    markMaterialsDirty: markSpeedballMaterialsDirty,
+                    markTopologyDirty: markSpeedballTopologyDirty,
+                    markLightsDirty: markSpeedballLightsDirty,
                     tick(nowMs) {
                         if (!speedballOn || deps.isPathTracingMode || !speedballField?.isSupported?.()) return;
                         // Tick EVERY frame, exactly like the speedball standalone — the
@@ -1123,12 +1181,22 @@ function createGiVolumeGlue(deps = {}) {
                         const timelineIdleMs = Number.isFinite(timelineUpdateMs) && timelineUpdateMs > 0
                             ? nowMs - timelineUpdateMs
                             : Infinity;
+                        const playing = !!deps.maxTimeline?.playing?.();
+                        const idleMs = Math.min(nowMs - deps.speedballGiLastInteractionMs, timelineIdleMs);
+                        syncSpeedballPresentationSize();
+                        flushSpeedballLightingDirty(speedballField, {
+                            allowDeferred: !playing && idleMs >= 200,
+                        });
                         void speedballField.tick({
                             // Scrub/step/stop are interactions too. Using the
                             // newest camera OR timeline activity keeps scene
                             // scans/refits out of the input callback tail.
-                            idleMs: Math.min(nowMs - deps.speedballGiLastInteractionMs, timelineIdleMs),
-                            playing: !!deps.maxTimeline?.playing?.(),
+                            idleMs,
+                            playing,
+                        }).catch((error) => {
+                            if (speedballTickFailureWarned) return;
+                            speedballTickFailureWarned = true;
+                            deps.maxjsDebugWarn?.('max.js Speedball GI update failed:', error);
                         });
                     },
                 };
@@ -1235,6 +1303,11 @@ function createGiVolumeGlue(deps = {}) {
             markLightProbeSceneDirty,
             markLightProbeLightsDirty,
             markLightProbeMaterialsDirty,
+            markSpeedballTransformsDirty,
+            markSpeedballDeformsDirty,
+            markSpeedballMaterialsDirty,
+            markSpeedballTopologyDirty,
+            markSpeedballLightsDirty,
             currentLightProbeSceneSignature,
             updateLightProbeGridFromScene,
             giVolumeNowMs,

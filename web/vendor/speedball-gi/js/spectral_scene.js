@@ -25,7 +25,9 @@
 import { MeshBVH } from 'three-mesh-bvh';
 import {
     createFlatBlasRefitStepper,
+    createFlatTlasRefitIndex,
     refitFlatBlasRange,
+    refitFlatTlasDirty,
     refitFlatTlasRange,
     runLatestBudgetedTask,
 } from './gi_refit.js';
@@ -42,13 +44,24 @@ const NODE_STRIDE_U32 = 8;     // bvhNodes: 6 aabb floats + miss + payload
 //   [24] alpha-map layer
 //   [25] nirAlbedo: −1 = untagged (kernel uses JH extrapolation as prior),
 //        else authored [0,1] NIR reflectance (userData.nirAlbedo wins over
-//        the classifyNir heuristics) · [26..27] pad
+//        the classifyNir heuristics) · [26] traversal flags · [27] pad
 const MAT_STRIDE = 28;
+const MAT_FLAG_ALPHA_TEXTURE = 1; // alpha acceptance requires UV/map sampling
+const MAT_FLAG_ALPHA_ACCEPT = 2;  // constant alpha path is guaranteed accepted
+const MAT_FLAG_SHADOW_BLOCK = 4;  // transmission < 0.5 (matches traverseAny)
 const LIGHT_STRIDE = 17;        // lights: see layout below
 const VERT_STRIDE = 3;          // vertexPos: tightly packed xyz (flat f32 storage, read by offset; also fed to MeshBVH which assumes stride 3)
 const VERTEX_DATA_STRIDE = 8;   // GPU interleaved per-vertex: pos(3) + normal(3) + uv(2)
 const BYTES_PER_BVH_NODE = 32;  // three-mesh-bvh BYTES_PER_NODE (8 x u32)
 const TEXTURE_ATLAS_SIZE = 256; // every material map is resampled to this square size and stacked into a DataArrayTexture layer
+const MATERIAL_MAP_TYPES = [
+    { field: 'map', recIdx: 12, out: 'albedo' },
+    { field: 'normalMap', recIdx: 13, out: 'normal' },
+    { field: 'roughnessMap', recIdx: 14, out: 'roughness' },
+    { field: 'metalnessMap', recIdx: 15, out: 'metalness' },
+    { field: 'emissiveMap', recIdx: 16, out: 'emissive' },
+    { field: 'alphaMap', recIdx: 24, out: 'alpha' },
+];
 const SKIP_TRIANGLE_MATERIAL = 0xFFFFFFFF;
 // Keep only genuinely tiny edits synchronous. A few thousand gathered/refit
 // items stay below one frame slice even on slower hosts; anything larger
@@ -158,7 +171,7 @@ function giColorHint(v) {
     return null;
 }
 
-function emissiveScaled(material, out) {
+export function emissiveScaled(material, out) {
     // Node-driven emissive (emissiveNode) is invisible to the packer; an explicit
     // userData.giEmissive hint (absolute linear energy, NOT scaled by
     // emissiveIntensity) is the only way to feed it to the trace.
@@ -265,6 +278,16 @@ function materialToUber(material) {
         ? Math.min(1, Math.max(0, udNir))
         : classifyNir(material.name, r, g, b, roughnessC, metalnessC, transmissionC);
 
+    // Traversal classification is packed once instead of rediscovered for
+    // every candidate triangle. A bound color/alpha map stays on the exact
+    // texture path; otherwise scalar alpha acceptance is a build-time fact.
+    const hasAlphaTexture = !!(material.map || material.alphaMap);
+    const constantAlphaAccepted = opacity > 1.0e-4
+        && (alphaTest <= 0 || opacity >= alphaTest);
+    const traversalFlags = (hasAlphaTexture ? MAT_FLAG_ALPHA_TEXTURE : 0)
+        | (!hasAlphaTexture && constantAlphaAccepted ? MAT_FLAG_ALPHA_ACCEPT : 0)
+        | (transmissionC < 0.5 ? MAT_FLAG_SHADOW_BLOCK : 0);
+
     return [r, g, b,
         Math.min(1, Math.max(0, roughness)), // 0 = delta mirror, legal
         Math.min(1, Math.max(0, metalness)),
@@ -280,7 +303,7 @@ function materialToUber(material) {
         Math.min(1, Math.max(0, alphaTest)),
         -1,                     // [24] alpha-map layer, filled by buildMaterialTextures
         nirAlbedo,              // [25] NIR reflectance (−1 = JH prior)
-        0, 0];                  // [26..27] pad
+        traversalFlags, 0];     // [26] traversal flags, [27] pad
 }
 
 const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
@@ -288,13 +311,15 @@ const texUuid = (t) => (t && t.isTexture ? t.uuid : '-');
 // Materials sharing scalar params but differing in any bound map must NOT
 // collapse to one uber index, else they'd share a texture layer. Fold the map
 // identities into the dedup key.
+function materialMapTail(material) {
+    return texUuid(material.map) + '|' + texUuid(material.normalMap) + '|'
+        + texUuid(material.roughnessMap) + '|' + texUuid(material.metalnessMap)
+        + '|' + texUuid(material.emissiveMap) + '|' + texUuid(material.alphaMap);
+}
 function uberKey(rec, material) {
     let k = '';
     for (let i = 0; i < MAT_STRIDE; i++) k += Math.round(rec[i] * 1000) + ':';
-    k += texUuid(material.map) + '|' + texUuid(material.normalMap) + '|'
-        + texUuid(material.roughnessMap) + '|' + texUuid(material.metalnessMap)
-        + '|' + texUuid(material.emissiveMap) + '|' + texUuid(material.alphaMap);
-    return k;
+    return k + materialMapTail(material);
 }
 
 // ── Material map extraction ────────────────────────────────────────
@@ -353,24 +378,147 @@ function extractTextureRGBA(tex, size) {
     return new Uint8Array(pixels);
 }
 
-// Walk every uber material, extract each map type, build the DataArrayTextures,
-// and write the assigned layer index back into each uber record. Returns
-// { albedo, normal, roughness, metalness, emissive, alpha } (DataArrayTexture | null).
-async function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
-    const TYPES = [
-        { field: 'map', recIdx: 12, out: 'albedo' },
-        { field: 'normalMap', recIdx: 13, out: 'normal' },
-        { field: 'roughnessMap', recIdx: 14, out: 'roughness' },
-        { field: 'metalnessMap', recIdx: 15, out: 'metalness' },
-        { field: 'emissiveMap', recIdx: 16, out: 'emissive' },
-        { field: 'alphaMap', recIdx: 24, out: 'alpha' },
-    ];
-    const layerBytes = size * size * 4;
-    const result = { albedo: null, normal: null, roughness: null, metalness: null, emissive: null, alpha: null };
+function emptyMaterialMaps() {
+    const maps = {};
+    for (const ty of MATERIAL_MAP_TYPES) maps[ty.out] = null;
+    return maps;
+}
 
-    for (const ty of TYPES) {
+function configureMaterialArrayTexture(THREE, texture) {
+    texture.format = THREE.RGBAFormat;
+    texture.type = THREE.UnsignedByteType;
+    texture.minFilter = THREE.LinearFilter;
+    texture.magFilter = THREE.LinearFilter;
+    texture.wrapS = THREE.RepeatWrapping;   // honour uv repeat > 1
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.colorSpace = THREE.NoColorSpace; // raw bytes; kernel decodes sRGB
+    texture.generateMipmaps = false;
+    texture.needsUpdate = true;
+    return texture;
+}
+
+function materialMapCapacity(required, previous, growth, maxLayers) {
+    const live = Math.max(0, Math.floor(Number(required) || 0));
+    const prior = Math.max(0, Math.floor(Number(previous) || 0));
+    if (live === 0 && prior === 0) return 0;
+    const factor = Number.isFinite(growth) && growth > 1 ? growth : 1.5;
+    const target = Math.max(
+        live,
+        live > 0 ? Math.ceil(live * factor) : 0,
+        prior > 0 ? Math.ceil(prior * factor) : 0,
+    );
+    const limit = Math.max(1, Math.floor(Number(maxLayers) || 256));
+    // Preserve the previous fail-loud behavior when the live scene itself is
+    // beyond the device limit; otherwise use all available geometric headroom.
+    return limit >= live ? Math.min(target, limit) : live;
+}
+
+function materialMapsConfigCompatible(generation, size, format, type) {
+    if (!generation || generation.disposed
+        || generation.width !== size || generation.height !== size
+        || generation.format !== format || generation.type !== type) return false;
+    return MATERIAL_MAP_TYPES.every(({ out }) => {
+        const capacity = generation.capacities?.[out] || 0;
+        const texture = generation.textures?.[out] || null;
+        if (capacity === 0) return texture === null;
+        return !!texture
+            && texture.image?.width === size
+            && texture.image?.height === size
+            && texture.image?.depth === capacity
+            && texture.format === format
+            && texture.type === type;
+    });
+}
+
+function materialMapsGenerationFits(generation, liveLayers, size, format, type) {
+    return materialMapsConfigCompatible(generation, size, format, type)
+        && MATERIAL_MAP_TYPES.every(({ out }) => liveLayers[out] <= generation.capacities[out]);
+}
+
+function materialMapLayerEquals(texture, layer, data, layerBytes) {
+    const resident = texture?.image?.data;
+    const start = layer * layerBytes;
+    if (!resident || !data || start + layerBytes > resident.length || data.length !== layerBytes) return false;
+    for (let i = 0; i < layerBytes; i++) {
+        if (resident[start + i] !== data[i]) return false;
+    }
+    return true;
+}
+
+function createMaterialMapsGeneration(
+    THREE,
+    packedLayers,
+    liveLayers,
+    size,
+    mapsArena,
+    previous,
+    capacityOverrides = null,
+) {
+    const textures = emptyMaterialMaps();
+    const capacities = {};
+    const layerBytes = size * size * 4;
+    for (const { out } of MATERIAL_MAP_TYPES) {
+        const live = liveLayers[out];
+        const capacity = capacityOverrides
+            ? Math.max(live, capacityOverrides[out] || 0)
+            : materialMapCapacity(
+                live,
+                previous?.capacities?.[out],
+                mapsArena.growth,
+                mapsArena.maxLayers,
+            );
+        capacities[out] = capacity;
+        if (capacity === 0) continue;
+        const packed = packedLayers[out];
+        const data = capacity === live && packed
+            ? packed
+            : new Uint8Array(layerBytes * capacity);
+        if (packed && data !== packed) data.set(packed, 0);
+        textures[out] = configureMaterialArrayTexture(
+            THREE,
+            new THREE.DataArrayTexture(data, size, size, capacity),
+        );
+    }
+    return {
+        refs: 0,
+        disposed: false,
+        generation: ++mapsArena.nextGeneration,
+        width: size,
+        height: size,
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        textures,
+        capacities,
+        liveLayers: { ...liveLayers },
+    };
+}
+
+// Walk every uber material, extract each map type, and write the assigned layer
+// index back into each uber record. Without an arena this preserves the public
+// spectral-tracer behavior and allocates exact-size DataArrayTextures. With an
+// arena, extraction remains a CPU staging operation: an accepted probe build
+// commits the staged live layers later, at the same boundary as its resident
+// material-buffer rewrite. This prevents an async/stale build from changing the
+// textures still sampled by the live kernels.
+async function buildMaterialTextures(THREE, uberList, uberMaterials, size, mapsArena = null) {
+    const layerBytes = size * size * 4;
+    const packedLayers = {};
+    const liveLayers = {};
+    const changedLayers = {};
+    const comparisonGeneration = mapsArena
+        && materialMapsConfigCompatible(
+            mapsArena.current,
+            size,
+            THREE.RGBAFormat,
+            THREE.UnsignedByteType,
+        )
+        ? mapsArena.current
+        : null;
+
+    for (const ty of MATERIAL_MAP_TYPES) {
         const layers = [];
         const byUuid = new Map();
+        changedLayers[ty.out] = [];
         for (let i = 0; i < uberList.length; i++) {
             const tex = uberMaterials[i]?.[ty.field];
             if (!tex || !tex.isTexture) continue;
@@ -387,26 +535,108 @@ async function buildMaterialTextures(THREE, uberList, uberMaterials, size) {
                 if (!data) continue; // unreadable → leave record layer at −1
                 layer = layers.length;
                 layers.push(data);
+                if (!materialMapLayerEquals(
+                    comparisonGeneration?.textures?.[ty.out], layer, data, layerBytes,
+                )) {
+                    changedLayers[ty.out].push(layer);
+                }
                 byUuid.set(tex.uuid, layer);
             }
             uberList[i][ty.recIdx] = layer;
         }
-        if (layers.length === 0) continue;
+        liveLayers[ty.out] = layers.length;
+        if (layers.length === 0) {
+            packedLayers[ty.out] = null;
+            continue;
+        }
         const merged = new Uint8Array(layerBytes * layers.length);
         for (let l = 0; l < layers.length; l++) merged.set(layers[l], l * layerBytes);
-        const arr = new THREE.DataArrayTexture(merged, size, size, layers.length);
-        arr.format = THREE.RGBAFormat;
-        arr.type = THREE.UnsignedByteType;
-        arr.minFilter = THREE.LinearFilter;
-        arr.magFilter = THREE.LinearFilter;
-        arr.wrapS = THREE.RepeatWrapping;   // honour uv repeat > 1
-        arr.wrapT = THREE.RepeatWrapping;
-        arr.colorSpace = THREE.NoColorSpace; // raw bytes; kernel decodes sRGB
-        arr.generateMipmaps = false;
-        arr.needsUpdate = true;
-        result[ty.out] = arr;
+        packedLayers[ty.out] = merged;
     }
-    return result;
+
+    if (!mapsArena) {
+        const maps = emptyMaterialMaps();
+        for (const { out } of MATERIAL_MAP_TYPES) {
+            const live = liveLayers[out];
+            if (live === 0) continue;
+            maps[out] = configureMaterialArrayTexture(
+                THREE,
+                new THREE.DataArrayTexture(packedLayers[out], size, size, live),
+            );
+        }
+        return { maps, mapsArenaGeneration: null, mapsArenaPlan: null };
+    }
+
+    const previous = mapsArena.current || null;
+    const format = THREE.RGBAFormat;
+    const type = THREE.UnsignedByteType;
+    if (materialMapsGenerationFits(previous, liveLayers, size, format, type)) {
+        return {
+            maps: previous.textures,
+            mapsArenaGeneration: previous,
+            mapsArenaPlan: {
+                kind: 'rewrite',
+                generation: previous,
+                packedLayers,
+                liveLayers,
+                changedLayers,
+                committed: false,
+            },
+        };
+    }
+
+    const hasAnyResidentLayer = MATERIAL_MAP_TYPES.some(({ out }) =>
+        liveLayers[out] > 0 || (previous?.capacities?.[out] || 0) > 0);
+    if (!hasAnyResidentLayer) {
+        return { maps: emptyMaterialMaps(), mapsArenaGeneration: null, mapsArenaPlan: null };
+    }
+
+    const configCompatible = materialMapsConfigCompatible(previous, size, format, type);
+    const generation = createMaterialMapsGeneration(
+        THREE, packedLayers, liveLayers, size, mapsArena, previous,
+    );
+    return {
+        maps: generation.textures,
+        mapsArenaGeneration: generation,
+        mapsArenaPlan: {
+            kind: previous ? (configCompatible ? 'grow' : 'reconfigure') : 'allocate',
+            generation,
+            packedLayers: null, // already copied into the fresh resident arrays
+            liveLayers,
+            committed: false,
+        },
+    };
+}
+
+// If the scene-storage arena must grow while maps themselves still fit, the
+// old staggered cascade needs an immutable map snapshot matching its old
+// material records. Fork the staged rewrite into a fresh texture generation
+// with the same capacities; the caller then rebinds scene storage and maps as
+// one coherent generation. This is the rare storage-growth fallback only.
+export function rebindMaterialMapsArenaBuild(THREE, built, mapsArena) {
+    const plan = built?.mapsArenaPlan;
+    const previous = built?.mapsArenaGeneration;
+    if (!mapsArena || !plan || plan.committed || plan.kind !== 'rewrite' || !previous) return false;
+    const generation = createMaterialMapsGeneration(
+        THREE,
+        plan.packedLayers,
+        plan.liveLayers,
+        previous.width,
+        mapsArena,
+        previous,
+        previous.capacities,
+    );
+    built.maps = generation.textures;
+    built.mapsArenaGeneration = generation;
+    built.mapsArenaPlan = {
+        kind: 'scene-rebind',
+        generation,
+        packedLayers: null,
+        liveLayers: plan.liveLayers,
+        changedLayers: null,
+        committed: false,
+    };
+    return true;
 }
 
 // ── Threaded (stackless) BVH re-flatten ────────────────────────────
@@ -491,7 +721,7 @@ function flattenBVHRoot(rootBuffer, expectedTriCount) {
 }
 
 // ── Light extraction ───────────────────────────────────────────────
-// Layout (stride 17 floats): [0] type(0 dir/1 point/2 spot/3 rect),
+// Layout (stride 17 floats): [0] type(0 dir/1 point/2 spot/3 emissive sphere),
 // [1..3] worldPos, [4..6] worldDir (toward target), [7..9] color*intensity,
 // [10] range, [11] decay, [12] cosAngle, [13] cosPenumbra, [14] w, [15] h,
 // [16] emitter class (packed): 0 untagged (JH emission), 2 LED,
@@ -582,6 +812,71 @@ export function collectLights(THREE, scene, camera = null) {
     return out;
 }
 
+export function collectEmitterRecords(THREE, scene, camera = null) {
+    const out = [];
+    const a = new THREE.Vector3();
+    const b = new THREE.Vector3();
+    const c = new THREE.Vector3();
+    const ab = new THREE.Vector3();
+    const ac = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    const scale = new THREE.Vector3();
+    scene.traverseVisible((obj) => {
+        if (obj.userData?.giEmitter !== true || !isTraceableMesh(obj, camera)) return;
+        const material = meshMaterials(obj)[0] || null;
+        if (!materialIsRenderable(material)) return;
+        const em = emissiveScaled(material, [0, 0, 0]);
+        if (Math.max(em[0], em[1], em[2]) <= 0) return;
+
+        const geom = obj.geometry;
+        if (!geom.boundingSphere) {
+            try { geom.computeBoundingSphere(); } catch { return; }
+        }
+        const sphere = geom.boundingSphere;
+        if (!sphere || !Number.isFinite(sphere.radius)) return;
+        obj.updateWorldMatrix(true, false);
+
+        const pos = geom.attributes.position;
+        const index = geom.index;
+        const count = index ? index.count : pos.count;
+        let area = 0;
+        for (let i = 0; i + 2 < count; i += 3) {
+            const ia = index ? index.getX(i) : i;
+            const ib = index ? index.getX(i + 1) : i + 1;
+            const ic = index ? index.getX(i + 2) : i + 2;
+            if (ia < 0 || ib < 0 || ic < 0 || ia >= pos.count || ib >= pos.count || ic >= pos.count) continue;
+            a.fromBufferAttribute(pos, ia).applyMatrix4(obj.matrixWorld);
+            b.fromBufferAttribute(pos, ib).applyMatrix4(obj.matrixWorld);
+            c.fromBufferAttribute(pos, ic).applyMatrix4(obj.matrixWorld);
+            area += ab.subVectors(b, a).cross(ac.subVectors(c, a)).length() * 0.5;
+        }
+        if (!(area > 0) || !Number.isFinite(area)) return;
+
+        center.copy(sphere.center).applyMatrix4(obj.matrixWorld);
+        obj.getWorldScale(scale);
+        const radius = sphere.radius * Math.max(Math.abs(scale.x), Math.abs(scale.y), Math.abs(scale.z));
+        if (!Number.isFinite(radius)) return;
+        const emitterScale = Number.isFinite(obj.userData?.giEmitterScale) ? obj.userData.giEmitterScale : 1;
+        // Color slots carry SURFACE RADIANCE (what a discovery ray returns on
+        // hit) — the probe-injection expectation rule multiplies by solid angle
+        // itself, so folding area in here would double-count it. The Cauchy
+        // projected-area term A/4 rides in the otherwise-unused slot 15: the
+        // kernel forms Omega = min(2*pi, (A/4)/d^2), which matches the sphere
+        // solid angle in the far field but stays honest for long thin emitters
+        // whose bounding sphere swallows half the room. Influence range stays
+        // POWER-based (radiance x A/4).
+        const cr = em[0] * emitterScale;
+        const cg = em[1] * emitterScale;
+        const cb = em[2] * emitterScale;
+        if (!Number.isFinite(cr) || !Number.isFinite(cg) || !Number.isFinite(cb)) return;
+        const projArea = area / 4;
+        const range = Math.sqrt(Math.max(0, cr, cg, cb) * projArea / 0.005);
+        if (!Number.isFinite(range) || !Number.isFinite(projArea)) return;
+        out.push([3, center.x, center.y, center.z, 0, 0, -1, cr, cg, cb, range, 2, -1, -1, radius, projArea, 0]);
+    });
+    return out;
+}
+
 // ── Main build ─────────────────────────────────────────────────────
 // TWO-LEVEL layout:
 //   • one BLAS per unique (geometry × per-tri material mapping), built in
@@ -653,9 +948,12 @@ function buildLocalBlas(THREE, d) {
     geometry.setAttribute('position', new THREE.BufferAttribute(vertexPos, VERT_STRIDE));
     geometry.setIndex(new THREE.BufferAttribute(triIndex, 1));
     geometry.clearGroups();
-    geometry.computeBoundingBox();
+    const bvh = new MeshBVH(geometry, { targetLeafSize: 8, indirect: false });
+    // MeshBVH writes geometry.boundingBox during the build (setBoundingBox
+    // default) from the indexed triangles only — unlike computeBoundingBox,
+    // which also scanned the zero-filled slots of skipped triangles and could
+    // wrongly pull the bounds toward the origin.
     const localBounds = geometry.boundingBox ? geometry.boundingBox.clone() : new THREE.Box3();
-    const bvh = new MeshBVH(geometry, { maxLeafSize: 8, indirect: false });
     const roots = bvh._roots;
     geometry.dispose?.();
     if (!Array.isArray(roots) || roots.length === 0) return null;
@@ -704,23 +1002,70 @@ function buildTlasRecords(aabbs, leafSize = 2) {
     return { records, order };
 }
 
-export async function buildSpectralScene({ THREE, scene, camera = null, maxTriangles = 4_000_000 } = {}) {
+// ── Cross-rebuild BLAS cache ────────────────────────────────────────────────
+// A structural rebuild used to rebuild EVERY BLAS in the scene; with a cache
+// installed a topology change pays only for the geometries it actually
+// changed. Entries are keyed by the same structural fingerprint as the
+// in-build dedup (geometry identity × attribute identity/version × per-tri
+// uber mapping), so any content change misses. The cached core is immutable
+// build output — records, soup slices, BVH-ordered materials — and every
+// build works on a shallow clone (see the reuse site), so per-build pool
+// offsets stamped by a newer build can never corrupt an older build that is
+// still draining async work against its own pool. Capacity is bounded by
+// total cached triangles, evicted least-recently-used first.
+export function createBlasCache({ maxTriangles = 2_000_000 } = {}) {
+    return { map: new Map(), maxTriangles, triangles: 0, hits: 0, misses: 0 };
+}
+
+let nextAttrId = 1;
+const attrIds = new WeakMap();
+// Attribute OBJECT identity for cache keys: a replaced attribute restarts its
+// version counter at 0, so version alone would false-hit across the swap.
+function attrIdentity(attr) {
+    if (!attr) return 0;
+    let id = attrIds.get(attr);
+    if (id === undefined) { id = nextAttrId++; attrIds.set(attr, id); }
+    return id;
+}
+
+export async function buildSpectralScene({
+    THREE,
+    scene,
+    camera = null,
+    maxTriangles = 4_000_000,
+    blasCache = null,
+    mapsArena = null,
+} = {}) {
     if (!scene) return null;
     scene.updateMatrixWorld(true);
 
     const uberList = [];
     const uberMaterials = []; // parallel to uberList: source THREE material (for map extraction)
+    const uberSharers = [];   // parallel: EVERY distinct material folded into the record by
+    const uberMapTails = [];  // dedup, and the map-identity tail the record was keyed with —
+                              // both feed updateMaterialValues' fail-closed drift checks.
+    const uberZeroEmissive = [];
     const uberMap = new Map();
-    function internMaterial(material) {
+    function internMaterial(material, zeroEmissive = false) {
         const mat = material || {};
         const rec = materialToUber(mat);
-        const key = uberKey(rec, mat);
+        if (zeroEmissive) {
+            // Tier-1 limitation: probe-space glossy reflections lose this self-glow;
+            // the raster still draws the emitter while NEE owns its traced direct light.
+            rec[7] = 0; rec[8] = 0; rec[9] = 0;
+        }
+        const key = uberKey(rec, mat) + (zeroEmissive ? ':E0' : '');
         let idx = uberMap.get(key);
         if (idx === undefined) {
             idx = uberList.length;
             uberList.push(rec);
             uberMaterials.push(mat);
+            uberSharers.push([mat]);
+            uberMapTails.push(materialMapTail(mat));
+            uberZeroEmissive.push(zeroEmissive);
             uberMap.set(key, idx);
+        } else if (!uberSharers[idx].includes(mat)) {
+            uberSharers[idx].push(mat);
         }
         return idx;
     }
@@ -739,12 +1084,24 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         if (triCount <= 0) return;
 
         const mats = meshMaterials(obj);
+        const zeroEmissive = obj.userData?.giEmitter === true;
         const { triMat, visibleTriCount, visibleTriIndices } =
-            buildTriangleMaterialMap(geom, mats, triCount, internMaterial, Array.isArray(obj.material));
+            buildTriangleMaterialMap(
+                geom, mats, triCount,
+                (material) => internMaterial(material, zeroEmissive),
+                Array.isArray(obj.material),
+            );
         if (visibleTriCount <= 0) return;
 
         const uniqueTriMaterial = Array.isArray(obj.material);
-        let key = `${geom.uuid}:${index ? index.version : -1}:${pos.version}:${uniqueTriMaterial ? 1 : 0}`;
+        const normalAttr = geom.attributes.normal || null;
+        // Doubles as the cross-rebuild cache key: attribute identities catch
+        // swapped-in attributes whose fresh version counters would collide,
+        // and the normal fingerprint keeps cached soup normals honest.
+        let key = `${geom.uuid}:${attrIdentity(index)}.${index ? index.version : -1}`
+            + `:${attrIdentity(pos)}.${pos.version}.${attributeDataVersion(pos)}`
+            + `:${attrIdentity(normalAttr)}.${normalAttr ? normalAttr.version : -1}.${attributeDataVersion(normalAttr)}`
+            + `:${uniqueTriMaterial ? 1 : 0}`;
         if (uniqueTriMaterial) {
             let h = 0;
             for (let t = 0; t < triCount; t++) h = ((h * 31) + triMat[t] + 1) >>> 0;
@@ -755,12 +1112,34 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
 
         let blasIdx = blasByKey.get(key);
         if (blasIdx === undefined) {
-            const blas = buildLocalBlas(THREE, {
-                pos, index, triCount, visibleTriCount, visibleTriIndices, triMat, uniqueTriMaterial,
-                normal: geom.attributes.normal || null,
-                uv: geom.attributes.uv || null,
-            });
-            if (!blas) return;
+            let core = blasCache ? blasCache.map.get(key) : undefined;
+            if (core) {
+                blasCache.hits++;
+                blasCache.map.delete(key);   // LRU touch: re-insert as newest
+                blasCache.map.set(key, core);
+            } else {
+                core = buildLocalBlas(THREE, {
+                    pos, index, triCount, visibleTriCount, visibleTriIndices, triMat, uniqueTriMaterial,
+                    normal: normalAttr,
+                    uv: geom.attributes.uv || null,
+                });
+                if (!core) return;
+                if (blasCache) {
+                    blasCache.misses++;
+                    blasCache.map.set(key, core);
+                    blasCache.triangles += core.triCount;
+                    for (const [oldKey, old] of blasCache.map) {
+                        if (blasCache.triangles <= blasCache.maxTriangles || blasCache.map.size <= 1) break;
+                        if (old === core) continue;   // never evict this build's own entry
+                        blasCache.map.delete(oldKey);
+                        blasCache.triangles -= old.triCount;
+                    }
+                }
+            }
+            // Per-build state lives on a clone: the pool offsets and source
+            // bindings stamped below must never leak into an older build that
+            // is still draining async deform slices against its own pool.
+            const blas = Object.assign({}, core);
             // Deform tracking: soup vertices [0, srcVertCount) map 1:1 onto the
             // source geometry's vertices, so updateDeforms can re-gather this
             // BLAS's pooled slice straight from the live attributes.
@@ -781,8 +1160,12 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         }
         if (obj.isInstancedMesh) {
             const capacity = Number.isFinite(obj.instanceMatrix?.count) ? obj.instanceMatrix.count : obj.count;
-            const count = Math.max(0, Math.min(obj.count | 0, capacity | 0));
-            for (let i = 0; i < count; i++) instances.push({ blas: blasIdx, object: obj, instanceIndex: i });
+            // Reserve every allocated matrix slot in the TLAS. Games can then
+            // grow/shrink `count` or recycle a slot without reallocating the
+            // soup; inactive records are masked in traversal until activated.
+            for (let i = 0; i < Math.max(0, capacity | 0); i++) {
+                instances.push({ blas: blasIdx, object: obj, instanceIndex: i });
+            }
         } else {
             instances.push({ blas: blasIdx, object: obj, instanceIndex: -1 });
         }
@@ -796,9 +1179,10 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     const instanceObjectCounts = instanceObjects.map((object) => ({
         object,
         count: object.isInstancedMesh
-            ? Math.max(0, Math.min(object.count | 0, (object.instanceMatrix?.count ?? object.count) | 0))
+            ? Math.max(0, (object.instanceMatrix?.count ?? object.count) | 0)
             : 1,
     }));
+    const instanceCountByObject = new Map(instanceObjectCounts.map((entry) => [entry.object, entry.count]));
     if (instCount >= (1 << 24)) return { error: `too many instances for the TLAS leaf payload: ${instCount}` };
 
     // Pool assembly: place every BLAS at its base offsets, then serialize
@@ -873,11 +1257,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         const aabbs = new Array(instCount);
         const invRows = new Float32Array(instCount * 12);
         const detSign = new Float32Array(instCount);
+        const active = new Uint8Array(instCount);
         const worldBounds = new THREE.Box3();
         worldBounds.makeEmpty();
         for (let i = 0; i < instCount; i++) {
             const ins = instances[i];
-            instanceWorldMatrix(ins, _m4);
+            const isActive = ins.instanceIndex < 0 || ins.instanceIndex < Math.max(0, ins.object.count | 0);
+            active[i] = isActive ? 1 : 0;
+            if (isActive) instanceWorldMatrix(ins, _m4);
+            else _m4.copy(ins.object.matrixWorld);
             _inv.copy(_m4).invert();
             const e = _inv.elements; // column-major → store ROWS (w = translation term)
             const o = i * 12;
@@ -885,22 +1273,37 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             invRows[o + 4] = e[1]; invRows[o + 5] = e[5]; invRows[o + 6] = e[9]; invRows[o + 7] = e[13];
             invRows[o + 8] = e[2]; invRows[o + 9] = e[6]; invRows[o + 10] = e[10]; invRows[o + 11] = e[14];
             detSign[i] = _m4.determinant() < 0 ? -1 : 1;
-            _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            if (isActive) {
+                _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+                worldBounds.union(_box);
+            } else {
+                // A finite point keeps the threaded TLAS numerically valid;
+                // the instance active flag prevents its BLAS from being entered.
+                const eWorld = ins.object.matrixWorld.elements;
+                _box.min.set(eWorld[12], eWorld[13], eWorld[14]);
+                _box.max.copy(_box.min);
+            }
             aabbs[i] = {
                 min: [_box.min.x, _box.min.y, _box.min.z],
                 max: [_box.max.x, _box.max.y, _box.max.z],
                 c: [(_box.min.x + _box.max.x) * 0.5, (_box.min.y + _box.max.y) * 0.5, (_box.min.z + _box.max.z) * 0.5],
             };
-            worldBounds.union(_box);
+        }
+        if (worldBounds.isEmpty() && aabbs.length > 0) {
+            worldBounds.min.fromArray(aabbs[0].min);
+            worldBounds.max.fromArray(aabbs[0].max);
         }
         const { records, order } = buildTlasRecords(aabbs);
-        return { invRows, detSign, records, order, worldBounds };
+        return { aabbs, invRows, detSign, active, records, order, worldBounds };
     }
 
     // Extract PBR maps into array textures FIRST — this writes each material's
     // assigned layer index into its uber record ([12..16]) before we pack the
     // materials buffer below.
-    const maps = await buildMaterialTextures(THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE);
+    const materialTextures = await buildMaterialTextures(
+        THREE, uberList, uberMaterials, TEXTURE_ATLAS_SIZE, mapsArena,
+    );
+    const { maps, mapsArenaGeneration, mapsArenaPlan } = materialTextures;
 
     // Materials buffer with the dynamic tail:
     //   [ ubers (uberCount×MAT_STRIDE) | instances (instCount×MAT_STRIDE) | TLAS (tlasNodes×12) ]
@@ -917,6 +1320,20 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     const tlasNodes = materials.subarray(tlasBase, tlasBase + tlasNodeCount * TLAS_STRIDE_F32);
     const liveInstanceBounds = new Float32Array(instCount * 6);
     const tlasOrder = dyn0.order;
+    const slotsByObject = new Map();
+    const objectByUuid = new Map();
+    for (let slot = 0; slot < instCount; slot++) {
+        const object = instances[tlasOrder[slot]].object;
+        let slots = slotsByObject.get(object);
+        if (!slots) { slots = []; slotsByObject.set(object, slots); }
+        slots.push(slot);
+        if (typeof object.uuid === 'string') objectByUuid.set(object.uuid, object);
+    }
+    // Material ASSIGNMENT snapshot: the per-triangle uber mapping is baked into
+    // the soup, so the value-only refresh must fail closed if any traced mesh's
+    // material slot identity changed since this build.
+    const objectMaterialSnapshot = new Map();
+    for (const object of slotsByObject.keys()) objectMaterialSnapshot.set(object, meshMaterials(object).slice());
     for (let i = 0; i < uberList.length; i++) materials.set(uberList[i], i * MAT_STRIDE);
 
     function writeDynamic(dyn) {
@@ -929,7 +1346,12 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             materials[b + 12] = blas.blasRoot;   // exact ≤ 2^24 (guarded above)
             materials[b + 13] = blas.blasEnd;
             materials[b + 14] = dyn.detSign[src];
-            materials.fill(0, b + 15, b + MAT_STRIDE);
+            materials[b + 15] = dyn.active[src];
+            materials.fill(0, b + 16, b + MAT_STRIDE);
+            const aabb = dyn.aabbs[src];
+            const bb = slot * 6;
+            liveInstanceBounds[bb] = aabb.min[0]; liveInstanceBounds[bb + 1] = aabb.min[1]; liveInstanceBounds[bb + 2] = aabb.min[2];
+            liveInstanceBounds[bb + 3] = aabb.max[0]; liveInstanceBounds[bb + 4] = aabb.max[1]; liveInstanceBounds[bb + 5] = aabb.max[2];
         }
         for (let i = 0; i < dyn.records.length; i++) {
             const rec = dyn.records[i];
@@ -943,26 +1365,99 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         }
     }
     writeDynamic(dyn0);
+    const tlasRefitIndex = createFlatTlasRefitIndex({
+        nodes: tlasNodes,
+        instanceBounds: liveInstanceBounds,
+        end: tlasNodeCount,
+    });
+    if (!tlasRefitIndex) return { error: 'invalid flattened TLAS topology' };
 
-    // Moving-object fast path: re-read live matrixWorlds, rewrite the stable
-    // instance slots, then refit the build-time TLAS partition bottom-up.
-    // No per-update arrays, median sort, node objects, or topology rewrite.
+    function currentInstanceCapacity(object) {
+        return object.isInstancedMesh
+            ? Math.max(0, (object.instanceMatrix?.count ?? object.count) | 0)
+            : 1;
+    }
+
+    function recordRanges(indices, base, stride) {
+        if (!indices.length) return [];
+        const sorted = Array.from(new Set(indices)).sort((a, b) => a - b);
+        const ranges = [];
+        let start = sorted[0], end = start;
+        for (let i = 1; i < sorted.length; i++) {
+            const value = sorted[i];
+            if (value === end + 1) { end = value; continue; }
+            ranges.push([base + start * stride, (end - start + 1) * stride]);
+            start = end = value;
+        }
+        ranges.push([base + start * stride, (end - start + 1) * stride]);
+        return ranges;
+    }
+
+    // Moving-object fast path. With no object list this preserves the legacy
+    // compatibility scan/refit. Event-driven hosts pass the dirty Object3D(s),
+    // rewriting only their stable instance slots and exact TLAS ancestors.
     // A wildly rearranged scene can make the frozen partition less efficient
     // to traverse, but its exact refit bounds stay correct. Returns null only
     // if the stored threaded layout is invalid (caller should full-rebuild).
-    function updateTransforms({ rewriteInstanceRows = true } = {}) {
-        for (const entry of instanceObjectCounts) {
-            const { object } = entry;
-            const count = object.isInstancedMesh
-                ? Math.max(0, Math.min(object.count | 0, (object.instanceMatrix?.count ?? object.count) | 0))
-                : 1;
-            if (count !== entry.count) return null;
+    function updateTransforms({ rewriteInstanceRows = true, objects = null } = {}) {
+        const dirtySlots = [];
+        const dirtyObjects = new Set();
+        const full = objects == null;
+        if (full) {
+            for (const entry of instanceObjectCounts) {
+                if (currentInstanceCapacity(entry.object) !== entry.count) return null;
+                dirtyObjects.add(entry.object);
+            }
+            for (let slot = 0; slot < instCount; slot++) dirtySlots.push(slot);
+        } else {
+            const targets = Array.isArray(objects) || objects instanceof Set ? objects : [objects];
+            for (const target of targets) {
+                const rawObject = target?.object || target;
+                const object = typeof rawObject === 'string' ? objectByUuid.get(rawObject) : rawObject;
+                const slots = slotsByObject.get(object);
+                // Hosts commonly report transforms for helpers, cameras, newly
+                // spawned objects awaiting a topology packet, or meshes excluded
+                // from GI. They are not evidence that the resident soup is bad.
+                if (!object || !slots) continue;
+                if (currentInstanceCapacity(object) !== (instanceCountByObject.get(object) ?? -1)) return null;
+                dirtyObjects.add(object);
+                const instanceIndex = Number.isInteger(target?.instanceIndex) ? target.instanceIndex : -1;
+                if (instanceIndex < 0) {
+                    dirtySlots.push(...slots);
+                } else {
+                    let found = false;
+                    for (const slot of slots) {
+                        if (instances[tlasOrder[slot]].instanceIndex !== instanceIndex) continue;
+                        dirtySlots.push(slot);
+                        found = true;
+                    }
+                    if (!found) continue;
+                }
+            }
         }
-        for (const object of instanceObjects) object.updateWorldMatrix?.(true, false);
-        for (let slot = 0; slot < instCount; slot++) {
+        if (dirtySlots.length > 1) {
+            dirtySlots.sort((a, b) => a - b);
+            let write = 1;
+            for (let read = 1; read < dirtySlots.length; read++) {
+                if (dirtySlots[read] !== dirtySlots[write - 1]) dirtySlots[write++] = dirtySlots[read];
+            }
+            dirtySlots.length = write;
+        }
+        if (dirtySlots.length === 0) return {
+            bounds: null, materialRanges: [], updatedInstances: 0, refittedTlasNodes: 0,
+            emitterTransformsTouched: false, full,
+        };
+        let emitterTransformsTouched = false;
+        for (const object of dirtyObjects) {
+            if (object.userData?.giEmitter === true) { emitterTransformsTouched = true; break; }
+        }
+        for (const object of dirtyObjects) object.updateWorldMatrix?.(true, false);
+        for (const slot of dirtySlots) {
             const src = tlasOrder[slot];
             const ins = instances[src];
-            instanceWorldMatrix(ins, _m4);
+            const isActive = ins.instanceIndex < 0 || ins.instanceIndex < Math.max(0, ins.object.count | 0);
+            if (isActive) instanceWorldMatrix(ins, _m4);
+            else _m4.copy(ins.object.matrixWorld);
             if (rewriteInstanceRows) {
                 const detSign = _m4.determinant() < 0 ? -1 : 1;
                 _inv.copy(_m4).invert();
@@ -972,8 +1467,15 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
                 materials[b + 4] = e[1]; materials[b + 5] = e[5]; materials[b + 6] = e[9]; materials[b + 7] = e[13];
                 materials[b + 8] = e[2]; materials[b + 9] = e[6]; materials[b + 10] = e[10]; materials[b + 11] = e[14];
                 materials[b + 14] = detSign;
+                materials[b + 15] = isActive ? 1 : 0;
             }
-            _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            if (isActive) {
+                _box.copy(blasList[ins.blas].localBounds).applyMatrix4(_m4);
+            } else {
+                const eWorld = ins.object.matrixWorld.elements;
+                _box.min.set(eWorld[12], eWorld[13], eWorld[14]);
+                _box.max.copy(_box.min);
+            }
             const bb = slot * 6;
             liveInstanceBounds[bb] = _box.min.x;
             liveInstanceBounds[bb + 1] = _box.min.y;
@@ -982,11 +1484,99 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
             liveInstanceBounds[bb + 4] = _box.max.y;
             liveInstanceBounds[bb + 5] = _box.max.z;
         }
-        if (!refitFlatTlasRange({ nodes: tlasNodes, instanceBounds: liveInstanceBounds, end: tlasNodeCount })) return null;
+        let touchedNodes;
+        if (full) {
+            if (!refitFlatTlasRange({ nodes: tlasNodes, instanceBounds: liveInstanceBounds, end: tlasNodeCount })) return null;
+            touchedNodes = Array.from({ length: tlasNodeCount }, (_, i) => i);
+        } else {
+            touchedNodes = refitFlatTlasDirty({
+                nodes: tlasNodes,
+                instanceBounds: liveInstanceBounds,
+                dirtySlots,
+                index: tlasRefitIndex,
+            });
+            if (!touchedNodes) return null;
+        }
         const bounds = new THREE.Box3();
         bounds.min.set(tlasNodes[0], tlasNodes[1], tlasNodes[2]);
         bounds.max.set(tlasNodes[3], tlasNodes[4], tlasNodes[5]);
-        return { bounds };
+        const materialRanges = [];
+        if (rewriteInstanceRows) materialRanges.push(...recordRanges(dirtySlots, instBase, MAT_STRIDE));
+        materialRanges.push(...recordRanges(touchedNodes, tlasBase, TLAS_STRIDE_F32));
+        return {
+            bounds,
+            materialRanges,
+            updatedInstances: dirtySlots.length,
+            refittedTlasNodes: touchedNodes.length,
+            emitterTransformsTouched,
+            full,
+        };
+    }
+
+    // Material-VALUE fast path, the twin of updateLights: scalar/color edits
+    // (emissive, color, roughness, opacity, …) never touch either BVH, so the
+    // affected uber records are re-read from the live materials and rewritten
+    // in place. Layer slots [12..16]/[24] belong to buildMaterialTextures and
+    // are carried over untouched. Anything STRUCTURAL fails closed to null →
+    // full rebuild: a changed map binding, a material reassignment (the
+    // per-triangle uber mapping is baked into the soup), or a dedup split
+    // (two materials shared one record and an edit made them diverge —
+    // compared at uberKey's 1/1000 rounding so raw sub-quantum differences
+    // folded together at build never read as drift).
+    function updateMaterialValues({ materials: targets = null } = {}) {
+        for (const [object, mats] of objectMaterialSnapshot) {
+            const live = meshMaterials(object);
+            if (live.length !== mats.length) return null;
+            for (let i = 0; i < mats.length; i++) if (live[i] !== mats[i]) return null;
+        }
+        let targetSet = null;
+        if (targets != null) {
+            targetSet = new Set();
+            const list = Array.isArray(targets) || targets instanceof Set ? targets : [targets];
+            for (const entry of list) {
+                if (!entry) continue;
+                if (entry.isMaterial) targetSet.add(entry);
+                else for (const m of meshMaterials(entry)) targetSet.add(m);
+            }
+        }
+        const staged = [];
+        let emitterValuesTouched = false;
+        for (let i = 0; i < uberList.length; i++) {
+            const sharers = uberSharers[i];
+            if (targetSet && !sharers.some((m) => targetSet.has(m))) continue;
+            const zeroEmissive = uberZeroEmissive[i] === true;
+            if (zeroEmissive) emitterValuesTouched = true;
+            if (materialMapTail(sharers[0]) !== uberMapTails[i]) return null;
+            const rec = materialToUber(sharers[0]);
+            if (zeroEmissive) { rec[7] = 0; rec[8] = 0; rec[9] = 0; }
+            for (let s = 1; s < sharers.length; s++) {
+                if (materialMapTail(sharers[s]) !== uberMapTails[i]) return null;
+                const r2 = materialToUber(sharers[s]);
+                if (zeroEmissive) { r2[7] = 0; r2[8] = 0; r2[9] = 0; }
+                for (let f = 0; f < MAT_STRIDE; f++) {
+                    if (Math.round(r2[f] * 1000) !== Math.round(rec[f] * 1000)) return null;
+                }
+            }
+            const b = i * MAT_STRIDE;
+            rec[12] = materials[b + 12]; rec[13] = materials[b + 13]; rec[14] = materials[b + 14];
+            rec[15] = materials[b + 15]; rec[16] = materials[b + 16]; rec[24] = materials[b + 24];
+            for (let f = 0; f < MAT_STRIDE; f++) {
+                if (Math.fround(rec[f]) !== materials[b + f]) { staged.push([i, rec]); break; }
+            }
+        }
+        // Validate-everything-first, THEN commit: a drift found on record k must
+        // not leave records < k half-applied in the CPU mirror of a buffer the
+        // held rebuild may take many frames to replace.
+        const changed = [];
+        for (const [i, rec] of staged) {
+            materials.set(rec, i * MAT_STRIDE);
+            changed.push(i);
+        }
+        return {
+            materialRanges: recordRanges(changed, 0, MAT_STRIDE),
+            updatedRecords: changed.length,
+            emitterValuesTouched,
+        };
     }
 
     let asyncDeformRequestSerial = 0;
@@ -1395,6 +1985,7 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
 
     // Lights
     const lightRecords = collectLights(THREE, scene, camera);
+    lightRecords.push(...collectEmitterRecords(THREE, scene, camera));
     const lights = new Float32Array(Math.max(1, lightRecords.length) * LIGHT_STRIDE);
     for (let i = 0; i < lightRecords.length; i++) lights.set(lightRecords[i], i * LIGHT_STRIDE);
 
@@ -1403,6 +1994,7 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
     // changes storage layout and therefore fails closed to a full scene build.
     function updateLights() {
         const nextRecords = collectLights(THREE, scene, camera);
+        nextRecords.push(...collectEmitterRecords(THREE, scene, camera));
         if (nextRecords.length !== lightRecords.length) return null;
         lights.fill(0);
         for (let i = 0; i < nextRecords.length; i++) {
@@ -1426,6 +2018,7 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         materials, materialCount: uberList.length,
         instBase, instCount, tlasBase, tlasNodeCount,
         updateTransforms,
+        updateMaterialValues,
         updateDeforms,
         updateDeformsAsync,
         cancelDeformUpdates,
@@ -1434,6 +2027,8 @@ export async function buildSpectralScene({ THREE, scene, camera = null, maxTrian
         lights, lightCount: lightRecords.length,
         env,
         maps, // { albedo, normal, roughness, metalness, emissive, alpha } DataArrayTexture | null
+        mapsArenaGeneration,
+        mapsArenaPlan,
         strides: { NODE_STRIDE_U32, MAT_STRIDE, LIGHT_STRIDE, VERT_STRIDE, VERTEX_DATA_STRIDE, TLAS_STRIDE_F32 },
     };
 }

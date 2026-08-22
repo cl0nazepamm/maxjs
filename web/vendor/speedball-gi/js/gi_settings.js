@@ -9,9 +9,10 @@ const KEY = 'speedball-gi-settings-v2';
 // Canonical defaults (= Sponza's tuning).
 export const GI_DEFAULTS = {
     giEnabled: true, giIntensity: 10, giDivisions: 16, giRays: 64,
-    giCascades: 1, giContinuous: true, showProbes: false,
-    giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 0,
-    giLeak: 0.8, giSolid: 0, giSky: 1, giNormalDetail: 1, giReflectionIntensity: 1,
+    giCascades: 1, giContinuous: true,
+    giHysteresis: 0.6, giHysteresisNormalize: true, giNormalBias: 1.75, giRadianceClamp: 8, giDepthSharpness: 7,
+    giLeak: 0.85, giSolid: 0, giSky: 1, giNormalDetail: 1,
+    giReflectionQuality: 'high', giReflectionIntensity: 1, giRoughnessLimit: 1,
     giChangeThreshold: 2.5, giSnapAmount: 0.30, giFireflyClamp: 6.0,
 };
 
@@ -20,6 +21,9 @@ const GI_PERSIST_KEYS = GI_KEYS.filter((k) => ![
     'giChangeThreshold',
     'giSnapAmount',
     'giFireflyClamp',
+    'giReflectionQuality',
+    'giRoughnessLimit',
+    'giNormalDetail',
 ].includes(k));
 
 // Saved settings merged over the defaults. Type-checked per key so a stale or
@@ -48,9 +52,11 @@ export function saveGiSettings(params) {
 
 // One GI panel for EVERY demo page — identical controls everywhere, built from the
 // same shared params (Sponza = canonical). Trimming a slider here trims it on all
-// pages at once. onInteract = the page's markInteraction; onStructure fires for
-// knobs that re-place probes so pages can refresh their probe helpers.
-export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure = () => {} } = {}) {
+// pages at once. onInteract = the page's markInteraction.
+export function addGiPanel(gui, gi, params, {
+    onInteract = () => {},
+    onReflectionQuality = null,
+} = {}) {
     // Demos may opt out of loadGiSettings() so hosted pages always start clean.
     // Fill any missing GI key here before lil-gui touches it; undefined values can
     // make add(...).name(...) explode on optional controls like sky/normal detail.
@@ -62,25 +68,34 @@ export function addGiPanel(gui, gi, params, { onInteract = () => {}, onStructure
     fGI.add(params, 'giHysteresis', 0.5, 0.99, 0.01).name('hysteresis').onChange((v) => { gi.setHysteresis(v); onInteract(); });
     fGI.add(params, 'giHysteresisNormalize').name('normalize hysteresis').onChange((v) => { gi.setHysteresisNormalization?.(v); onInteract(); });
     // STRUCTURAL knobs (idle-gated rebuild — never a per-tick recompile).
-    fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onStructure(); onInteract(); });
+    fGI.add(params, 'giDivisions', 2, 32, 1).name('divisions').onChange((v) => { gi.setDivisions(v); onInteract(); });
     fGI.add(params, 'giRays', 32, 256, 16).name('rays / probe').onChange((v) => { gi.setRays(v); onInteract(); });
-    fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi.setCascades(+v); onStructure(); onInteract(); });
+    fGI.add(params, 'giCascades', { 'single grid': 1, 'cascaded (2)': 2 }).name('cascades').onChange((v) => { gi.setCascades(+v); onInteract(); });
     fGI.add(params, 'giContinuous').name('continuous (solve while moving)').onChange((v) => { gi.setContinuous(v); onInteract(); });
-    fGI.add(params, 'showProbes').name('show probes').onChange(() => onStructure());
-    // Quality — UNIFORM-backed, apply instantly (no recompile/rebuild).
+    // Quality. Reflection tier is structural; the remaining controls are uniform-backed.
     const fQ = fGI.addFolder('Quality');
+    // Reflection tier is deliberately a page-owned reload callback: off/rough/high/
+    // ultra change storage bindings and material graphs, so a live uniform would lie
+    // about the zero-cost boundary. Demos without structural reload support omit it.
+    if (typeof onReflectionQuality === 'function') {
+        fQ.add(params, 'giReflectionQuality', ['off', 'rough', 'high', 'ultra'])
+            .name('reflection quality').onChange(onReflectionQuality);
+    }
     fQ.add(params, 'giNormalBias', 0, 4, 0.05).name('normal bias').onChange((v) => { gi.setNormalBias(v); onInteract(); });
     fQ.add(params, 'giRadianceClamp', 0, 32, 0.5).name('radiance clamp').onChange((v) => { gi.setRadianceClamp(v); onInteract(); });
-    fQ.add(params, 'giDepthSharpness', 0, 200, 1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
+    // This is the raw cosine exponent, not a percentage. At the default 64 rays,
+    // power 7 already leaves only ~7.5 effective samples per directional texel;
+    // the former 0..200 range put almost the entire slider in an undersampled,
+    // nearest-ray regime. Keep the demo in its useful 64-ray range. The API setter
+    // still accepts larger powers for integrations that deliberately use more rays.
+    fQ.add(params, 'giDepthSharpness', 0, 7, 0.1).name('depth sharpness').onChange((v) => { gi.setDepthSharpness(v); onInteract(); });
     fQ.add(params, 'giLeak', 0, 1, 0.05).name('chebyshev strength').onChange((v) => { gi.setChebyStrength(v); onInteract(); });
     if (typeof gi.setSkyIntensity === 'function') {
         fQ.add(params, 'giSky', 0, 2, 0.05).name('sky light').onChange((v) => { gi.setSkyIntensity(v); onInteract(); });
     }
-    if (typeof gi.setNormalDetail === 'function') {
-        fQ.add(params, 'giNormalDetail', 0, 1, 0.05).name('normal detail').onChange((v) => { gi.setNormalDetail(v); onInteract(); });
-    }
     if (gi.hasRoughReflections?.() && typeof gi.setReflectionIntensity === 'function') {
         fQ.add(params, 'giReflectionIntensity', 0, 1, 0.05).name('local reflections').onChange((v) => { gi.setReflectionIntensity(v); onInteract(); });
+        // roughnessLimit and normal detail are API-only (pinned at 1) — not Quality sliders.
     }
     // solid-scene (classify) stays hidden + pinned to 0 — a backface test misreads thin
     // two-sided geometry (Sponza curtains), so it's opt-in for enclosed solids only.
@@ -106,8 +121,9 @@ export function applyGiSettings(gi, s) {
     gi.setChebyStrength(cfg.giLeak);
     gi.setClassifyStrength(cfg.giSolid);
     gi.setSkyIntensity?.(cfg.giSky);
-    gi.setNormalDetail?.(cfg.giNormalDetail);
+    gi.setNormalDetail?.(1);
     gi.setReflectionIntensity?.(cfg.giReflectionIntensity);
+    gi.setRoughnessLimit?.(1);
     gi.setChangeThreshold(cfg.giChangeThreshold);
     gi.setSnapAmount(cfg.giSnapAmount);
     gi.setFireflyClamp(cfg.giFireflyClamp);

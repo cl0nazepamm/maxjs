@@ -131,7 +131,9 @@ function createSceneExtras(deps = {}) {
         function applyHairVisibility(handle, visible) {
             const entry = deps.hairMeshes.get(handle);
             if (!entry?.root) return false;
-            entry.root.visible = !!visible;
+            const next = !!visible;
+            if (entry.root.visible === next) return false;
+            entry.root.visible = next;
             return true;
         }
 
@@ -194,9 +196,14 @@ function createSceneExtras(deps = {}) {
         }
 
         function applyHairInstances(groups) {
+            const hadHair = deps.hairMeshes.size > 0;
             disposeHairInstances();
-            if (!Array.isArray(groups) || groups.length === 0) return;
+            if (!Array.isArray(groups) || groups.length === 0) {
+                if (hadHair) deps.markSpeedballTopologyDirty();
+                return;
+            }
             for (const grp of groups) buildHairEntry(grp);
+            deps.markSpeedballTopologyDirty();
         }
 
 
@@ -433,6 +440,7 @@ function createSceneExtras(deps = {}) {
                 deps.layerManager.markRuntimeTransformsDirty?.();
                 deps.maxjsFx.markSceneChanged?.();
                 deps.markLightProbeSceneDirty();
+                deps.markSpeedballTopologyDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                 deps.schedulePathTracingLiveRebuild();
                 deps.updateSyncHud({

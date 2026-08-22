@@ -45,6 +45,41 @@ const lightWorldQuat = new THREE.Quaternion();
 const LIGHT_BEAM_AXIS = new THREE.Vector3(0, -1, 0);
 const MAXJS_SELF_HIDDEN_LAYER = 31;
 
+export function resolveLightEmitterClass(lightData = {}) {
+    const explicit = lightData?.emitterClass;
+    if (typeof explicit === 'string' && explicit.trim()) {
+        return explicit.trim().toLowerCase().replaceAll('-', '_');
+    }
+    if (Number.isFinite(explicit)) return Math.trunc(explicit);
+
+    const props = typeof lightData?.userProps === 'string' ? lightData.userProps : '';
+    if (props) {
+        const match = /emitterClass\s*=\s*([a-z0-9_-]+)/i.exec(props);
+        if (match) return match[1].toLowerCase().replaceAll('-', '_');
+    }
+
+    const name = String(lightData?.name ?? '');
+    if (name) {
+        const normalized = `_${name.toLowerCase().replace(/[\s\-.]+/g, '_')}_`;
+        if (/_ir_|_nir_|_illuminator_/.test(normalized)) return 'ir';
+        if (/_led_/.test(normalized)) return 'led';
+        if (/_sodium_|_lps_/.test(normalized)) return 'sodium';
+        if (/_inc_|_incandescent_|_halogen_|_tungsten_/.test(normalized)) {
+            return 'incandescent';
+        }
+    }
+    return null;
+}
+
+export function isIrEmitterClass(value) {
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        return normalized === 'ir' || normalized.startsWith('ir_')
+            || normalized.startsWith('ir ') || normalized.includes('illuminator');
+    }
+    return Number.isFinite(value) && Math.trunc(value) >= 4;
+}
+
 function getLightParentObject(light, ld, parent, nodeMap) {
     const explicitParent = Object.prototype.hasOwnProperty.call(ld ?? {}, 'p')
         ? Number(ld.p)
@@ -298,24 +333,13 @@ function applyLightMetadata(light, ld) {
     if (props) light.userData.maxjsUserProps = props;
     else delete light.userData.maxjsUserProps;
 
-    let emitterClass;
+    const emitterClass = resolveLightEmitterClass(ld);
     let colorTemp;
     if (props) {
-        const emitterMatch = /emitterClass\s*=\s*([a-z_]+)/i.exec(props);
-        if (emitterMatch) emitterClass = emitterMatch[1].toLowerCase();
         const tempMatch = /colorTemp\s*=\s*([0-9.]+)/i.exec(props);
         if (tempMatch) colorTemp = Number(tempMatch[1]);
     }
-    if (!emitterClass && light.name) {
-        const normalizedName = `_${light.name.toLowerCase().replace(/[\s\-.]+/g, '_')}_`;
-        if (/_ir_|_nir_|_illuminator_/.test(normalizedName)) emitterClass = 'ir';
-        else if (/_led_/.test(normalizedName)) emitterClass = 'led';
-        else if (/_sodium_|_lps_/.test(normalizedName)) emitterClass = 'sodium';
-        else if (/_inc_|_incandescent_|_halogen_|_tungsten_/.test(normalizedName)) {
-            emitterClass = 'incandescent';
-        }
-    }
-    if (emitterClass) light.userData.emitterClass = emitterClass;
+    if (emitterClass !== null) light.userData.emitterClass = emitterClass;
     else delete light.userData.emitterClass;
     if (Number.isFinite(colorTemp)) light.userData.colorTemp = colorTemp;
     else delete light.userData.colorTemp;

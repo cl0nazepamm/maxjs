@@ -150,7 +150,7 @@ assert.match(updateDeforms, /if \(refitted === 0 \|\| !updateTlas\)/,
 
 const probes = await read('../web/vendor/speedball-gi/js/gi_probes.js');
 assert.match(probes, /const RAYS_PER_TICK_MIN = 2_048/);
-assert.match(probes, /if \(!moving && wasMoving\) \{[\s\S]*probeBudgetAfterInteraction\(tickBudgetRays\)/,
-    'Speedball resumes a stopped scrub with GPU headroom for the settle lane');
+assert.match(probes, /if \(!moving && wasMoving && \(!continuous \|\| wasPlaying\)\) \{[\s\S]*probeBudgetAfterInteraction\(tickBudgetRays\)/,
+    'Speedball resumes strict-idle or stopped playback with GPU headroom without throttling continuous camera motion');
 
 console.log('timeline-hitch-source-smoke: OK');

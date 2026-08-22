@@ -4,7 +4,7 @@
 // update() per frame:
 //   1. installs the lights-node factory so GI folds into every PBR material,
 //   2. wires the post-rebuild material-dirty pass (the silent-"GI-missing" footgun),
-//   3. idle-gates the solve off the camera transform (works with any controls, or none).
+//   3. tracks world-space camera interaction for rebuild gating and solve pacing.
 //
 // Advanced users can still import createProbeField / giLights directly and wire it
 // by hand; this is the batteries-included path.
@@ -12,6 +12,7 @@
 import * as THREE from 'three/webgpu';
 import { createProbeField } from './gi_probes.js';
 import { giLights, setNirDirectSensing, setNirIlluminatorGain } from './gi_lights_node.js';
+import { giClusteredLights } from './gi_clustered_lights_node.js';
 
 // spectral_scene / gi_probes gate: userData.maxjsVisible === false → kept out of the
 // GI BVH and the auto-fit bounds. Wrapped here so callers never touch the raw flag.
@@ -61,7 +62,6 @@ function makeMaterialDirtier(scene) {
         const mark = (m) => {
             if (!m || seen.has(m)) return; seen.add(m);
             if (m.isMeshBasicMaterial || m.isLineBasicMaterial || m.isLineDashedMaterial) return;
-            if (m.visible === false) return;
             m.dispose?.();
             m.needsUpdate = true;
         };
@@ -86,7 +86,7 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @example
  *   const gi = installSpeedballGI({ renderer, scene, camera });  // at setup
  *   // render loop:
- *   gi.update();            // idle-gated solve
+ *   gi.update();            // one call per render frame
  *
  * @param {object} opts
  * @param {THREE.WebGPURenderer} opts.renderer
@@ -95,15 +95,32 @@ const _now = () => (typeof performance !== 'undefined' && performance.now) ? per
  * @param {boolean} [opts.enabled=true]
  * @param {number}  [opts.intensity=10]        canonical demo tuning (Sponza)
  * @param {number}  [opts.divisions=16]        probes along the longest grid axis
- * @param {number}  [opts.hysteresis=0.9]      temporal stability (higher = steadier / slower)
- * @param {boolean} [opts.roughReflections=false] reuse DDGI rays for glossy + rough local reflections; opt-in keeps legacy path allocation-free
+ * @param {'gated'|'montecarlo'} [opts.jitterMode='gated'] stable held basis or fresh basis every solve
+ * @param {number}  [opts.hysteresis]          mode default is 0.60 Gated / 0.90 Monte Carlo
+ * @param {boolean} [opts.roughReflections=false] legacy reflection switch (`true` = ultra, `false` = off)
+ * @param {'off'|'rough'|'high'|'ultra'} [opts.reflectionQuality] structural reflection tier; overrides roughReflections
  * @param {number}  [opts.reflectionIntensity=1] local-vs-environment reflection coverage blend, 0..1
+ * @param {number}  [opts.roughnessLimit] skip local receiver work above this material roughness; pinned at 1 when omitted
  * @param {boolean} [opts.reflectionSkyFallback=false] fill reflection misses from setSky() SH instead of leaving them for PMREM/SSR
  * @param {object}  [opts.lights]              max light counts for the batched lights node
+ * @param {boolean|object} [opts.clusteredLighting=false]  SECONDARY MODE (three r185+): Forward+
+ *                  clustered raster lighting — thousands of non-shadowed point lights for
+ *                  near-constant direct cost (GiClusteredLightsNode replaces the batched
+ *                  DynamicLightsNode; `lights` caps are then ignored), while the GI lane
+ *                  budgets itself to the MAX_LIGHTS most important records (importance
+ *                  top-K + fixed light arena — light-count changes never trigger a BVH
+ *                  rebuild in this mode). Directional/spot/shadow-casting lights keep the
+ *                  stock per-light path. Pass an object to tune the cluster grid:
+ *                  { maxLights=1024, tileSize=32, zSlices=24, maxLightsPerCluster=64 }.
+ *                  Default false = the primary path, byte-identical to previous releases.
  * @param {boolean} [opts.installLightsNode=true]  set false if you install your own GI-aware lights node
  * @param {boolean} [opts.prepareMaterials=false]  run prepareMaterialsForGI(scene) on install
- * @returns {object} the probe field (all setters) augmented with update(), markInteraction(),
- *                   markMaterialsDirty(), and a dispose() that also restores the lights factory.
+ * @param {boolean} [opts.autoDetectChanges=true]  compatibility scene scans; set false when the host emits dirty events
+ * @returns {object} the probe field (including markTransformsDirty(),
+ *                   markDeformsDirty(), markMaterialValuesDirty(),
+ *                   markTopologyDirty(), and notifySceneChange()) augmented
+ *                   with update(), markInteraction(), markMaterialsDirty(),
+ *                   and a dispose() that also restores the lights factory.
  */
 export function installSpeedballGI({
     renderer,
@@ -112,18 +129,28 @@ export function installSpeedballGI({
     enabled = true,
     intensity = 10,
     divisions = 16,
-    hysteresis = 0.9,
+    hysteresis = null,
+    jitterMode = 'gated',
     roughReflections = false,
+    reflectionQuality = null,
     reflectionIntensity = 1,
+    roughnessLimit = null,
     reflectionSkyFallback = false,
     lights = { maxDirectionalLights: 4, maxPointLights: 16, maxSpotLights: 16, maxHemisphereLights: 2 },
+    clusteredLighting = false,
     installLightsNode = true,
     prepareMaterials = false,
+    autoDetectChanges = true,
 } = {}) {
     if (!renderer || !scene) throw new Error('installSpeedballGI: { renderer, scene } are required.');
 
+    const clustered = clusteredLighting === true
+        || (typeof clusteredLighting === 'object' && clusteredLighting !== null);
+    const clusteredOpts = clustered && typeof clusteredLighting === 'object' ? clusteredLighting : {};
+
     // 1. Lights factory — one line folds GI into every PBR material (no per-material wiring).
     let prevCreateNode = null;
+    let installedCreateNode = null;
     if (installLightsNode) {
         if (!renderer.lighting) throw new Error('installSpeedballGI: renderer.lighting is missing — needs a WebGPURenderer.');
         // Guard the one sharp edge: the factory must be in place before the first render.
@@ -136,24 +163,39 @@ export function installSpeedballGI({
                 'or GI may never fold into already-compiled materials.');
         }
         prevCreateNode = renderer.lighting.createNode || null;
-        renderer.lighting.createNode = (lightList = []) => giLights(lights).setLights(lightList);
+        installedCreateNode = clustered
+            ? (lightList = []) => giClusteredLights(clusteredOpts).setLights(lightList)
+            : (lightList = []) => giLights(lights).setLights(lightList);
+        renderer.lighting.createNode = installedCreateNode;
     }
-
-    if (prepareMaterials) prepareMaterialsForGI(scene);
 
     // 2. Probe field, with the material-dirty pass wired as onRebuilt (footgun handled).
     const markMaterialsDirty = makeMaterialDirtier(scene);
-    const gi = createProbeField({
-        renderer,
-        scene,
-        intensity,
-        hysteresis,
-        divisions,
-        roughReflections,
-        reflectionIntensity,
-        reflectionSkyFallback,
-        onRebuilt: markMaterialsDirty,
-    });
+    let gi;
+    try {
+        if (prepareMaterials) prepareMaterialsForGI(scene);
+        gi = createProbeField({
+            renderer,
+            scene,
+            intensity,
+            hysteresis,
+            jitterMode,
+            divisions,
+            roughReflections,
+            reflectionQuality,
+            reflectionIntensity,
+            roughnessLimit,
+            reflectionSkyFallback,
+            clusteredLighting: clustered,
+            autoDetectChanges,
+            onRebuilt: markMaterialsDirty,
+        });
+    } catch (error) {
+        if (installLightsNode && renderer.lighting?.createNode === installedCreateNode) {
+            renderer.lighting.createNode = prevCreateNode;
+        }
+        throw error;
+    }
     if (enabled) gi.setEnabled(true);
 
     // 3. Idle tracking off the camera transform → works with any controls (or none):
@@ -161,24 +203,50 @@ export function installSpeedballGI({
     let lastInteraction = _now();
     const _pos = new THREE.Vector3(Infinity, 0, 0);
     const _quat = new THREE.Quaternion(2, 0, 0, 0);
+    const _worldPos = new THREE.Vector3();
+    const _worldQuat = new THREE.Quaternion();
     const cameraMoved = (cam) => {
         if (!cam) return false;
-        const moved = cam.position.distanceToSquared(_pos) > 1e-7
-            || Math.abs(cam.quaternion.dot(_quat)) < 0.99999995;
-        _pos.copy(cam.position); _quat.copy(cam.quaternion);
+        cam.getWorldPosition(_worldPos);
+        cam.getWorldQuaternion(_worldQuat);
+        const moved = _worldPos.distanceToSquared(_pos) > 1e-7
+            || Math.abs(_worldQuat.dot(_quat)) < 0.99999995;
+        _pos.copy(_worldPos); _quat.copy(_worldQuat);
         return moved;
     };
+    const _drawingSize = new THREE.Vector2();
+    let drawingWidth = -1;
+    let drawingHeight = -1;
+    const presentationSizeChanged = () => {
+        if (typeof renderer.getDrawingBufferSize !== 'function') return false;
+        renderer.getDrawingBufferSize(_drawingSize);
+        const width = Math.round(_drawingSize.x);
+        const height = Math.round(_drawingSize.y);
+        const changed = drawingWidth >= 0 && (width !== drawingWidth || height !== drawingHeight);
+        drawingWidth = width;
+        drawingHeight = height;
+        return changed;
+    };
+    presentationSizeChanged();
+    let disposed = false;
+    let updateFailureWarned = false;
 
     return {
         ...gi,          // createProbeField returns plain closures (no `this`) — safe to spread
         gi,             // the raw field, if you want the exact object
         node: gi.node,
 
-        /** Call once per frame. Idle-gated: solves only when the view is at rest. */
+        /** Call once per frame. Heavy rebuilds stay idle-gated; solve cadence follows setContinuous(). */
         update({ camera: cam = camera, playing = false } = {}) {
+            if (disposed) return;
             const now = _now();
             if (cameraMoved(cam)) lastInteraction = now;
-            gi.tick({ idleMs: now - lastInteraction, playing });
+            if (presentationSizeChanged()) gi.resetFramePacing();
+            return gi.tick({ idleMs: now - lastInteraction, playing }).catch((error) => {
+                if (updateFailureWarned) return;
+                updateFailureWarned = true;
+                console.warn('SPEEDBALL GI update failed:', error);
+            });
         },
 
         /** Treat "now" as an interaction, deferring the next solve (e.g. after a big edit). */
@@ -190,22 +258,41 @@ export function installSpeedballGI({
          * gate (gi_lights_node). Uniform writes only — no recompile, no scene mutation;
          * light.color stays black, so the light never exists in the visible band.
          */
-        setNirSensing(on) { gi.setNirSensing(on); setNirDirectSensing(on); },
+        setNirSensing(on) {
+            if (disposed) return;
+            gi.setNirSensing(on);
+            setNirDirectSensing(on);
+        },
 
         /**
          * Sensed-band illuminator gain: one scalar trim for BOTH raster terms of
          * emitter-class-'ir' lights (probes' NEE + direct raster). Uniform writes
          * only. Hosts running the spectral tracer wire its setNirGain alongside.
          */
-        setNirGain(gain) { gi.setNirGain?.(gain); setNirIlluminatorGain(gain); },
+        setNirGain(gain) {
+            if (disposed) return;
+            gi.setNirGain?.(gain);
+            setNirIlluminatorGain(gain);
+        },
 
         /** Recompile lit materials so GI folds in — call if you add meshes after install. */
         markMaterialsDirty,
 
         /** Full teardown: restore the previous lights factory and free GPU resources. */
         dispose() {
-            if (installLightsNode && renderer.lighting) renderer.lighting.createNode = prevCreateNode;
-            gi.dispose();
+            if (disposed) return;
+            disposed = true;
+            if (installLightsNode && renderer.lighting?.createNode === installedCreateNode) {
+                renderer.lighting.createNode = prevCreateNode;
+            }
+            try {
+                gi.dispose();
+            } finally {
+                // Already-compiled materials retain the old lights graph. Invalidate
+                // them after restoring the factory so a later render cannot touch
+                // the disposed field, including materials that are currently hidden.
+                markMaterialsDirty();
+            }
         },
     };
 }

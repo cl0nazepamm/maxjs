@@ -133,7 +133,7 @@ function createRendererCore(deps = {}) {
             const rect = getViewportFrameRect();
             nextRenderer.setSize(rect.width, rect.height);
             nextRenderer.setPixelRatio(getEffectivePixelRatio());
-            nextRenderer.toneMapping = THREE.NeutralToneMapping;
+            nextRenderer.toneMapping = THREE.AgXToneMapping;
             nextRenderer.toneMappingExposure = 1.0;
             nextRenderer.shadowMap.enabled = true;
             nextRenderer.setClearColor?.(0x000000, 0);
@@ -274,7 +274,7 @@ function createRendererCore(deps = {}) {
             // native WebGPU renderer below.
             if (requestedBackend === 'webgl2' && !deps.isPathTracingMode) {
                 nextRenderer = new THREE_STD.WebGLRenderer({
-                    antialias: true,
+                    antialias: false,
                     alpha: true,
                     preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture,
                     powerPreference: 'high-performance',
@@ -285,13 +285,13 @@ function createRendererCore(deps = {}) {
             } else if (requestedBackend === 'webgl-fallback' && !deps.isPathTracingMode) {
                 // Normal viewer WebGL2 uses the modern renderer stack so TSL /
                 // Shader Lab can compile to the forced WebGL backend.
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
+                nextRenderer = new THREE.WebGPURenderer({ antialias: false, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
                 backendLabel = 'TSL_GL';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
             } else {
                 const requiredLimits = await resolveWebGPULimits();
-                nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture, requiredLimits });
+                nextRenderer = new THREE.WebGPURenderer({ antialias: false, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture, requiredLimits });
                 backendLabel = 'WebGPU';
                 try {
                     configureRenderer(nextRenderer);
@@ -303,13 +303,13 @@ function createRendererCore(deps = {}) {
                     console.warn('max.js WebGPU init failed, retrying with default limits.', error);
                     disposeRenderer(nextRenderer);
                     try {
-                        nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
+                        nextRenderer = new THREE.WebGPURenderer({ antialias: false, alpha: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
                         configureRenderer(nextRenderer);
                         await initializeRenderer(nextRenderer);
                     } catch (error2) {
                         console.warn('max.js WebGPU init failed, retrying with forced WebGL2 backend.', error2);
                         disposeRenderer(nextRenderer);
-                        nextRenderer = new THREE.WebGPURenderer({ antialias: true, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
+                        nextRenderer = new THREE.WebGPURenderer({ antialias: false, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
                         backendLabel = 'TSL_GL';
                         configureRenderer(nextRenderer);
                         await initializeRenderer(nextRenderer);

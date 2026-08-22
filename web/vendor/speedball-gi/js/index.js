@@ -12,7 +12,10 @@
 export { installSpeedballGI, excludeFromGI, prepareMaterialsForGI } from './install.js';
 
 // Core BVH-traced DDGI probe field (octahedral, infinite-bounce, idle-gated).
-export { createProbeField, getGiProbeNode, GiProbeNode } from './gi_probes.js';
+export {
+    createProbeField, getGiProbeNode, GiProbeNode,
+    REFLECTION_QUALITY_TIERS, resolveReflectionQuality,
+} from './gi_probes.js';
 
 // Lights node that injects the GI term into every PBR material.
 // setNirDirectSensing flips the DIRECT term of emitter-class-'ir' lights between
@@ -27,6 +30,12 @@ export {
     setNirIlluminatorGain, getNirIlluminatorGain,
     isIrEmitter, getOrCreateIrLightNode,
 } from './gi_lights_node.js';
+
+// SECONDARY MODE — clustered lighting (three r185+ Forward+ addon): thousands of
+// non-shadowed point lights drawn cheaply by the raster while the GI lane budgets
+// itself by importance. Opt in via installSpeedballGI({ clusteredLighting: true })
+// or wire GiClusteredLightsNode yourself (same seams as GiLightsNode).
+export { giClusteredLights, default as GiClusteredLightsNode } from './gi_clustered_lights_node.js';
 
 // Legacy surfel/lobe irradiance volume (kept for the non-BVH path).
 export { createIrradianceVolume, getGiVolumeNode, GiVolumeNode } from './gi_irradiance_volume.js';

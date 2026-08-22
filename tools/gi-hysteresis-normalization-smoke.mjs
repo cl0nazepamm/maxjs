@@ -268,10 +268,9 @@ assert.match(probeSource, /const sh\s*=\s*select\(dWasZero,\s*float\(0\.0\),\s*s
 assert.match(probeSource, /const sBlended\s*=\s*mix\(sCur,\s*sPrev,\s*sh\);/, 'rough reflection blend must consume seeded normalized history');
 assert.doesNotMatch(probeSource, /const sWasEmpty\b/, 'rough reflection must not use RGBA energy as an initialization sentinel');
 assert.match(probeSource, /const glossyReferenceH\s*=\s*U\.hysteresis\.add\(\s*float\(1\.0\)\.sub\(U\.hysteresis\)\.mul\(U\.debugTempNoiseHBoost\),?\s*\);/s, 'glossy reference must use the steady/noisy policy');
-assert.match(probeSource, /const glossyH\s*=\s*pow\(glossyReferenceH\.clamp\(1e-6,\s*1\.0\),\s*U\.hysteresisExponent\);/, 'glossy reflection must normalize steady history');
+assert.match(probeSource, /const glossyH\s*=\s*pow\(\s*glossyReferenceH\.clamp\(1e-6,\s*1\.0\),\s*U\.hysteresisExponent\.mul\(float\(glossyUpdateInterval\)\),?\s*\);/s, 'glossy reflection must normalize steady history for its interleaved revisit interval');
 assert.match(probeSource, /const gh\s*=\s*select\(empty,\s*float\(0\.0\),\s*glossyH\);/, 'glossy initialization must feed normalized history');
 assert.match(probeSource, /const num\s*=\s*mix\(curNum,\s*prevNum,\s*gh\)\.toVar\(\);/, 'glossy numerator must use normalized history');
 assert.match(probeSource, /const den\s*=\s*mix\(curDen,\s*prevDen,\s*gh\)\.max\(float\(1e-6\)\)\.toVar\(\);/, 'glossy support must use the same normalized history');
 
 console.log('GI hysteresis normalization smoke passed');
-

@@ -5,6 +5,11 @@ import { freezePlainObject } from './layer_utils.js';
 
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
+const RASTER_NIR_NODE_BINDINGS = Object.freeze([
+    ['colorNode', 'maxjsNirColorNode'],
+    ['emissiveNode', 'maxjsNirEmissiveNode'],
+]);
+
 function materialsOf(mesh) {
     return Array.isArray(mesh?.material) ? mesh.material : (mesh?.material ? [mesh.material] : []);
 }
@@ -99,35 +104,68 @@ export function createSpectralMaterialSystem({
     let nextOrder = 1;
     let nextScanAt = 0;
     // Raster NV band swap: while the imager senses NIR, a TAGGED material's
-    // diffuse scalar becomes grey at its authored NIR level (uniform write —
-    // zero recompiles; the diffuse map keeps supplying per-texel variation,
-    // mirroring the PT's level×texel behavior). The true visible color is
-    // parked in userData.giColor, which the spectral/probe packer honors
+    // diffuse scalar becomes grey at its authored NIR level. TSL materials may
+    // additionally provide per-pixel `userData.maxjsNirColorNode` and
+    // `maxjsNirEmissiveNode`; those replace the visible nodes only for the NIR
+    // pass. The scalar tag remains the spectral tracer fallback because the PT
+    // cannot execute arbitrary raster material graphs. The true visible color
+    // is parked in userData.giColor, which the spectral/probe packer honors
     // FIRST, so PT and probe-bounce albedo stay band-correct throughout.
     let rasterSensing = false;
 
     function applyRasterSwap(material, state, value) {
-        if (!material?.color?.isColor) return;
+        const hasScalarColor = material?.color?.isColor === true;
+        const hasNodeOverride = RASTER_NIR_NODE_BINDINGS.some(([, userDataKey]) =>
+            material?.userData?.[userDataKey] != null);
+        if (!hasScalarColor && !hasNodeOverride) return;
         if (!state.rasterSaved) {
             state.rasterSaved = true;
-            state.savedColor = material.color.clone();
+            state.savedColor = hasScalarColor ? material.color.clone() : null;
             state.hadGiColor = hasOwn(material.userData ?? {}, 'giColor');
             state.savedGiColor = material.userData?.giColor;
             material.userData ??= {};
-            material.userData.giColor = state.savedColor;
+            if (state.savedColor) material.userData.giColor = state.savedColor;
         }
-        material.color.setScalar(Math.min(1, Math.max(0, value)));
+
+        state.savedRasterNodes ??= {};
+        let nodeChanged = false;
+        let hasNirColorNode = false;
+        for (const [materialKey, userDataKey] of RASTER_NIR_NODE_BINDINGS) {
+            const nirNode = material.userData?.[userDataKey];
+            if (nirNode == null) continue;
+            if (materialKey === 'colorNode') hasNirColorNode = true;
+            if (!hasOwn(state.savedRasterNodes, materialKey)) {
+                state.savedRasterNodes[materialKey] = material[materialKey];
+            }
+            if (material[materialKey] === nirNode) continue;
+            material[materialKey] = nirNode;
+            nodeChanged = true;
+        }
+        if (nodeChanged) material.needsUpdate = true;
+        if (!hasNirColorNode && hasScalarColor) {
+            material.color.setScalar(Math.min(1, Math.max(0, value)));
+        }
     }
 
     function clearRasterSwap(material, state) {
         if (!state?.rasterSaved) return;
         state.rasterSaved = false;
+        let nodeChanged = false;
+        for (const [materialKey] of RASTER_NIR_NODE_BINDINGS) {
+            if (!hasOwn(state.savedRasterNodes ?? {}, materialKey)) continue;
+            if (material?.[materialKey] !== state.savedRasterNodes[materialKey]) {
+                material[materialKey] = state.savedRasterNodes[materialKey];
+                nodeChanged = true;
+            }
+        }
+        if (nodeChanged && material) material.needsUpdate = true;
         if (material?.color?.isColor && state.savedColor) material.color.copy(state.savedColor);
         if (material?.userData) {
             if (state.hadGiColor) material.userData.giColor = state.savedGiColor;
             else delete material.userData.giColor;
         }
         state.savedColor = null;
+        state.savedRasterNodes = null;
         state.savedGiColor = undefined;
     }
 

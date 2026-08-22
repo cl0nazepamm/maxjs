@@ -515,6 +515,7 @@ function createBakeSystem(deps = {}) {
                 deps.maxjsFx.markSceneChanged?.();
                 deps.maxjsFx.markOutputChanged?.();
                 markLightProbeSceneDirty();
+                deps.markSpeedballMaterialsDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 250 });
             }
             return changed;

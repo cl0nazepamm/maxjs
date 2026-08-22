@@ -906,6 +906,7 @@
         let localHdriFlip = false;
         let localHdriReflectionOnly = false;
 
+        let notifySpeedballMaterialStructureChanged = () => {};
         const texturePipeline = await createTexturePipeline({
             TSL,
             textureLoader,
@@ -926,6 +927,7 @@
             endTextureLoad,
             rememberMaterialEmissiveBase: (...args) => rememberMaterialEmissiveBase(...args),
             reapplyBakeOverridesToScene: () => reapplyBakeOverridesToScene(),
+            onMaterialStructureChanged: material => notifySpeedballMaterialStructureChanged(material),
             get renderer() { return renderer; },
             get rendererBackendLabel() { return rendererBackendLabel; },
             get bakeOverrides() { return bakeOverrides; },
@@ -1402,6 +1404,11 @@
             markLightProbeSceneDirty,
             markLightProbeLightsDirty,
             markLightProbeMaterialsDirty,
+            markSpeedballTransformsDirty,
+            markSpeedballDeformsDirty,
+            markSpeedballMaterialsDirty,
+            markSpeedballTopologyDirty,
+            markSpeedballLightsDirty,
             currentLightProbeSceneSignature,
             updateLightProbeGridFromScene,
             giVolumeNowMs,
@@ -1430,6 +1437,7 @@
             updateProbeHelpers,
             setProbeHelpersVisible,
         } = giVolumeGlue;
+        notifySpeedballMaterialStructureChanged = material => markSpeedballMaterialsDirty(material ?? null);
         if (skyActive) refreshSkyForSpectralView();
 
         const SYNC_MODE_UI = {
@@ -1705,6 +1713,11 @@
             markPathTracingSceneDirtyNow: (...args) => markPathTracingSceneDirtyNow(...args),
             markLightProbeSceneDirty,
             markLightProbeLightsDirty,
+            markSpeedballTransformsDirty,
+            markSpeedballDeformsDirty,
+            markSpeedballMaterialsDirty,
+            markSpeedballTopologyDirty,
+            markSpeedballLightsDirty,
             scheduleLightProbeFromCurrentScene,
             syncSpeedballProbeVolumes,
             schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
@@ -1783,6 +1796,7 @@
             countMaterialTextureSlots,
             buildGeometry,
             markLightProbeSceneDirty,
+            markSpeedballTopologyDirty,
             scheduleLightProbeFromCurrentScene,
             schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
             updateSyncHud,
@@ -1936,6 +1950,7 @@
             ensureSceneRenderableMaterial,
             stampSceneMaterial,
             markLightProbeSceneDirty,
+            markSpeedballMaterialsDirty,
             scheduleLightProbeFromCurrentScene,
             requestHostAction,
             bytesToBase64,
@@ -2318,7 +2333,7 @@
         // Toon outline is automatic — no UI button needed
 
         // Tone mapping modes
-        const DEFAULT_TONE_MAPPING = 'Neutral';
+        const DEFAULT_TONE_MAPPING = 'AgX';
         const toneMappingModes = {
             'None': THREE.NoToneMapping,
             'Linear': THREE.LinearToneMapping,
@@ -2695,6 +2710,8 @@
         let runtimeTransformRefreshQueued = false;
         let runtimeTransformLightsChanged = false;
         let runtimeTransformSurfacesChanged = false;
+        let runtimeTransformAllSurfacesChanged = false;
+        const runtimeTransformSurfaceTargets = new Set();
         const queueLightLinkSceneRefresh = () => {
             if (lightLinkSceneRefreshQueued) return;
             lightLinkSceneRefreshQueued = true;
@@ -2705,15 +2722,24 @@
         };
         const queueRuntimeTransformRefresh = (event) => {
             if (lightHandleMap.has(event?.handle)) runtimeTransformLightsChanged = true;
-            else runtimeTransformSurfacesChanged = true;
+            else {
+                runtimeTransformSurfacesChanged = true;
+                const target = nodeMap.get(event?.handle);
+                if (target?.geometry) runtimeTransformSurfaceTargets.add(target);
+                else runtimeTransformAllSurfacesChanged = true;
+            }
             if (runtimeTransformRefreshQueued) return;
             runtimeTransformRefreshQueued = true;
             queueMicrotask(() => {
                 runtimeTransformRefreshQueued = false;
                 const lightsChanged = runtimeTransformLightsChanged;
                 const surfacesChanged = runtimeTransformSurfacesChanged;
+                const allSurfacesChanged = runtimeTransformAllSurfacesChanged;
+                const surfaceTargets = new Set(runtimeTransformSurfaceTargets);
                 runtimeTransformLightsChanged = false;
                 runtimeTransformSurfacesChanged = false;
+                runtimeTransformAllSurfacesChanged = false;
+                runtimeTransformSurfaceTargets.clear();
 
                 // Runtime pose writes do not change mesh/material topology. In
                 // particular, markSceneChanged() refreshes SSR's scene-derived
@@ -2722,6 +2748,8 @@
                 // and PT invalidations, coalesced once per runtime update.
                 if (surfacesChanged) {
                     markLightProbeSceneDirty();
+                    if (allSurfacesChanged) markSpeedballTransformsDirty();
+                    else markSpeedballTransformsDirty(surfaceTargets);
                     schedulePathTracingLiveRebuild('transform');
                 }
                 if (lightsChanged) {
@@ -2760,6 +2788,16 @@
                     queueRuntimeTransformRefresh(event);
                     return;
                 }
+                if (event?.type === 'spectralMaterial') {
+                    const targets = new Set();
+                    for (const handle of event.handles ?? []) {
+                        const target = nodeMap.get(handle);
+                        if (target) targets.add(target);
+                    }
+                    markSpeedballMaterialsDirty(targets.size > 0 ? targets : null);
+                } else {
+                    markSpeedballTopologyDirty();
+                }
                 queueLightLinkSceneRefresh();
                 maxjsFx.markSceneChanged?.();
                 markLightProbeSceneDirty();
@@ -2779,6 +2817,15 @@
             getViewportAspect: () => getCameraProjectionAspect(),
             buildGeometry,
             applyMaterialScalar,
+            onSceneChange(change) {
+                if (change?.topology) markSpeedballTopologyDirty();
+                else {
+                    if (change?.transforms?.size) markSpeedballTransformsDirty(change.transforms);
+                    if (change?.materials?.size) markSpeedballMaterialsDirty(change.materials);
+                    if (change?.deform) markSpeedballDeformsDirty();
+                }
+                if (change?.lights) markSpeedballLightsDirty();
+            },
         });
         audioSystem = createMaxJSAudioSystem({
             THREE,
@@ -2791,6 +2838,16 @@
             parent: maxBasisRoot,
             getBus: () => layerManager?.getBus?.(),
             debugWarn: maxjsDebugWarn,
+            onSceneChange(change) {
+                if (change?.type === 'topology') {
+                    markSpeedballTopologyDirty();
+                    return;
+                }
+                if (change?.type === 'transform') {
+                    markSpeedballTransformsDirty(change.targets ?? null);
+                    if (change.deform === true) markSpeedballDeformsDirty();
+                }
+            },
         });
         layerManager.subscribe?.(() => {
             animationSystem.invalidateTargets();
@@ -2798,6 +2855,7 @@
             // Layer mutations can add/remove meshes — cheap scene refresh.
             maxjsFx.markSceneChanged?.();
             markLightProbeSceneDirty();
+            markSpeedballTopologyDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
             schedulePathTracingLiveRebuild();
         });

@@ -518,6 +518,7 @@ function buildLayerManager({
     overlayRoot,
     controls,
     sceneCameras = [],
+    onCameraModeChange = null,
     getAnimationSystem = () => null,
     getAudioSystem = () => null,
     getGLTFSystem = () => null,
@@ -541,6 +542,7 @@ function buildLayerManager({
             return null;
         },
         getSceneCameras: () => sceneCameras,
+        onCameraModeChange,
         getAnimationSystem,
         getAudioSystem,
         getGLTFSystem,
@@ -1966,6 +1968,7 @@ async function startRenderLoop({
         const dt = Math.min(0.25, Math.max(0, (nowMs - lastTimeMs) / 1000));
         lastTimeMs = nowMs;
         elapsed += dt;
+        layerManager?.enforceCameraControls?.();
         if (controls) controls.update();
         layerManager?.update?.(dt, elapsed);
         animationSystem?.update?.(dt);
@@ -2083,6 +2086,47 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         return result;
     };
 
+    const snapshotSceneCameras = Array.isArray(meta.sceneCameras) ? meta.sceneCameras : [];
+    const snapshotCameraByHandle = new Map(
+        snapshotSceneCameras
+            .map(entry => [Number(entry?.h ?? entry?.handle ?? 0), entry])
+            .filter(([handle]) => Number.isFinite(handle) && handle > 0),
+    );
+
+    function hasPortableCameraState(entry) {
+        return [entry?.pos, entry?.tgt, entry?.up]
+            .every(value => Array.isArray(value) && value.length >= 3
+                && value.slice(0, 3).every(Number.isFinite));
+    }
+
+    function applyPortableCameraRecord(record, handle = null) {
+        if (!hasPortableCameraState(record)) return false;
+        applyTopLevelCamera(record, { camera, controls, getAspect: getViewportAspect });
+        camera.userData ??= {};
+        camera.userData.maxjsSceneCameraHandle = Number.isFinite(Number(handle))
+            && Number(handle) > 0
+            ? Number(handle)
+            : null;
+        camera.userData.maxjsSceneCameraName = String(record?.n ?? record?.name ?? '');
+        camera.updateMatrix();
+        camera.updateMatrixWorld(true);
+        resize();
+        applySnapshotCameraClip(camera, snapshotCameraClip);
+        return true;
+    }
+
+    function applySnapshotLayerCameraMode(mode, { handle } = {}) {
+        if (mode === 'physical') {
+            const resolvedHandle = Number(handle);
+            const record = snapshotCameraByHandle.get(resolvedHandle);
+            return applyPortableCameraRecord(record, resolvedHandle);
+        }
+        if (mode === 'viewport') {
+            return applyPortableCameraRecord(meta.camera, Number(meta.activeCamera ?? 0));
+        }
+        return true;
+    }
+
     // Wire window resize → renderer + camera. Custom-site embedders that
     // host the canvas in a non-fullscreen context can call resize(w, h)
     // directly via the returned player handle. ResizeObserver catches CSS
@@ -2154,7 +2198,8 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     const layerManager = buildLayerManager({
         scene, camera, renderer, THREE,
         nodeMap, lightHandleMap, maxRoot, jsRoot, overlayRoot, controls,
-        sceneCameras: Array.isArray(meta.sceneCameras) ? meta.sceneCameras : [],
+        sceneCameras: snapshotSceneCameras,
+        onCameraModeChange: applySnapshotLayerCameraMode,
         getAnimationSystem: () => animationSystem,
         getAudioSystem: () => optionalModules.audio ?? null,
         getGLTFSystem: () => optionalModules.gltf ?? null,
@@ -2233,9 +2278,10 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Coordinates are in Max world space (Z-up), so they get parented
     // under maxBasisRoot via the camera's existing position math, but
     // OrbitControls.target needs the world-space (Y-up) value.
-    applyTopLevelCamera(meta.camera, { camera, controls, getAspect: getViewportAspect });
-    resize();
-    applySnapshotCameraClip(camera, snapshotCameraClip);
+    if (!applyPortableCameraRecord(meta.camera, Number(meta.activeCamera ?? 0))) {
+        resize();
+        applySnapshotCameraClip(camera, snapshotCameraClip);
+    }
 
     // Phase 7c: lock state. Snapshots authored with camera-lock active in
     // Max should ship without orbit controls — the snapshot represents a
@@ -2247,7 +2293,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     // Either says locked → disable controls. Custom-site embedders can
     // still call player.controls.enabled = true to override.
     const explicitLock = meta.snapshotUi?.camLock;
-    const inferredLock = meta.lockedCamera != null;
+    const inferredLock = Number(meta.lockedCamera) > 0;
     const locked = explicitLock === true || (explicitLock !== false && inferredLock);
     if (controls) {
         controls.enabled = !locked;

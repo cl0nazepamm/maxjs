@@ -2147,7 +2147,7 @@ function createPostFxGlue(deps = {}) {
                 }
                 if (typeof saved.camLock === 'boolean') {
                     deps.camLock = saved.camLock;
-                    deps.controls.enabled = !deps.camLock;
+                    deps.syncCameraControlAvailability();
                     deps.syncCameraLockButtonUi();
                 }
                 if (typeof saved.lightProbeEnabled === 'boolean') {

@@ -133,6 +133,17 @@ Exported snapshot folders can include:
 
 Snapshot export preserves scene hierarchy, transforms, materials, textures, lights, shadows, camera state, environment, sky, animation, runtime layers, and selected viewer UI state. PostFX coming later.
 
+Enable **Scene Cameras** to export every Max camera as a static, switchable snapshot record; this does not require animation, State Sets, or Camera Sequencer. Runtime layers can switch directly while preserving the same render camera and post-FX consumers:
+
+```js
+const cameras = ctx.camera.listSceneCameras();
+ctx.camera.useSceneCameraByName('Closeup', { exact: true });
+ctx.camera.useSceneCamera(cameras[0]);
+ctx.camera.useViewport(); // restore the originally exported view
+```
+
+`usePhysicalCamera()` and `usePhysicalCameraByName()` remain compatible aliases. **Camera Animation / Cuts** is separate and only bakes animated active-camera motion or legacy State Sets cuts.
+
 max.js treats runtime files as plugin-owned and `index.html` as project-owned. Re-exporting should refresh the runtime and scene payload without destroying standalone edits.
 
 The production binary contract, including units, channel encodings, MXJB deltas, and compatibility rules, is documented in [docs/M3_FORMAT.md](docs/M3_FORMAT.md).
@@ -156,9 +167,20 @@ scene_folder/
     effects.js
 ```
 
-Runtime layers read authored Max data through `ctx.maxScene` and create JS-owned objects through `ctx.js`. Snapshot export replays project layers when `project.maxjs.json` and `inlines/` are present.
+Runtime layers read authored Max data through `ctx.maxScene` and create JS-owned objects through `ctx.js`. For partitioned skeletons, `ctx.rig.bind('BoneName')` returns one hierarchy-aware control whose additive `setRotationEuler()` / `setQuaternion()` calls drive every private bone copy and descendant-only skin island. Snapshot export replays project layers when `project.maxjs.json` and `inlines/` are present.
+
+Partitioned facial morphs can be driven by channel name without object coupling: `ctx.morph.setMatching('Eye_Blink_L', weight, { clamp: true })` applies to every current or later-synced object exposing that morph, and `clearMatching()` restores each object's own authored value.
 
 Use runtime layers for interactive behavior, particles, overlays, camera logic, UI, gameplay-style logic, and deployable scene-specific code.
+
+Camera takeover is exclusive and transactional. Borrow the existing Max-style
+viewer controls with `ctx.camera.takeOver({ controls: 'viewer' })`, or pass
+`controls: 'none'` when the layer owns pointer input. Takeover wins over Viewer
+Camera Lock and incoming Max camera packets; `ctx.camera.release()` or automatic
+layer teardown restores the previous camera, orbit target, control mappings,
+navigation settings, and lock state. A non-owner cannot steal or release the
+camera. The older `useScriptMode({ enableOrbitControls: true })` spelling remains
+compatible.
 
 ## Animation
 

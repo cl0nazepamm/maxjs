@@ -3473,6 +3473,7 @@
             ExtractJsonBool(msg, L"includeAudios", options.includeAudios);
             ExtractJsonBool(msg, L"includeGLTFs", options.includeGLTFs);
             ExtractJsonBool(msg, L"includeInstances", options.includeInstances);
+            ExtractJsonBool(msg, L"includeSceneCameras", options.includeSceneCameras);
             ExtractJsonBool(msg, L"includeUnusedChannels", options.includeUnusedChannels);
             ExtractJsonBool(msg, L"includeAllMorphTargets", options.includeAllMorphTargets);
             ExtractJsonBool(msg, L"includeDebugPayload", options.includeDebugPayload);
@@ -6348,39 +6349,7 @@
         ss << L'}';
     }
 
-    void WriteSceneCamerasJson(std::wostringstream& ss) {
-        ss << L"\"sceneCameras\":[";
-        Interface* ip = GetCOREInterface();
-        INode* root = ip ? ip->GetRootNode() : nullptr;
-        bool first = true;
-        if (root) {
-            std::function<void(INode*)> collect = [&](INode* parent) {
-                for (int i = 0; i < parent->NumberOfChildren(); i++) {
-                    INode* node = parent->GetChildNode(i);
-                    if (!node) continue;
-                    if (IsSceneCameraNode(node)) {
-                        if (!first) ss << L',';
-                        ss << L"{\"h\":" << node->GetHandle()
-                           << L",\"n\":\"" << EscapeJson(node->GetName()) << L"\"";
-                        if (INode* target = node->GetTarget()) {
-                            ss << L",\"targetH\":" << target->GetHandle()
-                               << L",\"targetN\":\"" << EscapeJson(target->GetName()) << L"\"";
-                        }
-                        ss << L"}";
-                        first = false;
-                    }
-                    collect(node);
-                }
-            };
-            collect(root);
-        }
-        ss << L"],\"lockedCamera\":" << lockedCameraHandle_;
-    }
-
-    void WriteCameraJson(std::wostringstream& ss) {
-        CameraData cam = {};
-        GetActiveCamera(cam);
-        ss << L"\"camera\":{";
+    void WriteCameraDataJsonMembers(std::wostringstream& ss, const CameraData& cam) {
         ss << L"\"pos\":[";
         WriteFloatValue(ss, cam.pos[0]); ss << L',';
         WriteFloatValue(ss, cam.pos[1]); ss << L',';
@@ -6415,6 +6384,67 @@
             ss << L",\"dofBokehScale\":";
             WriteFloatValue(ss, cam.dofBokehScale);
         }
+    }
+
+    ULONG GetActiveSceneCameraHandle(Interface* ip) const {
+        if (lockedCameraHandle_ != 0) return lockedCameraHandle_;
+        if (!ip) return 0;
+        ViewExp& vp = ip->GetActiveViewExp();
+        INode* cameraNode = vp.GetViewCamera();
+        return cameraNode ? cameraNode->GetHandle() : 0;
+    }
+
+    void WriteSceneCamerasJson(std::wostringstream& ss,
+                               bool includeCameraState = false,
+                               bool includeSceneCameras = true,
+                               TimeValue sampleTime = 0) {
+        ss << L"\"sceneCameras\":[";
+        Interface* ip = GetCOREInterface();
+        INode* root = ip ? ip->GetRootNode() : nullptr;
+        const ULONG activeCameraHandle = includeSceneCameras
+            ? GetActiveSceneCameraHandle(ip)
+            : 0;
+        bool first = true;
+        if (root && includeSceneCameras) {
+            std::function<void(INode*)> collect = [&](INode* parent) {
+                for (int i = 0; i < parent->NumberOfChildren(); i++) {
+                    INode* node = parent->GetChildNode(i);
+                    if (!node) continue;
+                    if (IsSceneCameraNode(node)) {
+                        if (!first) ss << L',';
+                        ss << L"{\"h\":" << node->GetHandle()
+                           << L",\"n\":\"" << EscapeJson(node->GetName()) << L"\"";
+                        if (INode* target = node->GetTarget()) {
+                            ss << L",\"targetH\":" << target->GetHandle()
+                               << L",\"targetN\":\"" << EscapeJson(target->GetName()) << L"\"";
+                        }
+                        if (node->GetHandle() == activeCameraHandle) {
+                            ss << L",\"active\":true";
+                        }
+                        if (includeCameraState) {
+                            CameraData cameraData = {};
+                            if (GetSceneCameraData(node, sampleTime, cameraData)) {
+                                ss << L',';
+                                WriteCameraDataJsonMembers(ss, cameraData);
+                            }
+                        }
+                        ss << L"}";
+                        first = false;
+                    }
+                    collect(node);
+                }
+            };
+            collect(root);
+        }
+        ss << L"],\"lockedCamera\":" << lockedCameraHandle_
+           << L",\"activeCamera\":" << activeCameraHandle;
+    }
+
+    void WriteCameraJson(std::wostringstream& ss) {
+        CameraData cam = {};
+        GetActiveCamera(cam);
+        ss << L"\"camera\":{";
+        WriteCameraDataJsonMembers(ss, cam);
         ss << L'}';
     }
 

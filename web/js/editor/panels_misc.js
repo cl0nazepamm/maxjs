@@ -710,7 +710,7 @@ function createPanelsMisc(deps = {}) {
         btnCam.onclick = () => {
             deps.camLock = !deps.camLock;
             deps.syncCameraLockButtonUi();
-            deps.controls.enabled = !deps.camLock;
+            deps.syncCameraControlAvailability();
             deps.savePostFxState();
         };
 

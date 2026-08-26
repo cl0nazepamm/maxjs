@@ -143,7 +143,9 @@ export function createSpectralMaterialSystem({
         }
         if (nodeChanged) material.needsUpdate = true;
         if (!hasNirColorNode && hasScalarColor) {
-            material.color.setScalar(Math.min(1, Math.max(0, value)));
+            // Entries default to physical 0..1 reflectance, but an explicit
+            // options.max may opt into artistic HDR NIR response.
+            material.color.setScalar(Math.max(0, value));
         }
     }
 
@@ -356,8 +358,9 @@ export function createSpectralMaterialSystem({
     }
 
     function setEntryValue(entry, value) {
-        const next = Math.min(1, Math.max(0, Number(value)));
-        if (!Number.isFinite(next)) throw new TypeError('ctx.spectral.setNirAlbedo: value must be finite');
+        const number = Number(value);
+        if (!Number.isFinite(number)) throw new TypeError('ctx.spectral.setNirAlbedo: value must be finite');
+        const next = Math.min(entry.max, Math.max(0, number));
         if (next === entry.value) return false;
         entry.value = next;
         for (const material of entry.materialCounts.keys()) {
@@ -383,6 +386,8 @@ export function createSpectralMaterialSystem({
     function createEntry(layerId, getAdapter, selector, value, options = {}) {
         const number = Number(value);
         if (!Number.isFinite(number)) throw new TypeError('ctx.spectral.setNirAlbedo: value must be finite');
+        const requestedMax = Number(options.max);
+        const max = Number.isFinite(requestedMax) && requestedMax > 0 ? requestedMax : 1;
         const entry = {
             id: nextEntryId++,
             order: nextOrder++,
@@ -390,7 +395,8 @@ export function createSpectralMaterialSystem({
             layerId,
             getAdapter,
             selector: normalizeSelector(selector),
-            value: Math.min(1, Math.max(0, number)),
+            max,
+            value: Math.min(max, Math.max(0, number)),
             matched: new Set(),
             handleMaterials: new Map(),
             materialCounts: new Map(),
@@ -402,6 +408,7 @@ export function createSpectralMaterialSystem({
         return freezePlainObject({
             get key() { return entry.key; },
             get value() { return entry.value; },
+            get max() { return entry.max; },
             get matched() { return Object.freeze([...entry.matched]); },
             get materials() { return Object.freeze([...entry.materialCounts.keys()]); },
             get active() { return !entry.disposed; },

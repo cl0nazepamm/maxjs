@@ -9,6 +9,7 @@ function createSnapshotExport(deps = {}) {
             includeLights: true,
             includeAudios: true,
             includeInstances: true,
+            includeSceneCameras: true,
             includeUnusedChannels: false,
             includeAllMorphTargets: false,
             includeDebugPayload: false,
@@ -138,6 +139,7 @@ function createSnapshotExport(deps = {}) {
                             <label class="fx-check" for="snapshot-includeLights"><span>Lights</span><input id="snapshot-includeLights" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeAudios"><span>Audio</span><input id="snapshot-includeAudios" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeInstances"><span>Instances</span><input id="snapshot-includeInstances" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeSceneCameras" title="Export every Max scene camera with its transform, lens, clipping, and DOF state for direct runtime switching."><span>Scene Cameras</span><input id="snapshot-includeSceneCameras" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeUnusedChannels" title="Export stray vertex-color map channels (≥3, e.g. extra UVW sets). Off = lean export; tick only if a material reads maxjs_vc_N."><span>Unused VC Channels</span><input id="snapshot-includeUnusedChannels" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeAllMorphTargets" title="Keep zero unkeyed Morpher channels in the snapshot. Off prunes channels that sit at 0 and have no keys."><span>All Morph Channels</span><input id="snapshot-includeAllMorphTargets" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeDebugPayload"><span>Debug Payload</span><input id="snapshot-includeDebugPayload" type="checkbox"></label>
@@ -166,13 +168,13 @@ function createSnapshotExport(deps = {}) {
                             <label class="fx-check" for="snapshot-includeTransformAnimation"><span>Transform + Visibility</span><input id="snapshot-includeTransformAnimation" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeGeometryAnimation"><span>Geometry / Vertex</span><input id="snapshot-includeGeometryAnimation" type="checkbox"></label>
                             <label class="fx-check" for="snapshot-includeMaterialAnimation"><span>Material Params</span><input id="snapshot-includeMaterialAnimation" type="checkbox"></label>
-                            <label class="fx-check" for="snapshot-includeCameraAnimation"><span>Active Camera</span><input id="snapshot-includeCameraAnimation" type="checkbox"></label>
+                            <label class="fx-check" for="snapshot-includeCameraAnimation" title="Bake animated active-camera motion and legacy State Sets camera cuts."><span>Camera Animation / Cuts</span><input id="snapshot-includeCameraAnimation" type="checkbox"></label>
                             <label class="snapshot-inline" for="snapshot-animationSampleStepFrames">
                                 <span>Sample Every N Frames</span>
                                 <input id="snapshot-animationSampleStepFrames" type="number" min="1" max="120" step="1">
                             </label>
                         </div>
-                        <div class="snapshot-note">Material and geometry export are baked from the Max scene. Higher sample steps reduce export cost but also reduce fidelity.</div>
+                        <div class="snapshot-note">Scene Cameras above exports static switchable cameras without animation. Camera Animation / Cuts is only for animated camera motion and legacy State Sets cuts.</div>
                     </section>
                     <section class="fx-section">
                         <div class="fx-section-header">

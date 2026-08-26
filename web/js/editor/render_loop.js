@@ -34,9 +34,16 @@ function createRenderLoop(deps = {}) {
             const frameDt = captureFrameTime == null ? liveFrameDt : 0;
             const frameElapsed = captureFrameTime ?? liveFrameElapsed;
             deps.xrRuntime.update(frameDt);
-            if (!deps.xrRuntime.active) deps.syncOrbitNavigationFeel();
+            // Viewer navigation tuning belongs to the host only in viewport
+            // mode. A runtime camera owner borrowing OrbitControls must be able
+            // to author its own target, limits and feel without this frame loop
+            // writing over them immediately before controls.update().
+            if (!deps.xrRuntime.active && deps.layerManager.cameraMode === 'viewport') {
+                deps.syncOrbitNavigationFeel();
+            }
             let controlsChanged = false;
             if (!deps.xrRuntime.active && !(deps.animationSystem?.isDrivingSceneCamera?.())) {
+                deps.layerManager.enforceCameraControls?.();
                 controlsChanged = deps.controls.update() === true;
             }
             if (controlsChanged) {

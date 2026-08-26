@@ -680,6 +680,11 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f, \
         p_end, \
+    pb_alpha_test, _T("alphaTest"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ALPHA_TEST_EDIT, IDC_ALPHA_TEST_SPIN, 0.01f, \
+        p_end, \
     pb_lightmap, _T("lightMap"), TYPE_TEXMAP, 0, 0, \
         p_subtexno, UiSubTexToken(kMap_Lightmap), \
         p_ui, TYPE_TEXMAPBUTTON, IDC_LM_MAP, \
@@ -939,6 +944,9 @@ static void UpdateUtilityDialogUI(HWND hWnd, int utilityModel) {
     ShowUtilityControl(hWnd, IDC_UTILITY_OPMAPSTR_LABEL, showOpacityMapAmount);
     ShowUtilityControl(hWnd, IDC_OPMAPSTR_EDIT, showOpacityMapAmount);
     ShowUtilityControl(hWnd, IDC_OPMAPSTR_SPIN, showOpacityMapAmount);
+    ShowUtilityControl(hWnd, IDC_UTILITY_ALPHA_TEST_LABEL, showOpacityMap);
+    ShowUtilityControl(hWnd, IDC_ALPHA_TEST_EDIT, showOpacityMap);
+    ShowUtilityControl(hWnd, IDC_ALPHA_TEST_SPIN, showOpacityMap);
 
     ShowUtilityControl(hWnd, IDC_UTILITY_NORMAL_LABEL, showNormalRow);
     ShowUtilityControl(hWnd, IDC_NORMAL_MAP, showNormalRow);
@@ -1180,6 +1188,11 @@ static ThreeJSUtilityDlgProc utilityDlgProc;
         p_default, 1.0f, \
         p_range, 0.0f, 99999.0f, \
         p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_OPMAPSTR_EDIT, IDC_OPMAPSTR_SPIN, 0.01f, \
+        p_end, \
+    pb_alpha_test, _T("alphaTest"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_ALPHA_TEST_EDIT, IDC_ALPHA_TEST_SPIN, 0.01f, \
         p_end, \
     pb_lightmap, _T("lightMap"), TYPE_TEXMAP, 0, 0, \
         p_subtexno, UiSubTexToken(kMap_Lightmap), \

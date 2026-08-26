@@ -211,7 +211,7 @@ function createWebXRRuntime(deps = {}) {
                     xrOrigin.scale.setScalar(1);
                     restoreCameraState();
                     deps.camera.updateProjectionMatrix();
-                    controls.enabled = !deps.camLock;
+                    deps.syncCameraControlAvailability?.();
                     controls.update();
                     perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
                 }

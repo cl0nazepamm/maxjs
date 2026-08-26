@@ -18,6 +18,8 @@ enum ToonParamIDs {
     tp_ao_map, tp_ao_intensity,
     tp_displacement_map, tp_displacement_scale, tp_displacement_bias,
     tp_double_sided,
+    // Alpha cutoff (appended for scene compatibility).
+    tp_alpha_test,
 };
 
 enum ToonMapSlots {

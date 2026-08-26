@@ -37,7 +37,7 @@ BEGIN
     IDS_HTML_TEX_PARAMS "three.js HTML"
 END
 
-IDD_THREEJS_MTL DIALOG 0, 0, 170, 318
+IDD_THREEJS_MTL DIALOG 0, 0, 170, 334
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -121,15 +121,18 @@ BEGIN
     CONTROL         "",  IDC_DISP_BIAS_EDIT,"CustEdit", WS_TABSTOP, 138, 265, 16, 10
     CONTROL         "",  IDC_DISP_BIAS_SPIN,"SpinnerControl",0,        156,265, 11, 10
 
-    GROUPBOX        "Options",     -1,   2, 278, 166, 36
+    GROUPBOX        "Options",     -1,   2, 278, 166, 52
     CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 290, 68, 10
     LTEXT           "Env",         -1, 108, 290, 14,   8
     CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit", WS_TABSTOP, 128, 288, 20, 10
     CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,288, 11, 10
-    LTEXT           "Model: MeshStandardMaterial", IDC_MTL_MODEL_LABEL, 8, 302, 132, 8
+    LTEXT           "Alpha Cutoff", -1,   8, 306, 42, 8
+    CONTROL         "",  IDC_ALPHA_TEST_EDIT,"CustEdit", WS_TABSTOP, 52,304, 28, 10
+    CONTROL         "",  IDC_ALPHA_TEST_SPIN,"SpinnerControl",0, 82,304, 11, 10
+    LTEXT           "Model: MeshStandardMaterial", IDC_MTL_MODEL_LABEL, 8, 318, 132, 8
 END
 
-IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 562
+IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 578
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -291,15 +294,18 @@ BEGIN
     CONTROL         "",  IDC_DISP_BIAS_EDIT,"CustEdit", WS_TABSTOP, 138, 509, 16, 10
     CONTROL         "",  IDC_DISP_BIAS_SPIN,"SpinnerControl",0,        156,509, 11, 10
 
-    GROUPBOX        "Options",     -1,   2, 522, 166, 36
+    GROUPBOX        "Options",     -1,   2, 522, 166, 52
     CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 534, 68, 10
     LTEXT           "Env",         -1, 108, 534, 14,   8
     CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit", WS_TABSTOP, 128,532, 20, 10
     CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,532, 11, 10
-    LTEXT           "Model: MeshPhysicalMaterial / MeshSSSNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 546, 154, 8
+    LTEXT           "Alpha Cutoff", -1,   8, 550, 42, 8
+    CONTROL         "",  IDC_ALPHA_TEST_EDIT,"CustEdit", WS_TABSTOP, 52,548, 28, 10
+    CONTROL         "",  IDC_ALPHA_TEST_SPIN,"SpinnerControl",0, 82,548, 11, 10
+    LTEXT           "Model: MeshPhysicalMaterial / MeshSSSNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 562, 154, 8
 END
 
-IDD_THREEJS_SSS_MTL DIALOG 0, 0, 170, 390
+IDD_THREEJS_SSS_MTL DIALOG 0, 0, 170, 406
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -403,12 +409,15 @@ BEGIN
     CONTROL         "",  IDC_SSS_SCALE_EDIT,"CustEdit", WS_TABSTOP, 34, 337, 18, 10
     CONTROL         "",  IDC_SSS_SCALE_SPIN,"SpinnerControl",0,        54, 337, 11, 10
 
-    GROUPBOX        "Options",     -1,   2, 350, 166, 36
+    GROUPBOX        "Options",     -1,   2, 350, 166, 52
     CONTROL         "Double Sided",IDC_DOUBLE_SIDED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP, 8, 362, 68, 10
     LTEXT           "Env",         -1, 108, 362, 14,   8
     CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit", WS_TABSTOP, 128, 360, 20, 10
     CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,360, 11, 10
-    LTEXT           "Model: MeshSSSNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 374, 132, 8
+    LTEXT           "Alpha Cutoff", -1,   8, 378, 42, 8
+    CONTROL         "",  IDC_ALPHA_TEST_EDIT,"CustEdit", WS_TABSTOP, 52,376, 28, 10
+    CONTROL         "",  IDC_ALPHA_TEST_SPIN,"SpinnerControl",0, 82,376, 11, 10
+    LTEXT           "Model: MeshSSSNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 390, 132, 8
 END
 
 IDD_THREEJS_UTILITY_MTL DIALOG 0, 0, 170, 496
@@ -519,6 +528,9 @@ BEGIN
     LTEXT           "Env",         IDC_UTILITY_ENV_LABEL, 108, 426, 14,   8
     CONTROL         "",  IDC_ENV_INT_EDIT,"CustEdit",      WS_TABSTOP, 128,424, 20, 10
     CONTROL         "",  IDC_ENV_INT_SPIN,"SpinnerControl", 0,         150,424, 11, 10
+    LTEXT           "Alpha Cutoff", IDC_UTILITY_ALPHA_TEST_LABEL, 8, 442, 42, 8
+    CONTROL         "",  IDC_ALPHA_TEST_EDIT,"CustEdit", WS_TABSTOP, 52,440, 28, 10
+    CONTROL         "",  IDC_ALPHA_TEST_SPIN,"SpinnerControl",0, 82,440, 11, 10
     LTEXT           "Models: Distance / Depth / Lambert / Matcap / Normal / Phong / Backdrop", IDC_MTL_MODEL_LABEL, 8, 456, 154, 24
 END
 

@@ -1882,13 +1882,14 @@
             get webglBasicFx() { return webglBasicFx; },
             get shaderLabFx() { return shaderLabFx; },
             get pathTracingFx() { return pathTracingFx; },
-            get layerManager() { return layerManager; },
+            get layerManager() { return _layerManagerRef; },
             get xrRuntime() { return xrRuntime; },
             get nodeMap() { return nodeMap; },
         });
         const {
             updateSceneCameraList,
             syncCameraLockButtonUi,
+            syncCameraControlAvailability,
             applyLayerCameraMode,
             getCameraProjectionAspect,
             applyCameraProjectionFromMax,
@@ -2150,6 +2151,7 @@
             getViewportFrameRect,
             syncPostFxPanel: (...args) => syncPostFxPanel(...args),
             syncCameraLockButtonUi,
+            syncCameraControlAvailability,
             applyLocalHDRIToScene,
             syncEnvironmentDisplay,
             applyLightProbeState,
@@ -2380,6 +2382,7 @@
             setRightDockWidth,
             setShaderLabSnapshot,
             syncCameraLockButtonUi,
+            syncCameraControlAvailability,
             syncEnvButtonUi,
             syncEnvironmentDisplay,
             syncHdriPanel,
@@ -2567,7 +2570,7 @@
             : createWebXRRuntime({
                 renderer, scene, controls, perfHud, cameraDefaultPosition,
                 rendererBackendLabel, computeVisibleSceneBounds,
-                isWgl2FallbackBackendActive,
+                isWgl2FallbackBackendActive, syncCameraControlAvailability,
                 get camera() { return camera; },
                 get camLock() { return camLock; },
             });

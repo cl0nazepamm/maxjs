@@ -1395,6 +1395,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     d.roughness  = pb->GetFloat(pb_roughness, t);
     d.metalness  = pb->GetFloat(pb_metalness, t);
     d.opacity    = pb->GetFloat(pb_opacity, t);
+    d.alphaTest  = std::clamp(getOptionalFloat(pb_alpha_test, 0.0f), 0.0f, 1.0f);
     d.colorMapStrength = pb->GetFloat(pb_color_map_strength, t);
     d.roughnessMapStrength = pb->GetFloat(pb_roughness_map_strength, t);
     d.metalnessMapStrength = pb->GetFloat(pb_metalness_map_strength, t);
@@ -1590,6 +1591,9 @@ static void ExtractThreeJSToonMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     Color c = pb->GetColor(tp_color, t);
     d.color[0] = c.r; d.color[1] = c.g; d.color[2] = c.b;
     d.opacity = pb->GetFloat(tp_opacity, t);
+    d.alphaTest = HasParam(pb, tp_alpha_test)
+        ? std::clamp(pb->GetFloat(tp_alpha_test, t), 0.0f, 1.0f)
+        : 0.0f;
     d.normalScale = pb->GetFloat(tp_normal_scale, t);
     d.bumpScale = pb->GetFloat(tp_bump_scale, t);
     d.displacementScale = pb->GetFloat(tp_displacement_scale, t);
@@ -2153,7 +2157,12 @@ static void ExtractPhysicalMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
     // present, matching Max's cutout-over-transparency precedence) and only fall
     // back to transparency when cutout left the slot empty.
     readMap(_T("cutout_map"),       _T("cutout_map_on"),        d.opacityMap,      d.opacityMapTransform);
-    if (d.opacityMap.empty()) {
+    if (!d.opacityMap.empty()) {
+        // Max's Cutout slot is coverage, not blended transparency. Preserve
+        // that semantic so hair cards and foliage stay in the opaque queue and
+        // discard JPEG/filtered near-black texels instead of drawing card slabs.
+        d.alphaTest = 0.5f;
+    } else {
         readMap(_T("transparency_map"), _T("transparency_map_on"), d.opacityMap, d.opacityMapTransform);
     }
 

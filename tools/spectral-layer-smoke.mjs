@@ -66,6 +66,22 @@ assert.equal(eye.colorNode, visibleEyeColorNode);
 assert.equal(eye.emissiveNode, visibleEyeEmissiveNode);
 eyeNir.dispose();
 
+const hot = material('Hot_NIR');
+hot.color = color(0.2);
+nodeMap.set(7, object('Hot_Main', 7, 0, hot));
+const hotNir = spectral.setNirAlbedo('Hot*', 2, { max: 8 });
+assert.equal(hotNir.value, 2);
+assert.equal(hotNir.max, 8);
+assert.equal(hot.userData.nirAlbedo, 2);
+system.setRasterSensing(true);
+assert.equal(hot.color.value, 2, 'opt-in HDR NIR must reach the raster material');
+hotNir.set(20);
+assert.equal(hotNir.value, 8);
+assert.equal(hot.color.value, 8);
+system.setRasterSensing(false);
+assert.equal(hot.color.value, 0.2);
+hotNir.dispose();
+
 const foliage = spectral.setNirAlbedo({
     under: 'Vegetation',
     materials: 'Leaf*',

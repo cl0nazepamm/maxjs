@@ -107,6 +107,8 @@ enum ThreeJSParamIDs {
     pb_depth_packing,
     pb_fog,
     pb_combine,
+    // Alpha cutoff (appended for scene compatibility).
+    pb_alpha_test,
 };
 
 enum ThreeJSUtilityModel {

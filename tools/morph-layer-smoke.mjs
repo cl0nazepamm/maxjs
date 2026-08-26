@@ -26,9 +26,10 @@ const renderer = {
 };
 const maxRoot = new THREE.Group();
 const original = morphMesh('Face', 101);
-maxRoot.add(original);
+const tearline = morphMesh('TearLine', 102, 0.05, 0.02);
+maxRoot.add(original, tearline);
 scene.add(maxRoot);
-const nodeMap = new Map([[101, original]]);
+const nodeMap = new Map([[101, original], [102, tearline]]);
 
 const manager = createLayerManager({
     scene,
@@ -96,8 +97,30 @@ assert.equal(replacement.morphTargetInfluences[0], 1, 'optional clamp constrains
 assert.equal(morph.clear(101, 0), true);
 assert.equal(replacement.morphTargetInfluences[0], 0.25);
 
+assert.deepEqual(morph.matching('Blink'), [101, 102], 'matching finds every object exposing the channel name');
+assert.equal(morph.setMatching('Blink', 0.6, { clamp: true }), 2, 'setMatching broadcasts to every current match');
+assert.equal(replacement.morphTargetInfluences[0], 0.6, 'matching override reaches the rebuilt face');
+assert.equal(tearline.morphTargetInfluences[0], 0.6, 'matching override reaches the separate tearline');
+
+const latePart = morphMesh('LateFacePart', 103, 0.12, 0.03);
+maxRoot.add(latePart);
+nodeMap.set(103, latePart);
+manager.beforeRender(4);
+assert.equal(latePart.morphTargetInfluences[0], 0.6, 'retained matching override reaches a late-synced face partition');
+
+replacement.morphTargetInfluences[0] = 0.3;
+tearline.morphTargetInfluences[0] = 0.4;
+latePart.morphTargetInfluences[0] = 0.22;
+manager.beforeRender(5);
+assert.equal(replacement.morphTargetInfluences[0], 0.6, 'matching override survives an authored face update');
+assert.equal(tearline.morphTargetInfluences[0], 0.6, 'matching override survives an authored tearline update');
+assert.equal(morph.clearMatching('Blink'), 3, 'clearMatching clears every object owned by the broadcast');
+assert.equal(replacement.morphTargetInfluences[0], 0.3, 'face restores its newest authored value');
+assert.equal(tearline.morphTargetInfluences[0], 0.4, 'tearline restores its newest authored value');
+assert.equal(latePart.morphTargetInfluences[0], 0.22, 'late partition restores its newest authored value');
+
 assert.equal(morph.set(101, 'Blink', 0.9), true);
 assert.equal(manager.remove('morph-smoke'), true);
-assert.equal(replacement.morphTargetInfluences[0], 0.25, 'layer removal restores owned morph channels');
+assert.equal(replacement.morphTargetInfluences[0], 0.3, 'layer removal restores owned morph channels');
 
 console.log('morph layer smoke: ok');

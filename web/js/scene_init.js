@@ -191,8 +191,10 @@ export function createScene({ renderer, canvas } = {}) {
     overlayRoot.name = '__maxjs_overlay_root__';
     maxBasisRoot.add(overlayRoot);
 
-    // Camera — perspective only in snapshot mode (live mode supports an
-    // ortho switch, but snapshots always export a single camera state).
+    // One stable render camera is shared by post-FX and runtime consumers.
+    // Snapshots can export many portable scene-camera records and apply them
+    // onto this object without replacing consumer references. Orthographic
+    // projection remains a separate compatibility concern.
     const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
 
     const initialSize = measureCanvasSize(canvas ?? renderer.domElement);

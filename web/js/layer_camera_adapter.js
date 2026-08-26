@@ -47,6 +47,9 @@ function createCameraAdapter(
         const name = String(entry?.name ?? entry?.n ?? entry?.label ?? '').trim();
         const targetHandle = Number(entry?.targetHandle ?? entry?.targetH ?? entry?.th ?? 0);
         const targetName = String(entry?.targetName ?? entry?.targetN ?? entry?.tn ?? '').trim();
+        const hasSnapshotState = [entry?.pos, entry?.tgt, entry?.up]
+            .every(value => Array.isArray(value) && value.length >= 3
+                && value.slice(0, 3).every(Number.isFinite));
         return freezePlainObject({
             handle,
             h: handle,
@@ -56,6 +59,8 @@ function createCameraAdapter(
             targetH: Number.isFinite(targetHandle) && targetHandle > 0 ? targetHandle : null,
             targetName,
             targetN: targetName,
+            active: entry?.active === true,
+            hasSnapshotState,
         });
     }
 
@@ -74,10 +79,20 @@ function createCameraAdapter(
         }) ?? null;
     }
 
-    function usePhysicalCamera(handle) {
+    function useSceneCamera(handle) {
         if (!isActive()) return false;
         const resolvedHandle = Number(handle?.handle ?? handle?.h ?? handle);
+        if (!Number.isFinite(resolvedHandle) || resolvedHandle <= 0) return false;
         return cameraControl.setMode('physical', { handle: resolvedHandle, layerId });
+    }
+
+    function getActiveSceneCamera() {
+        const cameras = listSceneCameras();
+        const physicalHandle = Number(cameraControl.getPhysicalCameraHandle?.() ?? 0);
+        if (physicalHandle > 0) {
+            return cameras.find(entry => entry.handle === physicalHandle) ?? null;
+        }
+        return cameras.find(entry => entry.active) ?? null;
     }
 
     function readVector3Like(value, target = new THREE.Vector3()) {
@@ -172,32 +187,40 @@ function createCameraAdapter(
         // Switch to viewport mode (synced from Max viewport)
         useViewport() {
             if (!isActive()) return false;
-            return cameraControl.setMode('viewport');
+            return cameraControl.setMode('viewport', { layerId });
         },
 
         // Switch to physical camera mode (lock to Max camera object)
-        usePhysicalCamera,
+        useSceneCamera,
+        usePhysicalCamera: useSceneCamera,
 
         listSceneCameras,
         findSceneCamera,
+        getActiveSceneCamera,
+        useSceneCameraByName(name, options = {}) {
+            const entry = findSceneCamera(name, options);
+            return entry ? useSceneCamera(entry.handle) : false;
+        },
         usePhysicalCameraByName(name, options = {}) {
             const entry = findSceneCamera(name, options);
-            return entry ? usePhysicalCamera(entry.handle) : false;
+            return entry ? useSceneCamera(entry.handle) : false;
         },
 
         // Switch to script/game mode (full JS control)
         useScriptMode(options = {}) {
             if (!isActive()) return false;
             return cameraControl.setMode('script', {
+                ...options,
                 layerId,
-                enableControls: options.enableOrbitControls ?? false,
+                controls: options.controls
+                    ?? (options.enableOrbitControls === true ? 'viewer' : 'none'),
             });
         },
 
         // Legacy ownership API (maps to script mode)
-        takeOver() { return isActive() && cameraControl.claim(layerId); },
+        takeOver(options = {}) { return isActive() && cameraControl.claim(layerId, options); },
         release() {
-            if (isActive()) cameraControl.release(layerId);
+            return isActive() ? cameraControl.release(layerId) : false;
         },
         get isOverridden() { return cameraControl.isClaimed(); },
         get isOwnedByMe() { return isActive() && cameraControl.getOwner() === layerId; },
@@ -427,9 +450,7 @@ function createCameraAdapter(
         // Enable/disable controls temporarily
         setControlsEnabled(enabled) {
             if (!isActive()) return false;
-            const ctrl = cameraControl.getControls?.();
-            if (ctrl) ctrl.enabled = enabled;
-            return !!ctrl;
+            return cameraControl.setControlsEnabled?.(layerId, enabled === true) ?? false;
         },
     });
 }

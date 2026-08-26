@@ -1686,7 +1686,7 @@
         ss << L",";
         WriteCameraJson(ss);
         ss << L",";
-        WriteSceneCamerasJson(ss);
+        WriteSceneCamerasJson(ss, true, options.includeSceneCameras, t);
 
         EnvData envData;
         GetEnvironment(envData);

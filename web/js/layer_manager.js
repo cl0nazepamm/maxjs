@@ -9,6 +9,7 @@ import { createDeformSystem } from './layer_deform.js';
 import { createLayerParamController } from './layer_params.js';
 import { createMorphSystem } from './layer_morph.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
+import { createRigFacade } from './layer_rig.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
 import { createSpectralMaterialSystem } from './layer_spectral.js';
 import {
@@ -39,6 +40,84 @@ const INERT_LAYER_INPUT = freezePlainObject({
     on() {},
     dispose() {},
 });
+
+const CAMERA_CONTROL_SCALAR_KEYS = Object.freeze([
+    'autoRotate', 'autoRotateSpeed',
+    'dampingFactor', 'enableDamping',
+    'enablePan', 'enableRotate', 'enableZoom',
+    'keyPanSpeed', 'maxAzimuthAngle', 'maxDistance', 'maxPolarAngle', 'maxTargetRadius', 'maxZoom',
+    'minAzimuthAngle', 'minDistance', 'minPolarAngle', 'minTargetRadius', 'minZoom',
+    'panSpeed', 'rotateSpeed', 'screenSpacePanning', 'zoomSpeed', 'zoomToCursor',
+]);
+
+function captureCameraState(activeCamera) {
+    if (!activeCamera) return null;
+    return {
+        camera: activeCamera,
+        matrixAutoUpdate: activeCamera.matrixAutoUpdate,
+        position: activeCamera.position?.clone?.() ?? null,
+        quaternion: activeCamera.quaternion?.clone?.() ?? null,
+        up: activeCamera.up?.clone?.() ?? null,
+        zoom: activeCamera.zoom,
+        fov: activeCamera.fov,
+        near: activeCamera.near,
+        far: activeCamera.far,
+        aspect: activeCamera.aspect,
+        left: activeCamera.left,
+        right: activeCamera.right,
+        top: activeCamera.top,
+        bottom: activeCamera.bottom,
+    };
+}
+
+function restoreCameraState(state) {
+    const activeCamera = state?.camera;
+    if (!activeCamera) return;
+    if (state.position && activeCamera.position) activeCamera.position.copy(state.position);
+    if (state.quaternion && activeCamera.quaternion) activeCamera.quaternion.copy(state.quaternion);
+    if (state.up && activeCamera.up) activeCamera.up.copy(state.up);
+    for (const key of ['zoom', 'fov', 'near', 'far', 'aspect', 'left', 'right', 'top', 'bottom']) {
+        if (state[key] !== undefined && key in activeCamera) activeCamera[key] = state[key];
+    }
+    activeCamera.matrixAutoUpdate = state.matrixAutoUpdate;
+    activeCamera.updateProjectionMatrix?.();
+    activeCamera.updateMatrix?.();
+    activeCamera.updateMatrixWorld?.(true);
+}
+
+function captureViewerControls(controls) {
+    if (!controls) return null;
+    const scalars = {};
+    for (const key of CAMERA_CONTROL_SCALAR_KEYS) {
+        if (key in controls) scalars[key] = controls[key];
+    }
+    return {
+        enabled: controls.enabled,
+        target: controls.target?.clone?.() ?? null,
+        cursor: controls.cursor?.clone?.() ?? null,
+        mouseButtons: controls.mouseButtons ? { ...controls.mouseButtons } : null,
+        touches: controls.touches ? { ...controls.touches } : null,
+        scalars,
+    };
+}
+
+function restoreViewerControls(controls, state) {
+    if (!controls || !state) return;
+    for (const [key, value] of Object.entries(state.scalars)) controls[key] = value;
+    if (state.target && controls.target) controls.target.copy(state.target);
+    if (state.cursor && controls.cursor) controls.cursor.copy(state.cursor);
+    if (state.mouseButtons && controls.mouseButtons) Object.assign(controls.mouseButtons, state.mouseButtons);
+    if (state.touches && controls.touches) Object.assign(controls.touches, state.touches);
+    controls.enabled = state.enabled;
+    controls.update?.();
+}
+
+function normalizeCameraControlsMode(options = {}) {
+    const requested = options.controls;
+    if (requested === true || requested === 'viewer' || requested === 'orbit') return 'viewer';
+    if (requested === false || requested === 'none' || requested === 'manual') return 'none';
+    return options.enableControls === true || options.enableOrbitControls === true ? 'viewer' : 'none';
+}
 
 export function createLayerManager({
     scene,
@@ -96,59 +175,103 @@ export function createLayerManager({
     let cameraMode = 'viewport';
     let cameraClaimOwner = null; // layer id that claimed camera (for 'script' mode)
     let physicalCameraHandle = null; // handle of locked physical camera (for 'physical' mode)
-    let controlsEnabledBeforeClaim = true;
+    let cameraControlsMode = 'none';
+    let cameraRestoreFrame = null;
 
     const cameraControl = {
         getMode() { return cameraMode; },
         setMode(mode, options = {}) {
             if (mode !== 'viewport' && mode !== 'physical' && mode !== 'script') return false;
-            if (mode === 'physical' && !Number.isFinite(Number(options.handle))) return false;
+            const resolvedHandle = Number(options.handle);
+            if (mode === 'physical' && (!Number.isFinite(resolvedHandle) || resolvedHandle <= 0)) return false;
+            const requestedOwner = options.layerId ?? null;
+            if (cameraClaimOwner && requestedOwner !== cameraClaimOwner && options.force !== true) return false;
+            if (mode !== 'viewport' && !requestedOwner) return false;
             const prevMode = cameraMode;
+            const prevOwner = cameraClaimOwner;
+            const prevPhysicalHandle = physicalCameraHandle;
+            const prevCameraControlsMode = cameraControlsMode;
+            const activeCamera = getCamera ? getCamera() : camera;
+            const transactionCameraState = captureCameraState(activeCamera);
+            const transactionControlsState = captureViewerControls(controls);
+            const enteringOwnedMode = prevMode === 'viewport' && mode !== 'viewport';
+            const leavingOwnedMode = prevMode !== 'viewport' && mode === 'viewport';
+
+            if (enteringOwnedMode) {
+                cameraRestoreFrame = {
+                    camera: transactionCameraState,
+                    controls: transactionControlsState,
+                };
+            }
             cameraMode = mode;
 
             if (mode === 'viewport') {
                 // Release any ownership, sync from Max viewport
                 cameraClaimOwner = null;
                 physicalCameraHandle = null;
-                camera.matrixAutoUpdate = false;
-                if (controls) controls.enabled = controlsEnabledBeforeClaim;
+                cameraControlsMode = 'none';
+                if (leavingOwnedMode && cameraRestoreFrame) {
+                    restoreCameraState(cameraRestoreFrame.camera);
+                    restoreViewerControls(controls, cameraRestoreFrame.controls);
+                } else if (activeCamera) {
+                    activeCamera.matrixAutoUpdate = isSnapshot;
+                }
             } else if (mode === 'physical') {
-                // Lock to physical camera object
-                physicalCameraHandle = options.handle ?? null;
-                cameraClaimOwner = options.layerId ?? null;
-                camera.matrixAutoUpdate = false;
+                // Lock to a named scene camera. Live mode asks Max to sync it;
+                // snapshots apply the exported static camera record in the
+                // onCameraModeChange callback.
+                physicalCameraHandle = resolvedHandle;
+                cameraClaimOwner = requestedOwner;
+                cameraControlsMode = 'none';
+                if (activeCamera) activeCamera.matrixAutoUpdate = false;
                 if (controls) controls.enabled = false;
             } else if (mode === 'script') {
                 // Full JS control
-                cameraClaimOwner = options.layerId ?? null;
+                cameraClaimOwner = requestedOwner;
                 physicalCameraHandle = null;
-                camera.matrixAutoUpdate = true;
-                if (controls) {
-                    if (prevMode !== 'script') controlsEnabledBeforeClaim = controls.enabled;
-                    controls.enabled = options.enableControls ?? false;
-                }
+                cameraControlsMode = normalizeCameraControlsMode(options);
+                if (activeCamera) activeCamera.matrixAutoUpdate = true;
+                if (controls) controls.enabled = cameraControlsMode === 'viewer';
             }
+            let accepted = true;
             try {
-                onCameraModeChange?.(mode, {
+                const callbackResult = onCameraModeChange?.(mode, {
                     handle: physicalCameraHandle,
                     owner: cameraClaimOwner,
-                    enableControls: options.enableControls ?? false,
+                    controls: cameraControlsMode,
+                    enableControls: cameraControlsMode === 'viewer',
+                    previousMode: prevMode,
+                    previousOwner: prevOwner,
+                    restoring: leavingOwnedMode,
                 });
+                if (callbackResult === false) accepted = false;
             } catch (error) {
                 console.error('[LayerManager] camera mode change callback error', error);
+                accepted = false;
             }
+            if (!accepted) {
+                cameraMode = prevMode;
+                cameraClaimOwner = prevOwner;
+                physicalCameraHandle = prevPhysicalHandle;
+                cameraControlsMode = prevCameraControlsMode;
+                restoreCameraState(transactionCameraState);
+                restoreViewerControls(controls, transactionControlsState);
+                if (enteringOwnedMode) cameraRestoreFrame = null;
+                return false;
+            }
+            if (leavingOwnedMode) cameraRestoreFrame = null;
             return true;
         },
-        claim(layerId) {
+        claim(layerId, options = {}) {
             if (cameraMode === 'script' && cameraClaimOwner && cameraClaimOwner !== layerId) return false;
-            return this.setMode('script', { layerId, enableControls: false });
+            return this.setMode('script', { ...options, layerId });
         },
         release(layerId) {
             if (cameraMode === 'script' && (!layerId || cameraClaimOwner === layerId)) {
-                return this.setMode('viewport');
+                return this.setMode('viewport', { layerId: layerId ?? cameraClaimOwner });
             }
             if (cameraMode === 'physical' && (!cameraClaimOwner || !layerId || cameraClaimOwner === layerId)) {
-                return this.setMode('viewport');
+                return this.setMode('viewport', { layerId: layerId ?? cameraClaimOwner });
             }
             return false;
         },
@@ -157,6 +280,20 @@ export function createLayerManager({
         isViewportMode() { return cameraMode === 'viewport'; },
         isPhysicalMode() { return cameraMode === 'physical'; },
         getOwner() { return cameraClaimOwner; },
+        getControlsMode() { return cameraControlsMode; },
+        setControlsEnabled(layerId, enabled) {
+            if (cameraMode !== 'script' || cameraClaimOwner !== layerId) return false;
+            cameraControlsMode = enabled ? 'viewer' : 'none';
+            if (controls) controls.enabled = enabled === true;
+            return true;
+        },
+        enforceControls() {
+            if (!controls || cameraMode === 'viewport') return false;
+            const enabled = cameraMode === 'script' && cameraControlsMode === 'viewer';
+            if (controls.enabled === enabled) return false;
+            controls.enabled = enabled;
+            return true;
+        },
         getPhysicalCameraHandle() { return physicalCameraHandle; },
         getControls() { return controls; },
         getCamera() { return getCamera ? getCamera() : camera; },
@@ -643,6 +780,14 @@ export function createLayerManager({
             createAnchor: (handle, options = {}) => createAnchorForLayer(layer, handle, options),
             THREE,
         });
+        const rigFacade = createRigFacade({
+            THREE,
+            nodeMap,
+            maxScene: maxSceneFacade,
+            getAdapter: (handle, explicitObj) => getLayerNodeAdapter(layer, handle, explicitObj),
+            isActive: () => isLayerCurrent(layer),
+        });
+        layer.disposers.push(() => rigFacade.disposeAll());
 
         const gltfFacade = freezePlainObject({
             get(handle) {
@@ -1204,6 +1349,7 @@ export function createLayerManager({
             scene: maxSceneFacade,
             maxScene: maxSceneFacade,
             nodeMap: nodeMapFacade,
+            rig: rigFacade,
             camera: cameraFacade,
             renderer: rendererFacade,
             instances: instancesFacade,
@@ -1855,6 +2001,9 @@ export function createLayerManager({
         serialize,
         get isCameraOverridden() { return cameraControl.isScriptMode(); },
         get cameraMode() { return cameraControl.getMode(); },
+        get cameraOwner() { return cameraControl.getOwner(); },
+        get cameraControlsMode() { return cameraControl.getControlsMode(); },
+        enforceCameraControls() { return cameraControl.enforceControls(); },
         roots: freezePlainObject({
             maxRoot,
             jsRoot: jsWorldRoot,

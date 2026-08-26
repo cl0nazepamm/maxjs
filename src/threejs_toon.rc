@@ -38,6 +38,9 @@ BEGIN
     CONTROL         "", IDC_TOON_OPAC_E, "CustEdit", WS_TABSTOP, 52, 102, 30, 10
     CONTROL         "", IDC_TOON_OPAC_S, "SpinnerControl", 0, 82, 102, 11, 10
     CONTROL         "", IDC_TOON_OPAC_MAP, "CustButton", WS_TABSTOP, 52, 116, 70, 12
+    LTEXT           "Cut", -1, 126, 118, 12, 8
+    CONTROL         "", IDC_TOON_ALPHA_TEST_E, "CustEdit", WS_TABSTOP, 140, 116, 16, 10
+    CONTROL         "", IDC_TOON_ALPHA_TEST_S, "SpinnerControl", 0, 157, 116, 11, 10
     
     // ── Emission ──────────────────────────────
     GROUPBOX        "Emission", -1, 2, 130, 166, 65

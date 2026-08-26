@@ -15,6 +15,10 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
     // state in a WeakMap so a full sync can replace the mesh without retaining
     // the dead object or losing the newest authored value underneath it.
     const overrides = new Map();
+    // Layer-owned channel broadcasts. A matching override is retained by
+    // morph name and re-scanned during applyAll(), so newly synced face
+    // partitions automatically join without being named by layer code.
+    const matchingOverrides = new Map();
 
     function resolveTarget(target) {
         if (target == null) return null;
@@ -107,6 +111,16 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
         );
     }
 
+    function matchingHandles(channel) {
+        if (typeof channel !== 'string' || !channel) return Object.freeze([]);
+        const out = [];
+        for (const [handle, object] of nodeMap) {
+            if (!Number.isFinite(Number(handle))) continue;
+            if (resolveChannel(object, channel)) out.push(Number(handle));
+        }
+        return Object.freeze(out);
+    }
+
     function applyEntry(object, channel, entry) {
         const resolved = resolveChannel(object, channel);
         if (!resolved) return false;
@@ -165,7 +179,22 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
         return changed;
     }
 
+    function applyMatchingEntry(layerId, entry) {
+        let matched = 0;
+        for (const handle of matchingHandles(entry.channel)) {
+            if (set(layerId, handle, entry.channel, entry.value, entry.options)) matched++;
+        }
+        return matched;
+    }
+
+    function applyAllMatching() {
+        for (const [layerId, entries] of matchingOverrides) {
+            for (const entry of entries.values()) applyMatchingEntry(layerId, entry);
+        }
+    }
+
     function applyAll() {
+        applyAllMatching();
         let changed = false;
         for (const handle of overrides.keys()) changed = applyHandle(handle) || changed;
         return changed;
@@ -233,6 +262,42 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
         return true;
     }
 
+    function setMatching(layerId, channel, value, options = {}) {
+        const numericValue = Number(value);
+        if (!layerId || typeof channel !== 'string' || !channel || !Number.isFinite(numericValue)) return 0;
+        let entries = matchingOverrides.get(layerId);
+        if (!entries) {
+            entries = new Map();
+            matchingOverrides.set(layerId, entries);
+        }
+        const entry = {
+            channel,
+            value: numericValue,
+            options: {
+                mode: options.mode === 'additive' ? 'additive' : 'absolute',
+                clamp: options.clamp === true,
+            },
+        };
+        entries.set(channelKey(channel), entry);
+        return applyMatchingEntry(layerId, entry);
+    }
+
+    function clearMatching(layerId, channel) {
+        if (!layerId || typeof channel !== 'string' || !channel) return 0;
+        const key = channelKey(channel);
+        const entries = matchingOverrides.get(layerId);
+        entries?.delete(key);
+        if (entries?.size === 0) matchingOverrides.delete(layerId);
+
+        let cleared = 0;
+        for (const [handle, channels] of [...overrides]) {
+            const entry = channels.get(key);
+            if (!entry || entry.layerId !== layerId) continue;
+            if (clear(layerId, handle, channel)) cleared++;
+        }
+        return cleared;
+    }
+
     function clearTargetForLayer(layerId, target) {
         const resolvedTarget = resolveTarget(target);
         if (!resolvedTarget) return 0;
@@ -251,6 +316,7 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
 
     function clearLayer(layerId) {
         if (!layerId) return 0;
+        matchingOverrides.delete(layerId);
         let count = 0;
         for (const [handle, channels] of [...overrides.entries()]) {
             for (const [key, entry] of [...channels.entries()]) {
@@ -275,6 +341,7 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
     function createLayerFacade(layerId, isActive = () => true) {
         return freezePlainObject({
             list,
+            matching: matchingHandles,
             has(target, channel) {
                 return isActive() && has(layerId, target, channel);
             },
@@ -284,8 +351,14 @@ function createMorphSystem({ nodeMap, lightHandleMap = null } = {}) {
             set(target, channel, value, options = {}) {
                 return isActive() && set(layerId, target, channel, value, options);
             },
+            setMatching(channel, value, options = {}) {
+                return isActive() ? setMatching(layerId, channel, value, options) : 0;
+            },
             clear(target, channel) {
                 return isActive() && clear(layerId, target, channel);
+            },
+            clearMatching(channel) {
+                return isActive() ? clearMatching(layerId, channel) : 0;
             },
             clearAll(target = null) {
                 if (!isActive()) return 0;

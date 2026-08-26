@@ -19,6 +19,7 @@ function createCameraSystem(deps = {}) {
         // ── Scene Camera Lock ────────────────────────────────
         const selSceneCamera = document.getElementById('selSceneCamera');
         let knownSceneCameras = [];
+        let layerHostFrame = null;
 
         function updateSceneCameraList(cameras, lockedHandle) {
             knownSceneCameras = cameras || [];
@@ -47,32 +48,82 @@ function createCameraSystem(deps = {}) {
         function syncCameraLockButtonUi() {
             const el = document.getElementById('btnCamLock');
             if (!el) return;
-            el.classList.toggle('active', deps.camLock);
-            el.title = deps.camLock ? 'Camera lock on — orbit disabled' : 'Camera lock off — orbit enabled';
+            const layerMode = deps.layerManager?.cameraMode ?? 'viewport';
+            const layerOwned = layerMode !== 'viewport';
+            el.classList.toggle('active', deps.camLock || layerOwned);
+            el.disabled = layerOwned;
+            el.title = layerOwned
+                ? `Camera owned by runtime layer — ${layerMode} mode overrides viewer lock`
+                : deps.camLock ? 'Camera lock on — orbit disabled' : 'Camera lock off — orbit enabled';
             el.setAttribute('aria-pressed', deps.camLock ? 'true' : 'false');
-            el.setAttribute('aria-label', deps.camLock ? 'Camera lock on' : 'Camera lock off');
+            el.setAttribute('aria-label', layerOwned
+                ? 'Camera controlled by runtime layer'
+                : deps.camLock ? 'Camera lock on' : 'Camera lock off');
+        }
+
+        function syncCameraControlAvailability() {
+            if (!deps.controls || deps.xrRuntime?.active) return false;
+            const layerMode = deps.layerManager?.cameraMode ?? 'viewport';
+            const enabled = layerMode === 'script'
+                ? deps.layerManager?.cameraControlsMode === 'viewer'
+                : layerMode === 'physical'
+                    ? false
+                    : !deps.camLock;
+            deps.controls.enabled = enabled;
+            return enabled;
         }
 
         function applyLayerCameraMode(mode, options = {}) {
+            if (options.previousMode === 'viewport' && mode !== 'viewport' && !layerHostFrame) {
+                layerHostFrame = {
+                    camLock: deps.camLock,
+                    selectedHandle: parseInt(selSceneCamera.value, 10) || 0,
+                    camera: serializeCurrentCameraState(),
+                    hostStateMutated: false,
+                };
+            }
+
             if (mode === 'physical') {
                 const handle = parseInt(options.handle, 10) || 0;
-                if (!handle) return;
+                if (!handle) return false;
+                if (layerHostFrame) layerHostFrame.hostStateMutated = true;
                 deps.camLock = true;
                 syncCameraLockButtonUi();
-                deps.controls.enabled = false;
+                syncCameraControlAvailability();
                 if ([...selSceneCamera.options].some(o => o.value === String(handle))) {
                     selSceneCamera.value = String(handle);
                 }
                 deps.bridge.send('lock_camera', { handle: String(handle) });
-                return;
+                return true;
+            }
+
+            if (mode === 'script') {
+                syncCameraLockButtonUi();
+                syncCameraControlAvailability();
+                return true;
             }
 
             if (mode === 'viewport') {
-                selSceneCamera.value = '0';
-                deps.bridge.send('lock_camera', { handle: '0' });
-                deps.controls.enabled = !deps.camLock;
-                return;
+                const restore = layerHostFrame;
+                layerHostFrame = null;
+                if (restore?.hostStateMutated) {
+                    const selectedHandle = restore.selectedHandle ?? 0;
+                    deps.camLock = restore.camLock;
+                    if ([...selSceneCamera.options].some(o => o.value === String(selectedHandle))) {
+                        selSceneCamera.value = String(selectedHandle);
+                    } else {
+                        selSceneCamera.value = '0';
+                    }
+                    deps.bridge.send('lock_camera', { handle: selSceneCamera.value });
+                    if (restore.camera && !deps.camLock && selectedHandle === 0) {
+                        applyStandaloneCameraState(restore.camera);
+                    }
+                }
+                syncCameraLockButtonUi();
+                syncCameraControlAvailability();
+                return true;
             }
+            return false;
         }
 
         function getCameraProjectionAspect() {
@@ -335,6 +386,7 @@ function createCameraSystem(deps = {}) {
         return {
             updateSceneCameraList,
             syncCameraLockButtonUi,
+            syncCameraControlAvailability,
             applyLayerCameraMode,
             getCameraProjectionAspect,
             applyCameraProjectionFromMax,

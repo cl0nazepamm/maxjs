@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
+import { resolveLightEmitterClass } from '../web/js/scene_lights.js';
+
 const fullSyncSource = readFileSync(
     new URL('../src/maxjs_panel_fullsync.inl', import.meta.url), 'utf8');
 const snapshotSource = readFileSync(
@@ -121,8 +123,9 @@ assert.match(lightMetadata, /light\.userData\.maxjsUserProps\s*=\s*props/,
     'standalone lights stamp the raw user-property buffer');
 assert.match(lightMetadata, /delete\s+light\.userData\.maxjsUserProps/,
     'authoritative light payloads clear removed user properties');
-assert.ok(lightMetadata.includes('/emitterClass\\s*=\\s*([a-z_]+)/i'),
-    'standalone lights derive spectral emitter class from user properties');
+assert.equal(resolveLightEmitterClass({
+    userProps: 'emitterClass = IR',
+}), 'ir', 'standalone lights derive spectral emitter class from user properties');
 assert.ok(lightMetadata.includes('/colorTemp\\s*=\\s*([0-9.]+)/i'),
     'standalone lights derive color temperature from user properties');
 assert.match(lightMetadata, /delete\s+light\.userData\.emitterClass/,
@@ -130,7 +133,9 @@ assert.match(lightMetadata, /delete\s+light\.userData\.emitterClass/,
 assert.match(lightMetadata, /delete\s+light\.userData\.colorTemp/,
     'authoritative light payloads clear removed color temperature');
 
-const applyStandaloneLightMetadata = new Function('light', 'ld', lightMetadata);
+const applyStandaloneLightMetadata = new Function(
+    'resolveLightEmitterClass', 'light', 'ld', lightMetadata,
+).bind(null, resolveLightEmitterClass);
 const standaloneLight = {
     name: 'Neutral Light',
     userData: {
@@ -156,7 +161,7 @@ assert.equal('colorTemp' in standaloneLight.userData, false,
     'authoritative payload clears stale color temperature');
 
 standaloneLight.name = 'Warehouse_LED_Key';
-applyStandaloneLightMetadata(standaloneLight, {});
+applyStandaloneLightMetadata(standaloneLight, { name: standaloneLight.name });
 assert.equal(standaloneLight.userData.emitterClass, 'led',
     'name tagging remains the metadata fallback');
 

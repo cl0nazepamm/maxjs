@@ -20,6 +20,7 @@ import {
     getEmissiveColor,
     getEmissiveIntensity,
     getTextureExtension,
+    iorFromReflectivity,
     maxMapChannelFromMapName,
     normalScaleVectorFromDescriptor,
     optimizedTextureTransformForSlot,
@@ -524,10 +525,14 @@ function applyPbrScalarParams(params, md) {
     params.envMapIntensity = Number.isFinite(md?.envI) ? md.envI : 1.0;
 }
 
-function applyPhysicalScalarParams(params, md) {
+function applyPhysicalScalarParams(params, md, { supportsReflectivityAlias = true } = {}) {
     // `reflectivity` is an alias setter onto `ior`, and setValues applies params
     // in insertion order — it has to land before ior or it overwrites it.
-    setNumber(params, 'reflectivity', md?.reflectivity);
+    if (supportsReflectivityAlias) {
+        setNumber(params, 'reflectivity', md?.reflectivity);
+    } else {
+        setNumber(params, 'ior', iorFromReflectivity(md?.reflectivity));
+    }
     setNumber(params, 'specularIntensity', md?.specularIntensity);
     if (Array.isArray(md?.specularColor)) params.specularColor = colorFromArray(md.specularColor, 0xffffff);
     setNumber(params, 'clearcoat', md?.clearcoat);
@@ -1430,7 +1435,9 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
             applyPbrScalarParams(params, md);
         }
         if (info.runtimeModelName === 'MeshPhysicalMaterial' || info.runtimeModelName === 'MeshSSSNodeMaterial') {
-            applyPhysicalScalarParams(params, md);
+            applyPhysicalScalarParams(params, md, {
+                supportsReflectivityAlias: info.runtimeModelName !== 'MeshSSSNodeMaterial',
+            });
         }
 
         const emissiveColor = getEmissiveColor(md);

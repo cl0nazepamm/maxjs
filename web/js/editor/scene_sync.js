@@ -14,7 +14,12 @@ import {
 import { gpuRecomputeNormals, gpuNormalsInvalidate, isGpuNormalsDisabled } from '../gpu_normals.js';
 import { maxTimeline } from '../maxjs_timeline.js';
 import { copyMaxComponentsToWorld } from '../scene_space.js';
-import { ensureGeometryUv0ForMaterial, markUv0AttributeAuthored, assignGatedMaterialScalar } from '../material_contract.js';
+import {
+    assignGatedMaterialScalar,
+    ensureGeometryUv0ForMaterial,
+    iorFromReflectivity,
+    markUv0AttributeAuthored,
+} from '../material_contract.js';
 import { ensureMaxOwned, markOwned, OWNER_MAX } from '../layer_ownership.js';
 import { createInstanceBuckets } from '../instance_buckets.js';
 
@@ -1894,6 +1899,14 @@ function createSceneSync(deps = {}) {
                 // specularIntensity==0 => ior 1.0 rule below).
                 if (material?.reflectivity != null && 'reflectivity' in m) {
                     m.reflectivity = material.reflectivity;
+                } else if (
+                    material?.reflectivity != null &&
+                    material?.ior == null &&
+                    m.type === 'MeshSSSNodeMaterial' &&
+                    'ior' in m
+                ) {
+                    const mappedIor = iorFromReflectivity(material.reflectivity);
+                    if (Number.isFinite(mappedIor)) m.ior = mappedIor;
                 }
                 if (material?.specularIntensity != null && 'specularIntensity' in m) {
                     m.specularIntensity = material.specularIntensity;

@@ -12,6 +12,7 @@ import {
 } from 'three/tsl';
 import {
     ensureGeometryUv0ForMaterial,
+    iorFromReflectivity,
     normalScaleVectorFromDescriptor,
     shouldRouteBlackSpecularToLambert as shouldRouteBlackSpecularToLambertShared,
 } from '../material_contract.js';
@@ -726,7 +727,14 @@ function createMaterials(deps = {}) {
                         // params in insertion order, so it MUST go in before ior or it
                         // overwrites the authored IOR (reflectivity 0.5 => ior 1.5, which
                         // silently pinned every glass/water/gem IOR to 1.5).
-                        if (md.reflectivity != null) params.reflectivity = md.reflectivity;
+                        if (md.reflectivity != null) {
+                            if (runtimeModelName === 'MeshSSSNodeMaterial') {
+                                const mappedIor = iorFromReflectivity(md.reflectivity);
+                                if (Number.isFinite(mappedIor)) params.ior = mappedIor;
+                            } else {
+                                params.reflectivity = md.reflectivity;
+                            }
+                        }
                         if (Array.isArray(md.specularColor)) {
                             params.specularColor = new THREE.Color(md.specularColor[0], md.specularColor[1], md.specularColor[2]);
                         }

@@ -75,7 +75,11 @@ import {
 } from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
-import { assignGatedMaterialScalar, isProgramGatedMaterialScalar } from './material_contract.js';
+import {
+    assignGatedMaterialScalar,
+    iorFromReflectivity,
+    isProgramGatedMaterialScalar,
+} from './material_contract.js';
 import { copyMaxArrayToWorld, copyMaxComponentsToWorld } from './max_basis.js';
 import { binInRange, geometryFromNodeBinary, typedArrayCanStore } from './scene_binary.js';
 import { sceneSpace } from './max_basis.js';
@@ -1677,6 +1681,17 @@ function applySnapshotMaterialScalar(mesh, payload, materialIndex = null) {
             // this; the shared helper keeps both hosts on the same rule.
             if (isProgramGatedMaterialScalar(key)) {
                 if (assignGatedMaterialScalar(material, key, payload[key])) materialNeedsUpdate = true;
+                continue;
+            }
+            if (
+                key === 'reflectivity' &&
+                payload.reflectivity != null &&
+                payload.ior == null &&
+                material.type === 'MeshSSSNodeMaterial' &&
+                'ior' in material
+            ) {
+                const mappedIor = iorFromReflectivity(payload.reflectivity);
+                if (Number.isFinite(mappedIor)) material.ior = mappedIor;
                 continue;
             }
             if (payload[key] != null && key in material) material[key] = Number(payload[key]);

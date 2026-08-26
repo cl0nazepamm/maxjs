@@ -138,6 +138,17 @@ export function finiteNumberOr(value, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
+// MeshPhysicalMaterial exposes `reflectivity` as an alias setter onto `ior`,
+// but MeshPhysicalNodeMaterial (and therefore MeshSSSNodeMaterial) does not.
+// Preserve the same authored meaning when a node material consumes the shared
+// MaxJSPBR descriptor instead of passing an unsupported constructor property.
+export function iorFromReflectivity(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return undefined;
+    const reflectivity = Math.min(1, Math.max(0, n));
+    return (1 + 0.4 * reflectivity) / (1 - 0.4 * reflectivity);
+}
+
 export function firstString(...values) {
     return values.find(value => typeof value === 'string' && value.length > 0) ?? null;
 }

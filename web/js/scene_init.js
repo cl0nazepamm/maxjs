@@ -135,18 +135,18 @@ async function createWebGpuRenderer(canvas) {
             'Open snapshot.html for the WebGL deploy target instead.',
         );
     }
-    const adapter = await globalThis.navigator.gpu.requestAdapter({
-        powerPreference: 'high-performance',
-    }).catch(() => null);
+    // Chromium ignores powerPreference for WebGPU adapter selection on Windows
+    // and warns once for this probe and again when WebGPURenderer initializes.
+    // Keep the hint on the WebGL paths, where it is honored, but let native
+    // WebGPU use the platform's adapter policy.
+    const adapter = await globalThis.navigator.gpu.requestAdapter().catch(() => null);
     if (!adapter) {
         throw new Error(
             '[scene_init] Native WebGPU adapter is not available. ' +
             'Open snapshot.html for the WebGL deploy target instead.',
         );
     }
-    return new THREE.WebGPURenderer({
-        canvas, antialias: true, alpha: true, powerPreference: 'high-performance',
-    });
+    return new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
 }
 
 // ─── Scene + groups + cameras + controls ──────────────────────────────

@@ -756,6 +756,7 @@ export function createLayerManager({
             THREE,
             scene,
             () => isLayerCurrent(layer),
+            (dispose) => layer.disposers.push(dispose),
         );
         const instancesFacade = createInstancesFacade({
             THREE,

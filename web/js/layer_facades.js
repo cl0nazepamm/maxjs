@@ -408,8 +408,21 @@ function createMaxSceneFacade({ scene, nodeMap, lightHandleMap, getAdapter, crea
     });
 }
 
-function createRendererFacade(renderer, THREE, scene, isActive = () => true) {
+function createRendererFacade(
+    renderer,
+    THREE,
+    scene,
+    isActive = () => true,
+    registerDisposer = null,
+) {
     let pmremGenerator = null;
+
+    if (typeof registerDisposer === 'function') {
+        registerDisposer(() => {
+            try { pmremGenerator?.dispose?.(); } catch (_) { /* best effort */ }
+            pmremGenerator = null;
+        });
+    }
 
     function getPMREMGenerator() {
         if (!pmremGenerator) {

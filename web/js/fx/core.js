@@ -368,7 +368,7 @@ export function createFxCore({
         }
     }
 
-    function recreatePostPipeline() {
+    function retirePostPipeline({ recreate = true } = {}) {
         // Retire the ENTIRE pipeline object, not just its node graph. Swapping
         // outputNode on a reused quad is not enough on the WebGPU backend
         // (r185): the old quad's compiled builder state (updateBeforeNodes)
@@ -381,7 +381,7 @@ export function createFxCore({
         // unreachable, so its render-object caches, builder state, and node
         // graph all become collectable together.
         const previous = postProcessing;
-        try { previous.dispose?.(); } catch {}
+        try { previous?.dispose?.(); } catch {}
         try {
             const quadMat = previous?._quadMesh?.material;
             if (quadMat) {
@@ -389,10 +389,21 @@ export function createFxCore({
                 quadMat.fragmentNode = null;
             }
         } catch {}
-        previous.outputNode = emptyOutputNode;
+        if (previous) {
+            previous.outputNode = emptyOutputNode;
+            previous.needsUpdate = true;
+        }
+        if (!recreate) {
+            postProcessing = null;
+            return;
+        }
         postProcessing = new PipelineCtor(renderer);
         postProcessing.outputNode = emptyOutputNode;
         postProcessing.needsUpdate = true;
+    }
+
+    function recreatePostPipeline() {
+        retirePostPipeline({ recreate: true });
     }
 
     // Deep-dispose a post-FX node. PassNode owns render targets and temporal
@@ -424,8 +435,9 @@ export function createFxCore({
         }
     }
 
-    function clearNodes() {
-        recreatePostPipeline();
+    function clearNodes({ recreatePipeline = true } = {}) {
+        if (recreatePipeline) recreatePostPipeline();
+        else retirePostPipeline({ recreate: false });
         activePasses.clear();
         activeScenePass = null;
         const seen = new Set();
@@ -596,17 +608,15 @@ export function createFxCore({
     function teardownPipeline() {
         syncSharedSceneEffects(true);
         restoreForcedContactShadowLight();
-        clearNodes();
-        postProcessing.outputNode = null;
-        postProcessing.needsUpdate = true;
+        // Terminal teardown must not leave a fresh RenderPipeline owned by a
+        // disposed scene. The next rebuild creates one through clearNodes().
+        clearNodes({ recreatePipeline: false });
     }
 
     function handleBuildFailure() {
         restoreForcedContactShadowLight();
         deactivateAllEffects();
-        clearNodes();
-        postProcessing.outputNode = null;
-        postProcessing.needsUpdate = true;
+        clearNodes({ recreatePipeline: false });
     }
 
     /**

@@ -59,7 +59,7 @@
 import * as THREE from 'three';
 
 import { createLayerManager } from './layer_manager.js';
-import { createMaxJSAnimationSystem } from './maxjs_animation.js?v=20260514-loop1';
+import { createMaxJSAnimationSystem } from './maxjs_animation.js?v=20260827-attribute-dispose1';
 import { maxTimeline } from './maxjs_timeline.js';
 import {
     createRenderer as createRendererImpl,
@@ -1507,10 +1507,33 @@ function collectRuntimeResources(roots) {
     return { geometries, materials, textures, skeletons };
 }
 
-function disposeRuntimeObjects(roots, preserve = null) {
+function disposeRendererGeometryAttributes(renderer, geometry) {
+    const attributes = renderer?._attributes ?? renderer?.attributes;
+    if (!geometry || (!attributes?.delete && !attributes?.remove)) return;
+    const seen = new Set();
+    const retire = (attribute) => {
+        if (!attribute || seen.has(attribute)) return;
+        seen.add(attribute);
+        try {
+            if (typeof attributes.delete === 'function') attributes.delete(attribute);
+            else attributes.remove?.(attribute);
+        } catch {}
+    };
+    retire(geometry.index);
+    retire(geometry.indirect);
+    for (const attribute of Object.values(geometry.attributes ?? {})) retire(attribute);
+    for (const morphList of Object.values(geometry.morphAttributes ?? {})) {
+        for (const attribute of morphList ?? []) retire(attribute);
+    }
+}
+
+function disposeRuntimeObjects(roots, preserve = null, renderer = null) {
     const resources = collectRuntimeResources(roots);
     for (const geometry of resources.geometries) {
-        if (!preserve?.geometries?.has(geometry)) geometry.dispose?.();
+        if (!preserve?.geometries?.has(geometry)) {
+            disposeRendererGeometryAttributes(renderer, geometry);
+            geometry.dispose?.();
+        }
     }
     for (const material of resources.materials) {
         if (!preserve?.materials?.has(material)) material.dispose?.();
@@ -1521,6 +1544,30 @@ function disposeRuntimeObjects(roots, preserve = null) {
     for (const skeleton of resources.skeletons) {
         if (!preserve?.skeletons?.has(skeleton)) skeleton.dispose?.();
     }
+}
+
+// WebGPURenderer keeps per-scene nodes outside the authored scene graph. In
+// particular, a textured background creates a private sphere mesh whose
+// geometry/material otherwise survive when snapshots switch scenes.
+function disposeRendererSceneCaches(renderer, scene) {
+    const nodeManager = renderer?._nodes;
+    const nodeData = nodeManager?.has?.(scene) ? nodeManager.get(scene) : null;
+    const cachedNodes = new Set([
+        nodeData?.backgroundNode,
+        nodeData?.environmentNode,
+        nodeData?.fogNode,
+    ]);
+    for (const node of cachedNodes) {
+        try { node?.dispose?.(); } catch {}
+    }
+
+    const backgroundManager = renderer?._background;
+    const backgroundData = backgroundManager?.has?.(scene) ? backgroundManager.get(scene) : null;
+    const backgroundMesh = backgroundData?.backgroundMesh;
+    try { backgroundMesh?.material?.dispose?.(); } catch {}
+    try { backgroundMesh?.geometry?.dispose?.(); } catch {}
+    try { backgroundManager?.delete?.(scene); } catch {}
+    try { nodeManager?.delete?.(scene); } catch {}
 }
 
 async function applyRuntimeScene(runtimeScene, { root, jsRoot, overlayRoot, nodeMap }) {
@@ -2198,6 +2245,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     const animationSystem = createMaxJSAnimationSystem({
         THREE,
+        renderer,
         nodeMap, lightHandleMap,
         getCamera: () => camera,
         getControls: () => controls,
@@ -2440,7 +2488,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             try { layerManager?.clear?.(); } catch {}
             try { animationSystem?.clear?.(); } catch {}
             try {
-                disposeRuntimeObjects(runtimeSceneState.roots);
+                disposeRuntimeObjects(runtimeSceneState.roots, null, renderer);
                 for (const bakedRoot of runtimeSceneState.roots) bakedRoot.parent?.remove(bakedRoot);
                 runtimeSceneState.roots.length = 0;
             } catch {}
@@ -2457,6 +2505,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
                     mesh.parent?.remove(mesh);
                     if (mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
                         disposedGeometries.add(mesh.geometry);
+                        disposeRendererGeometryAttributes(renderer, mesh.geometry);
                         mesh.geometry.dispose?.();
                     }
                     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
@@ -2468,7 +2517,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
                 }
                 applierCtx.forestMeshes.clear();
             } catch {}
+            try { disposeRuntimeObjects([maxRoot, jsRoot, overlayRoot], null, renderer); } catch {}
             try { materialBuilder.dispose(); } catch {}
+            try { disposeRendererSceneCaches(renderer, scene); } catch {}
             try { renderer?.dispose?.(); } catch {}
             try { restoreThreeConsole(); } catch {}
         },

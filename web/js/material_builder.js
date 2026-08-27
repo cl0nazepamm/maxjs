@@ -695,6 +695,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
     hdrLoader.setCrossOrigin?.('anonymous');
     exrLoader.setCrossOrigin?.('anonymous');
     const textureCache = new Map();
+    let disposed = false;
     let bakeOverrides = normalizeBakeState(bakeState);
     // Shared TSL compiler — the exact module the live viewer uses, so WebGPU
     // snapshots render real TSL instead of a PBR fallback. On the WebGL build
@@ -756,6 +757,12 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
     }
 
     function finishTextureLoad(entry, loaded, textureColorSpace, xf) {
+        if (disposed) {
+            entry.callbacks.splice(0);
+            if (loaded !== entry.texture) loaded.dispose?.();
+            return;
+        }
+        const placeholder = entry.texture;
         loaded.colorSpace = textureColorSpace;
         applyTextureChannelSelection(loaded, xf);
         applyTextureTransform(loaded, xf);
@@ -764,6 +771,10 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         entry.loaded = true;
         const callbacks = entry.callbacks.splice(0);
         for (const callback of callbacks) callback(loaded);
+        // Consumers have all switched to the real texture. The temporary 1x1
+        // clone is not in textureCache anymore, so retire it here rather than
+        // leaving one GPU texture behind after every asynchronous load.
+        if (placeholder && placeholder !== loaded) placeholder.dispose?.();
     }
 
     function failTextureLoad(entry, err, { silent = false } = {}) {
@@ -835,6 +846,7 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
 
         const entry = {
             texture: cloneFallbackTexture(fallbackTexture, textureColorSpace, xf),
+            loadingTexture: null,
             loaded: false,
             failed: false,
             callbacks: [],
@@ -843,16 +855,21 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         textureCache.set(key, entry);
 
         if (isVideoTexture) {
-            beginVideoTextureLoad(entry, textureColorSpace, xf, { silent: options.silent });
+            entry.loadingTexture = beginVideoTextureLoad(entry, textureColorSpace, xf, { silent: options.silent });
         } else {
-            beginTextureLoad(entry, activeLoader, textureColorSpace, xf, { silent: options.silent });
+            entry.loadingTexture = beginTextureLoad(entry, activeLoader, textureColorSpace, xf, { silent: options.silent });
         }
         return entry;
     }
 
     function loadTex(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null) {
         const normalizedXf = optimizedTextureTransformForSlot('map', xf);
-        return loadTextureEntry(url, colorSpace, normalizedXf, fallbackTextures.white)?.texture ?? null;
+        const entry = loadTextureEntry(url, colorSpace, normalizedXf, fallbackTextures.white);
+        // TSL code captures this object synchronously and cannot receive the
+        // normal material-slot callback. Return TextureLoader's stable object;
+        // ensureTextureBindingSafe supplies its temporary 1x1 image, and the
+        // loader fills the same texture in place when the asset arrives.
+        return entry?.loadingTexture ?? entry?.texture ?? null;
     }
 
     function createPendingMaterialXMaterial(md) {
@@ -1595,9 +1612,14 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
     }
 
     function dispose() {
+        if (disposed) return;
+        disposed = true;
         for (const entry of textureCache.values()) {
             entry.callbacks?.splice(0);
             entry.texture?.dispose?.();
+            if (entry.loadingTexture && entry.loadingTexture !== entry.texture) {
+                entry.loadingTexture.dispose?.();
+            }
         }
         textureCache.clear();
         for (const texture of tslTextureCache.values()) texture?.dispose?.();

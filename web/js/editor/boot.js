@@ -2811,6 +2811,7 @@
         jsmodVisibilityOwnedByLayer = (handle) => layerManager.hasRuntimeVisibilityOverride(handle);
         animationSystem = createMaxJSAnimationSystem({
             THREE,
+            renderer,
             nodeMap,
             lightHandleMap,
             getCamera: () => camera,

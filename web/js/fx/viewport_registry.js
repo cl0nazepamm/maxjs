@@ -8,14 +8,36 @@
 // fx/core calls purgeViewportCachesForTarget() for each render target it
 // disposes. Registration is WeakRef-based so dead nodes stay collectable.
 import { RenderTarget } from 'three';
-import { viewportLinearDepth, viewportOpaqueMipTexture } from 'three/tsl';
+import { viewportLinearDepth, viewportMipTexture, viewportOpaqueMipTexture } from 'three/tsl';
 
 const refs = new Set();
+const registeredNodes = new WeakSet();
 
 export function registerViewportNode(node) {
-    if (node) refs.add(new WeakRef(node));
+    if (node && !registeredNodes.has(node)) {
+        registeredNodes.add(node);
+        refs.add(new WeakRef(node));
+    }
     return node;
 }
+
+// Three also owns private ViewportTextureNode singletons (notably the
+// back-side transmission buffer) that cannot be imported and registered by
+// name. Auto-register the cache owner whenever any viewport node resolves a
+// reference so those private framebuffer clones follow RenderTarget disposal.
+try {
+    const viewportPrototype = Object.getPrototypeOf(viewportMipTexture());
+    const patchKey = Symbol.for('maxjs.viewportRegistry.autoRegister');
+    if (viewportPrototype?.getTextureForReference && !viewportPrototype[patchKey]) {
+        const baseGetTextureForReference = viewportPrototype.getTextureForReference;
+        viewportPrototype.getTextureForReference = function (reference = null) {
+            const cacheOwner = this.referenceNode ?? this;
+            if (cacheOwner?._cacheTextures) registerViewportNode(cacheOwner);
+            return baseGetTextureForReference.call(this, reference);
+        };
+        Object.defineProperty(viewportPrototype, patchKey, { value: true });
+    }
+} catch (_) { /* viewport node shape changed — named registrations remain */ }
 
 // Built-in module-level singletons with the same per-target clone cache:
 // - the opaque viewport texture sampled by transmissive node materials

@@ -133,6 +133,7 @@ function collectRuntimeTargets(root, registry) {
 
 export function createMaxJSAnimationSystem({
     THREE,
+    renderer = null,
     nodeMap,
     lightHandleMap,
     getCamera,
@@ -167,6 +168,19 @@ export function createMaxJSAnimationSystem({
     const vectorSample = new THREE.Vector3();
     const animatedLightTargetWorld = new THREE.Vector3();
     const ANIMATED_LIGHT_TARGET_DISTANCE = 1000;
+
+    // BufferGeometry does not emit a disposal event when an attribute is
+    // replaced. WebGPURenderer therefore keeps the superseded GPU buffer until
+    // the renderer itself dies, which matters when one renderer serves many
+    // snapshot scenes. Retire the previous backend attribute explicitly.
+    function retireGeometryAttribute(attribute) {
+        if (!attribute) return;
+        const attributes = renderer?._attributes ?? renderer?.attributes;
+        try {
+            if (typeof attributes?.delete === 'function') attributes.delete(attribute);
+            else attributes?.remove?.(attribute);
+        } catch {}
+    }
 
     function addTraceTargets(targets, target) {
         if (!target || target.isCamera || target.isLight) return;
@@ -585,6 +599,7 @@ export function createMaxJSAnimationSystem({
             currentPosition.copyArray(vertices);
             currentPosition.needsUpdate = true;
         } else {
+            retireGeometryAttribute(currentPosition);
             geometry.setAttribute('position', new THREE.BufferAttribute(vertices, 3));
         }
 
@@ -605,6 +620,7 @@ export function createMaxJSAnimationSystem({
                 currentIndex.needsUpdate = true;
             }
         } else {
+            retireGeometryAttribute(currentIndex);
             geometry.setIndex(new THREE.BufferAttribute(indices, 1));
         }
 
@@ -619,9 +635,11 @@ export function createMaxJSAnimationSystem({
                 currentUv.needsUpdate = true;
                 markUv0AttributeAuthored(currentUv);
             } else {
+                retireGeometryAttribute(currentUv);
                 geometry.setAttribute('uv', uvAttr);
             }
         } else if (geometry.getAttribute('uv')) {
+            retireGeometryAttribute(geometry.getAttribute('uv'));
             geometry.deleteAttribute('uv');
         }
         if (!frame.spline) ensureGeometryUv0ForMaterial(geometry, target.material);
@@ -636,10 +654,12 @@ export function createMaxJSAnimationSystem({
                 currentNormal.copyArray(normalAttr.array);
                 currentNormal.needsUpdate = true;
             } else {
+                retireGeometryAttribute(currentNormal);
                 geometry.setAttribute('normal', normalAttr);
             }
         } else {
             if (geometry.getAttribute('normal')) {
+                retireGeometryAttribute(geometry.getAttribute('normal'));
                 geometry.deleteAttribute('normal');
             }
             if (!frame.spline) {

@@ -120,16 +120,52 @@ export function assignGatedMaterialScalar(material, key, value) {
     return wasActive !== (next > 0);
 }
 
+const OUTPUT_INVERT_LUT_TOLERANCE = 0.006;
+
+function isUnitOutputInvertLut(lut) {
+    if (!Array.isArray(lut) || lut.length < 2) return false;
+    const denominator = lut.length - 1;
+    for (let i = 0; i < lut.length; i++) {
+        const value = Number(lut[i]);
+        const expected = 1 - i / denominator;
+        if (!Number.isFinite(value) || Math.abs(value - expected) > OUTPUT_INVERT_LUT_TOLERANCE) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// BitmapTex's Output > Invert is serialized as Max's baked output LUT. For a
+// tangent-space normal map that control means a DirectX/OpenGL convention
+// switch, not an RGB color inversion. Detect only the unambiguous pure 1-x
+// curve; any gamma, alpha-from-RGB, level/offset, or custom color-map transfer
+// continues through the ordinary texture filtering path.
+export function normalMapOutputUsesYFlip(xf) {
+    if (!xf || typeof xf !== 'object' || xf.alphaFromRGB) return false;
+    const gamma = Number(xf.manualGamma);
+    if (Number.isFinite(gamma) && gamma > 0 && Math.abs(gamma - 1) > 1.0e-6) return false;
+
+    const mono = Array.isArray(xf.outLut) ? xf.outLut : null;
+    const red = Array.isArray(xf.outLutR) ? xf.outLutR : mono;
+    if (!isUnitOutputInvertLut(red)) return false;
+    if (Array.isArray(xf.outLutG) && !isUnitOutputInvertLut(xf.outLutG)) return false;
+    if (Array.isArray(xf.outLutB) && !isUnitOutputInvertLut(xf.outLutB)) return false;
+    return true;
+}
+
 // Max's Normal Bump exposes flipred/flipgreen/swap_rg for DirectX-vs-OpenGL
-// convention. The wire carries a scalar normScl, so the flips ride as flags and
-// become the sign of each normalScale component here — shared so the live viewer
-// and the snapshot player expand them identically.
+// convention. Bitmap Output's pure Invert flag is also a green-channel flip
+// when the bitmap occupies the tangent-normal slot. The wire carries a scalar
+// normScl, so all convention switches become signs on normalScale here — shared
+// so the live viewer and snapshot player expand them identically. XOR makes two
+// authored Y flips cancel instead of accidentally inverting the map twice.
 export function normalScaleVectorFromDescriptor(md, THREE_NS = THREE) {
     const scale = Number(md?.normScl);
     if (!Number.isFinite(scale)) return null;
+    const outputYFlip = normalMapOutputUsesYFlip(md?.normMapXf ?? md?.normalMapXf);
     return new THREE_NS.Vector2(
         md?.normFlipR ? -scale : scale,
-        md?.normFlipG ? -scale : scale,
+        (!!md?.normFlipG !== outputYFlip) ? -scale : scale,
     );
 }
 
@@ -923,6 +959,14 @@ export function applyTextureChannelSelection(tex, xf) {
 export function optimizedTextureTransformForSlot(key, xf) {
     const normalized = normalizeTextureTransform(xf);
     if (!normalized) return null;
+    if ((key === 'normMap' || key === 'normalMap') && normalMapOutputUsesYFlip(normalized)) {
+        // The matching normalScale.y sign now carries this convention switch.
+        // Remove the baked RGB inversion so the normal texture itself stays raw.
+        delete normalized.outLut;
+        delete normalized.outLutR;
+        delete normalized.outLutG;
+        delete normalized.outLutB;
+    }
     const nativeChannels = {
         aoMap: 2,
         roughMap: 3,

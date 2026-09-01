@@ -84,6 +84,16 @@ export async function createRenderer(canvas, { backend = 'webgl', pixelRatioCap 
     configureRenderer(renderer, canvas, pixelRatioCap);
     await initializeRenderer(renderer);
 
+    // WebGPU's RectAreaLightNode does not lazily create its LTC lookup
+    // textures. The editor installs them during boot; snapshot hosts need the
+    // same one-time setup before compiling materials that see area lights.
+    if (THREE.RectAreaLightNode?.setLTC) {
+        const { RectAreaLightTexturesLib } = await import(
+            'three/addons/lights/RectAreaLightTexturesLib.js'
+        );
+        THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+    }
+
     if (normalizedBackend === 'webgpu' && renderer.backend?.isWebGPUBackend !== true) {
         renderer.dispose?.();
         throw new Error(

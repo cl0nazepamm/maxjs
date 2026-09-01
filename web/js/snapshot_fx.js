@@ -69,7 +69,6 @@ export async function createSnapshotFx({
         getMainLight: () => mainLight,
         supportsScreenSpaceEffects,
         isShaderLabEnabled,
-        getEnvironmentVisible: () => envVisible,
         getResolutionScale: () => resolutionScale,
     });
 
@@ -131,7 +130,6 @@ export async function createSnapshotFx({
 
     let pipelineReady = false;
     let restored = false;
-    let forceEnvironmentBackground = false;
     let lastWidth = 0;
     let lastHeight = 0;
     let lastPixelRatio = 1;
@@ -188,7 +186,6 @@ export async function createSnapshotFx({
         core.prepareRebuild();
         if (!hasPipelineEffectEnabled()) {
             pipelineReady = false;
-            forceEnvironmentBackground = false;
             core.teardownPipeline();
             syncCanvasFilterForPowerShot();
             return;
@@ -198,11 +195,9 @@ export async function createSnapshotFx({
         const result = core.buildPipeline();
         if (result.ok) {
             pipelineReady = true;
-            forceEnvironmentBackground = result.forceEnvironmentBackground;
             snapshotRendererSize();
         } else {
             pipelineReady = false;
-            forceEnvironmentBackground = false;
             core.handleBuildFailure();
             console.warn('[snapshot_fx] post-FX pipeline build failed; falling back to plain render', result.error);
         }
@@ -361,11 +356,7 @@ export async function createSnapshotFx({
                 return;
             }
 
-            const originalBackground = forceEnvironmentBackground ? scene.background : null;
             try {
-                if (forceEnvironmentBackground) {
-                    scene.background = scene.environment;
-                }
                 core.updatePerFrame();
                 if (shaderLabActive) {
                     const consumed = shaderLabFinal.renderFinal(() => core.postProcessing.render());
@@ -382,10 +373,6 @@ export async function createSnapshotFx({
                 core.restoreSceneAfterPostPass();
                 core.handleBuildFailure();
                 renderer.render(scene, camera);
-            } finally {
-                if (forceEnvironmentBackground) {
-                    scene.background = originalBackground;
-                }
             }
         },
 

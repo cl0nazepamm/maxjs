@@ -2322,8 +2322,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         applySnapshotCoreLook(meta.snapshotUi, { renderer });
     }
     // scene.environment lands after the snapshotUi post-FX replay above, so
-    // rebuild the FX graph once: env-backdrop compensation (hidden HDRI +
-    // ssr/fog) needs the final environment state.
+    // rebuild the FX graph once against the final environment/material state.
     (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.notifyEnvironmentChanged?.();
     syncDefaultLights();
 

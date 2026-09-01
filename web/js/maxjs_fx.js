@@ -152,8 +152,6 @@ export function createMaxJSFxController({
     let pipelineBuiltAgainstEmptyScene = false;
     let activeShaderLabFx = shaderLabFx;
     let postFxResolutionScale = 1.0;
-    let forceEnvironmentBackground = false;
-
     const core = createFxCore({
         renderer,
         scene,
@@ -164,7 +162,6 @@ export function createMaxJSFxController({
         supportsScreenSpaceEffects,
         supportsTslPostEffects,
         isShaderLabEnabled,
-        getEnvironmentVisible: () => environmentVisible,
         getResolutionScale: () => postFxResolutionScale,
     });
     // NEVER cache core.postProcessing: the instance is replaced on every
@@ -697,7 +694,6 @@ export function createMaxJSFxController({
         if (!hasPipelineEffectEnabled() || !available) {
             pipelineReady = false;
             core.teardownPipeline();
-            forceEnvironmentBackground = false;
             syncCanvasColorGrading();
             return;
         }
@@ -709,10 +705,8 @@ export function createMaxJSFxController({
         if (result.ok) {
             pipelineReady = true;
             lastError = '';
-            forceEnvironmentBackground = result.forceEnvironmentBackground;
             pipelineBuiltAgainstEmptyScene = result.builtAgainstEmptyScene;
         } else {
-            forceEnvironmentBackground = false;
             disableWithError('SSGI setup failed', result.error);
         }
     }
@@ -1600,12 +1594,7 @@ export function createMaxJSFxController({
                 return;
             }
 
-            const originalBackground = forceEnvironmentBackground ? scene.background : null;
-
             try {
-                if (forceEnvironmentBackground) {
-                    scene.background = scene.environment;
-                }
                 core.updatePerFrame();
                 if (shaderLabActive) {
                     const consumed = shaderLabFinal.renderFinal(() => core.postProcessing.render());
@@ -1620,10 +1609,6 @@ export function createMaxJSFxController({
                 core.restoreSceneAfterPostPass();
                 disableWithError('Post pipeline render failed', error);
                 renderer.render(scene, camera);
-            } finally {
-                if (forceEnvironmentBackground) {
-                    scene.background = originalBackground;
-                }
             }
 
             updateCloneBlobAnalysis();

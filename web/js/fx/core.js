@@ -7,7 +7,6 @@
 // Core-resident concerns (NOT descriptors, NOT dynamic modules):
 //   - shared pre-pass (depth/normal/velocity MRT union)
 //   - scene pass MRT + texture extraction + beauty-alpha coverage
-//   - env-backdrop compensation (depends on environmentVisible + ssr)
 //   - PS1 vertex snap (material-level, driven by retro.wiggle / shaderlab)
 //   - pixel frame timer
 //   - forced contact-shadow light, toon-mesh cache, deep node disposal
@@ -38,7 +37,6 @@ import {
     triNoise3D,
     uniform,
     unpackRGBToNormal,
-    vec3,
     vec4,
     velocity,
     Fn,
@@ -75,7 +73,6 @@ export function createFxCore({
     supportsScreenSpaceEffects = false,
     supportsTslPostEffects = supportsScreenSpaceEffects,
     isShaderLabEnabled = () => false,
-    getEnvironmentVisible = () => true,
     getResolutionScale = () => 1.0,
 }) {
     const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
@@ -624,8 +621,7 @@ export function createFxCore({
      *  1. union pre-pass for descriptors with needs (samples:1 when forced)
      *  2. context-stage descriptors (slot order) build ctx.sceneContext
      *  3. scene pass (scenePass-stage descriptor or default pass) + MRT
-     *  4. beauty fold in slot order, env-backdrop compensation spliced
-     *     between slots 50 and 60 (early) / >=130 fallback
+     *  4. beauty fold in slot order
      *  5. output node with coverage-derived beauty alpha
      *
      * The caller decides teardown-vs-build and owns error escalation; an
@@ -665,7 +661,7 @@ export function createFxCore({
                 }
                 postProcessing.outputNode = ctx.withBeautyAlpha(currentBeauty);
                 postProcessing.needsUpdate = true;
-                return { ok: true, forceEnvironmentBackground: false, builtAgainstEmptyScene: false };
+                return { ok: true, builtAgainstEmptyScene: false };
             }
 
             const active = sorted.filter((d) => isEffectActive(d.id));
@@ -723,20 +719,6 @@ export function createFxCore({
             for (const d of active) {
                 if (d.stage === 'context') d.build(ctx);
             }
-
-            // When HDRI is loaded but not shown as the viewport background, the scene pass still
-            // sees environment in reflections; far-depth pixels must be normalized to hidden fill + a=0
-            // so SSR (isBg) behaves.
-            const hiddenEnvironmentBackdrop =
-                !!scene.environment && !getEnvironmentVisible();
-            const useEnvironmentBackdropCompensation =
-                hiddenEnvironmentBackdrop
-                && isEffectActive('ssr');
-            // Hidden environment/background means transparent scene input.
-            // The CSS viewport backdrop may still be visible behind the canvas,
-            // but it must never enter Bloom/SSGI/SSR source pixels.
-            const backgroundFillNode = vec3(0, 0, 0);
-            const backgroundAlphaNode = float(0);
 
             const ssrDielectricReflectivityNode = roughness.oneMinus().mul(0.08).add(float(0.02));
             const ssrReflectivityNode = max(
@@ -800,43 +782,10 @@ export function createFxCore({
             const geometryCoverageAlpha = scenePassDepth.r.lessThan(float(0.999999)).select(float(1), float(0));
             currentBeautyAlpha = max(scenePassColor.a, geometryCoverageAlpha);
 
-            // SSR needs the HDRI temporarily visible as a background source when
-            // the user hides the environment, but downstream effects should see
-            // a transparent/hidden backdrop. The early splice (before bloom) lets
-            // glow rebuild alpha around geometry instead of being wiped later.
-            let environmentBackdropCompensated = false;
-            let earlyCompensationDone = false;
-            const applyBackdropCompensation = () => {
-                const hasGeom = scenePassDepth.r.lessThan(float(0.999999));
-                currentBeautyAlpha = hasGeom.select(currentBeautyAlpha, backgroundAlphaNode);
-                currentBeauty = vec4(
-                    hasGeom.select(currentBeauty.rgb, backgroundFillNode),
-                    currentBeautyAlpha
-                );
-                environmentBackdropCompensated = true;
-            };
-
             for (const d of active) {
                 if (d.stage !== 'beauty') continue;
-                if (!earlyCompensationDone && (d.slot ?? 0) >= 60) {
-                    earlyCompensationDone = true;
-                    if (useEnvironmentBackdropCompensation) applyBackdropCompensation();
-                }
-                // Late fallback preserves older paths where the early
-                // compensation could not run (only slot>=130 descriptors
-                // reach this).
-                if ((d.slot ?? 0) >= 130
-                    && useEnvironmentBackdropCompensation
-                    && !environmentBackdropCompensated) {
-                    applyBackdropCompensation();
-                }
                 const next = d.build(ctx);
                 if (next != null) currentBeauty = next;
-            }
-            if (!earlyCompensationDone
-                && useEnvironmentBackdropCompensation
-                && !environmentBackdropCompensated) {
-                applyBackdropCompensation();
             }
 
             postProcessing.outputNode = ctx.withBeautyAlpha(currentBeauty);
@@ -853,7 +802,6 @@ export function createFxCore({
 
             return {
                 ok: true,
-                forceEnvironmentBackground: useEnvironmentBackdropCompensation,
                 builtAgainstEmptyScene: renderableCount === 0,
             };
         } catch (error) {

@@ -1145,7 +1145,7 @@ body.light-mode .bake-stat {
 body.light-mode .bake-stat span { color: #666; }
 body.light-mode .bake-stat strong,
 body.light-mode .bake-value { color: #222; }
-/* ── Light Mode — brushed metal / CLONE.LLC ── */
+/* ── Light mode — brushed metal ── */
 body.light-mode { background: var(--maxjs-viewport-bg, #2a2a2a); }
 
 /* HUD info — dark translucent terminal style */

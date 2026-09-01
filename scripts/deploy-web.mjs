@@ -1,25 +1,19 @@
 #!/usr/bin/env node
 //
-// deploy-web.mjs — mirror this repo's `web/` runtime into clone-llc.
+// deploy-web.mjs — mirror this repo's `web/` runtime into an explicit target.
 //
-// clone-llc is a maxjs working folder (MAXJS_WEB_DIR points there at
-// launch). Whenever `web/js/*`, `web/snapshot.html`, `web/index.html`,
-// `web/vendor/*` etc. change in this repo, clone-llc needs the same
-// bytes for the live Max viewer (and `snapshot.html`) to pick them up.
+// Development normally points MAXJS_WEB_DIR directly at this repo's `web/`
+// folder and needs no deploy step. Use this script only when intentionally
+// refreshing a separate packaged or project-local runtime.
 //
 // Usage:
-//   node scripts/deploy-web.mjs               # one-shot sync, no deletes
-//   node scripts/deploy-web.mjs --watch       # continuous, debounced
-//   node scripts/deploy-web.mjs --target=PATH # override destination
-//   node scripts/deploy-web.mjs --paths=js,snapshot.html  # only those
+//   node scripts/deploy-web.mjs --target=PATH
+//   node scripts/deploy-web.mjs --target=PATH --watch
+//   node scripts/deploy-web.mjs --target=PATH --paths=js,snapshot.html
 //
 // Behavior:
 //   - Files in web/* that are newer (or missing in dst) are copied.
-//   - Files only in clone-llc that don't exist in web/ are LEFT ALONE.
-//     This is critical: clone-llc has its own `.max` files, AGENTS.md,
-//     CLAUDE.md, launch-max.bat, _concepts/, project.maxjs.json,
-//     inlines/, geo/, ref/, sfx/ — none of which live in web/. The
-//     deploy script must never touch them.
+//   - Files only in the target are LEFT ALONE; this script never deletes.
 //   - node_modules/ and vendor/ are huge but rarely change; we still
 //     stat-check them so a vendor bump propagates. First sync of these
 //     is the slow one.
@@ -33,7 +27,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 const REPO_ROOT  = path.resolve(__dirname, '..');
 const SRC_DEFAULT = path.join(REPO_ROOT, 'web');
-const DST_DEFAULT = path.resolve(REPO_ROOT, '..', 'clone-llc');
 
 // Subpaths under web/ that are generated runtime data and should never be
 // mirrored into a project folder.
@@ -47,14 +40,18 @@ const HEAVY_SUBPATHS = new Set(['vendor', 'node_modules']);
 function parseArgs(argv) {
     const args = {
         watch: false,
-        target: DST_DEFAULT,
+        target: null,
         paths: null,
         includeVendor: false,
     };
     for (const a of argv) {
         if (a === '--watch') args.watch = true;
         else if (a === '--include-vendor') args.includeVendor = true;
-        else if (a.startsWith('--target=')) args.target = path.resolve(a.slice('--target='.length));
+        else if (a.startsWith('--target=')) {
+            const target = a.slice('--target='.length).trim();
+            if (!target) throw new Error('--target requires a non-empty path');
+            args.target = path.resolve(target);
+        }
         else if (a.startsWith('--paths=')) args.paths = a.slice('--paths='.length).split(',').map(s => s.trim()).filter(Boolean);
     }
     return args;
@@ -194,6 +191,9 @@ function watchMode({ src, dst, paths }) {
 
 async function main() {
     const args = parseArgs(process.argv.slice(2));
+    if (!args.target) {
+        throw new Error('Refusing to deploy without an explicit --target=PATH');
+    }
 
     if (args.watch) {
         // Initial sync (skip heavy unless explicitly included).

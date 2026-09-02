@@ -39,7 +39,13 @@ export default {
     update(ctx) {
         const aoPass = ctx.getActivePass('ao');
         if (!aoPass) return;
-        aoPass.radius.value = ctx.derived.effectiveGTAORadius;
-        aoPass.thickness.value = ctx.derived.effectiveGTAOThickness;
+        const {state, derived} = ctx;
+        aoPass.samples.value = state.gtao.samples;
+        aoPass.distanceExponent.value = state.gtao.distanceExponent;
+        aoPass.distanceFallOff.value = state.gtao.distanceFallOff;
+        aoPass.radius.value = derived.effectiveGTAORadius;
+        aoPass.scale.value = state.gtao.scale;
+        aoPass.thickness.value = derived.effectiveGTAOThickness;
+        ctx.applyNodeResolutionScale(aoPass, state.gtao.resolutionScale);
     },
 };

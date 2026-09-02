@@ -176,7 +176,7 @@ function buildSnapshotMeta() {
                 id: 'probe',
                 name: 'Snapshot Runtime Probe',
                 source: 'inline',
-                entry: 'inlines/probe.js',
+                entry: 'scripts/probe.js',
                 active: true,
                 parameters: [{
                     name: 'turbidity',
@@ -200,7 +200,7 @@ function buildSnapshotMeta() {
                 id: 'broken',
                 name: 'Broken Snapshot Runtime Probe',
                 source: 'inline',
-                entry: 'inlines/broken.js',
+                entry: 'scripts/broken.js',
                 active: true,
                 parameters: [],
             }],
@@ -287,7 +287,7 @@ function makeFixtureRoutes() {
         layers: [{
             id: 'probe',
             name: 'Snapshot Runtime Probe',
-            entry: 'inlines/probe.js',
+            entry: 'scripts/probe.js',
             enabled: true,
         }],
     };
@@ -304,11 +304,11 @@ function makeFixtureRoutes() {
             type: MIME['.json'],
             body: Buffer.from(JSON.stringify(manifest), 'utf8'),
         }],
-        [`${FIXTURE_ROOT}/inlines/probe.js`, {
+        [`${FIXTURE_ROOT}/scripts/probe.js`, {
             type: MIME['.js'],
             body: Buffer.from(LAYER_SOURCE, 'utf8'),
         }],
-        [`${FIXTURE_ROOT}/inlines/broken.js`, {
+        [`${FIXTURE_ROOT}/scripts/broken.js`, {
             type: MIME['.js'],
             body: Buffer.from(BROKEN_LAYER_SOURCE, 'utf8'),
         }],
@@ -503,6 +503,10 @@ async page => {
             && (source.visible === false || source.layers?.mask === 0x80000000);
 
         expect(!!source?.isMesh, 'fixture Max source mesh was not applied');
+        expect(player.controls?.enabled === true,
+            'snapshot viewport did not remain interactive by default');
+        expect(player.controls?.enableZoom === false,
+            'snapshot viewport still allows implicit wheel dolly');
         expect(sourceHidden, 'hideMaxSyncHandles did not hide Max source handle 101');
         expect(Math.abs((source?.matrix?.elements?.[12] ?? 0) - 12) < 1e-6,
             'versioned additive transform override did not restore to local X=12');
@@ -587,6 +591,8 @@ async page => {
                 sourceHidden,
                 sourceLocalX: source?.matrix?.elements?.[12] ?? null,
                 sourceCastShadow: source?.castShadow ?? null,
+                controlsEnabled: player.controls?.enabled ?? null,
+                wheelDollyEnabled: player.controls?.enableZoom ?? null,
                 jsOrigins,
                 overlayOrigins,
                 animationIds: probe?.animationIds ?? [],

@@ -18,7 +18,7 @@ Architecture is split between viewer and standalone into two optimized paths: th
 - **Three.js Renderer** with WGL2, WebGPU and WebGPU with forced WebGL.
 - **ActiveShade** can directly embed into 3ds Max viewport. Uses a custom workaround instead of Autodesk's API so it does not lag or choke 3ds Max down.
 - **Snapshot Builder** exports your scene to a deployable website in one click, with optimized packed geometry, copied assets, runtime layers, camera/look state, lighting, materials, animation, and standalone viewer files ready to host.
-- **Programmable (`ctx`)** — edit the live synced scene via `ctx.maxScene` (transforms, visibility, queries) and add JS-owned objects via `ctx.js`, wired from `project.maxjs.json` and `inlines/*.js`.
+- **Programmable (`ctx`)** — edit the live synced scene via `ctx.maxScene` (transforms, visibility, queries) and add JS-owned objects via `ctx.js`, wired from `project.maxjs.json` and `scripts/*.js`.
 - **PostFX** includes SSGI, SSR, Bloom, Toon and much more. See full list below.
 - **Materials** Huge material coverage including automatic translation of 3ds Max materials.
 
@@ -127,7 +127,7 @@ Exported snapshot folders can include:
 - `scene.m3` packed M3 scene payload
 - `scene_anim.bin` optional binary animation payload.
 - `assets/` copied texture/media files.
-- `project.maxjs.json` and `inlines/` for scene-local runtime replay.
+- `project.maxjs.json` and `scripts/` for scene-local runtime replay.
 - `postfx.maxjs.json` for saved look state.
 - `vendor/` runtime dependencies.
 
@@ -150,7 +150,7 @@ The production binary contract, including units, channel encodings, MXJB deltas,
 
 ## Relay Mode (WIP)
 
-Relay Mode streams the same M3 full-scene baseline and live updates into a normal Three.js/Vite project. The DCC remains the level editor and source of truth; the receiving project owns rendering, gameplay, Rapier, UI, and its normal application loop. Once a relay consumer has accepted its baseline, the Max viewer stops rendering.
+Relay Mode streams the same M3 full-scene baseline and live updates into a normal Three.js/Vite project. The DCC remains the level editor and source of truth; the receiving project owns rendering, gameplay, Rapier, UI, and its normal application loop. Every viewer boot starts with Relay off; the producer module and host observer are installed only after the explicit RELAY toggle. Once a relay consumer has accepted its baseline, the Max viewer stops rendering.
 
 Use the reusable `maxjsRelay` Vite plugin and `RelayClient`; no max.js editor page is required in the receiving project.
 
@@ -162,12 +162,23 @@ Scene-local runtime code lives beside the `.max` scene:
 scene_folder/
   scene.max
   project.maxjs.json
-  inlines/
+  scripts/
     behavior.js
     effects.js
 ```
 
-Runtime layers read authored Max data through `ctx.maxScene` and create JS-owned objects through `ctx.js`. For partitioned skeletons, `ctx.rig.bind('BoneName')` returns one hierarchy-aware control whose additive `setRotationEuler()` / `setQuaternion()` calls drive every private bone copy and descendant-only skin island. Snapshot export replays project layers when `project.maxjs.json` and `inlines/` are present.
+Runtime layers read authored Max data through `ctx.maxScene` and create JS-owned objects through `ctx.js`. For partitioned skeletons, `ctx.rig.bind('BoneName')` returns one hierarchy-aware control whose additive `setRotationEuler()` / `setQuaternion()` calls drive every private bone copy and descendant-only skin island. Snapshot export replays project layers when `project.maxjs.json` and `scripts/` are present. Legacy projects using `inlines/` remain readable as a fallback.
+
+Static Max meshes can be reused procedurally without duplicating them per
+placement: `ctx.js.instanceFromMax()` creates a fixed-capacity runtime batch,
+and `ctx.kits.capture()` turns a tagged hierarchy into reusable modules and
+sockets. Follow mode keeps authoritative Multi/Sub and TSL material identity;
+clone mode can isolate classic geometry/material resources once per batch.
+These new batch/kit paths reject NodeMaterial cloning in v1 because Three.js
+only shallow-clones its node graph; use followed instance batches rather than
+one-off kit instantiation for TSL modules. See the tracked
+[maxjs-runtime reference](skills/maxjs-runtime/SKILL.md#procedural-mesh-reuse-and-modular-kits)
+for the modular-building workflow and snapshot boundary.
 
 Partitioned facial morphs can be driven by channel name without object coupling: `ctx.morph.setMatching('Eye_Blink_L', weight, { clamp: true })` applies to every current or later-synced object exposing that morph, and `clearMatching()` restores each object's own authored value.
 

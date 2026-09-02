@@ -1,7 +1,6 @@
 // panels_misc.js - editor rail buttons, panel visibility, clay/ascii, and studio persistence glue.
 import * as THREE from 'three';
 import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
-import { getReflectionPaintNode } from '../max_lights_node.js';
 import { createCanvasPanel } from '../canvas_panel.js';
 import { createShaderLabPanel } from '../shader_lab_panel.js';
 import { getHostProfile } from '../host_profile.js';
@@ -196,222 +195,6 @@ function createPanelsMisc(deps = {}) {
         });
 
 
-        // ── Reflection Paint Panel ──────────────────────────
-        const reflPaintPanel = document.getElementById('reflPaintPanel');
-        const reflPaint = getReflectionPaintNode();
-        let reflPaintPanelVisible = false;
-        const REFL_PAINT_STORAGE_KEY = 'maxjs-reflection-paint';
-
-        function notifyReflectionPaintChanged(wasActive, options = {}) {
-            if (wasActive !== reflPaint.active) deps.maxjsFx.markSceneChanged?.();
-            deps.maxjsFx.markOutputChanged?.();
-            if (deps.lightLinkPanelVisible && (options.rebuildLightPanel || wasActive !== reflPaint.active)) {
-                deps.rebuildLightLinkPanel();
-            }
-        }
-
-        function setReflPaintPanelVisible(v) {
-            if (v && !deps.isStudioMode) return;
-            reflPaintPanelVisible = !!v;
-            reflPaintPanel.classList.toggle('visible', reflPaintPanelVisible);
-            reflPaintPanel.toggleAttribute('inert', !reflPaintPanelVisible);
-            reflPaintPanel.setAttribute('aria-hidden', String(!reflPaintPanelVisible));
-            document.getElementById('btnReflPaint')?.classList.toggle('active', reflPaintPanelVisible);
-            if (reflPaintPanelVisible) rebuildReflPaintPanel();
-        }
-
-        function saveReflPaint(options = {}) {
-            saveStudioState(options);
-        }
-
-        function serializeReflectionPaintState() {
-            return {
-                intensity: reflPaint.getGlobalIntensity?.() ?? 1.0,
-                lights: reflPaint.getLights(),
-            };
-        }
-
-        function applyReflectionPaintState(payload) {
-            try {
-                const lights = Array.isArray(payload) ? payload : payload?.lights;
-                const wasActive = reflPaint.active;
-                if (Number.isFinite(payload?.intensity)) {
-                    reflPaint.setGlobalIntensity(payload.intensity);
-                } else if (payload && !Array.isArray(payload)) {
-                    reflPaint.setGlobalIntensity(1.0);
-                }
-                reflPaint.clearLights();
-                for (const l of (Array.isArray(lights) ? lights : [])) {
-                    reflPaint.addLight({
-                        id: l.id,
-                        lat: l.lat, lon: l.lon,
-                        color: l.color,
-                        colorOuter: l.colorOuter,
-                        intensity: l.intensity,
-                        radiusX: l.radiusX ?? l.radius ?? 0.15,
-                        radiusY: l.radiusY ?? l.radius ?? 0.15,
-                        edge: l.edge ?? 0.3,
-                        shape: l.shape ?? 'circle',
-                        rotation: l.rotation ?? 0,
-                    });
-                }
-                notifyReflectionPaintChanged(wasActive);
-            } catch {}
-        }
-
-        function readLegacyReflectionPaintState() {
-            try {
-                const raw = localStorage.getItem(REFL_PAINT_STORAGE_KEY);
-                return raw ? { lights: JSON.parse(raw) } : null;
-            } catch {
-                return null;
-            }
-        }
-
-        function rpRow(cls, id, label, type, min, max, step, value, displayVal) {
-            return `<label class="fx-check"><span>${label}</span><div style="display:flex;align-items:center;gap:4px;flex:1;min-width:0;">` +
-                `<input type="${type}" class="fx-range ${cls}" data-id="${id}" min="${min}" max="${max}" step="${step}" value="${value}">` +
-                `<span class="${cls}-val" data-id="${id}" style="width:32px;font-size:9px;text-align:right;color:#999;font-variant-numeric:tabular-nums;flex-shrink:0;">${displayVal}</span></div></label>`;
-        }
-
-        function handleReflPaintInput(ev) {
-            const el = ev.target;
-            const sec = el.closest('[data-id]');
-            const id = Number(sec?.dataset.id || el.dataset.id);
-            if (!id) return;
-            const wasActive = reflPaint.active;
-            const props = {};
-            if (el.classList.contains('rp-lat') || el.classList.contains('rp-lon')) {
-                const latEl = reflPaintPanel.querySelector(`.rp-lat[data-id="${id}"]`);
-                const lonEl = reflPaintPanel.querySelector(`.rp-lon[data-id="${id}"]`);
-                props.lat = parseFloat(latEl.value);
-                props.lon = parseFloat(lonEl.value);
-                const latV = reflPaintPanel.querySelector(`.rp-lat-val[data-id="${id}"]`);
-                const lonV = reflPaintPanel.querySelector(`.rp-lon-val[data-id="${id}"]`);
-                if (latV) latV.textContent = Math.round(props.lat);
-                if (lonV) lonV.textContent = Math.round(props.lon);
-            } else if (el.classList.contains('rp-color')) {
-                props.color = el.value;
-            } else if (el.classList.contains('rp-color-outer')) {
-                props.colorOuter = el.value;
-            } else if (el.classList.contains('rp-int')) {
-                props.intensity = parseFloat(el.value);
-                const v = reflPaintPanel.querySelector(`.rp-int-val[data-id="${id}"]`);
-                if (v) v.textContent = props.intensity.toFixed(1);
-            } else if (el.classList.contains('rp-sx')) {
-                props.radiusX = parseFloat(el.value);
-                const v = reflPaintPanel.querySelector(`.rp-sx-val[data-id="${id}"]`);
-                if (v) v.textContent = props.radiusX.toFixed(2);
-            } else if (el.classList.contains('rp-sy')) {
-                props.radiusY = parseFloat(el.value);
-                const v = reflPaintPanel.querySelector(`.rp-sy-val[data-id="${id}"]`);
-                if (v) v.textContent = props.radiusY.toFixed(2);
-            } else if (el.classList.contains('rp-shape')) {
-                props.shape = el.value;
-            } else if (el.classList.contains('rp-rot')) {
-                props.rotation = parseFloat(el.value) * Math.PI / 180;
-                const v = reflPaintPanel.querySelector(`.rp-rot-val[data-id="${id}"]`);
-                if (v) v.textContent = Math.round(parseFloat(el.value));
-            } else if (el.classList.contains('rp-edge')) {
-                props.edge = parseFloat(el.value);
-                const v = reflPaintPanel.querySelector(`.rp-edge-val[data-id="${id}"]`);
-                if (v) v.textContent = props.edge.toFixed(3);
-            } else {
-                return;
-            }
-            reflPaint.updateLight(id, props);
-            if (deps.lightLinking.getReflectionPaintConstrainToCamera()) {
-                deps.lightLinking.captureReflectionPaintCameraDirections();
-            }
-            saveReflPaint();
-            notifyReflectionPaintChanged(wasActive);
-        }
-
-        reflPaintPanel.addEventListener('input', handleReflPaintInput);
-        reflPaintPanel.addEventListener('change', () => saveReflPaint({ flush: true }));
-
-        function rebuildReflPaintPanel() {
-            const lights = reflPaint.getLights();
-            let html = `<div class="sidepanel-header"><div><div class="sidepanel-title">Reflection Paint</div>` +
-                `<div class="sidepanel-subtitle">Global painted HDRI overlay</div></div>` +
-                `<div style="display:flex;gap:4px"><button id="rp-add" type="button">+ Add</button>` +
-                `<button id="rp-hide" type="button">Hide</button></div></div>`;
-            html += `<div class="sidepanel-body">`;
-
-            if (lights.length === 0) {
-                html += `<div style="color:#555;font-size:10px;padding:4px 0;">No paint lights. Click + Add to paint one on the environment sphere.</div>`;
-            }
-
-            for (const l of lights) {
-                const rotDeg = Math.round((l.rotation || 0) * 180 / Math.PI);
-                html += `<section class="fx-section" data-id="${l.id}">`;
-                html += `<div class="fx-section-title" style="margin-bottom:8px;">`;
-                html += `<span style="flex:1;">Paint ${l.id}</span>`;
-                html += `<button class="rp-del" data-id="${l.id}" type="button" style="color:#c66;">Delete</button>`;
-                html += `</div>`;
-                html += `<div class="fx-grid">`;
-                html += rpRow('rp-lat', l.id, 'Latitude', 'range', -90, 90, 1, Math.round(l.lat), Math.round(l.lat));
-                html += rpRow('rp-lon', l.id, 'Longitude', 'range', 0, 360, 1, Math.round(l.lon), Math.round(l.lon));
-                html += `<label class="fx-check"><span>Color</span><div style="display:flex;align-items:center;gap:6px;">` +
-                    `<input type="color" class="rp-color" data-id="${l.id}" value="${l.color}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Center">` +
-                    `<span style="font-size:9px;color:#666;">Edge</span>` +
-                    `<input type="color" class="rp-color-outer" data-id="${l.id}" value="${l.colorOuter}" style="width:24px;height:16px;border:1px solid rgba(255,255,255,0.1);padding:0;background:none;cursor:pointer;" title="Edge gradient">` +
-                    `</div></label>`;
-                html += rpRow('rp-int', l.id, 'Intensity', 'range', 0, 10, 0.1, l.intensity, l.intensity.toFixed(1));
-                html += rpRow('rp-sx', l.id, 'Size X', 'range', 0.01, 1.5, 0.01, l.radiusX, l.radiusX.toFixed(2));
-                html += rpRow('rp-sy', l.id, 'Size Y', 'range', 0.01, 1.5, 0.01, l.radiusY, l.radiusY.toFixed(2));
-                html += `<label class="fx-check"><span>Shape</span>` +
-                    `<select class="rp-shape" data-id="${l.id}" style="background:rgba(255,255,255,0.05);color:#bbb;border:1px solid rgba(255,255,255,0.08);padding:3px 6px;font:9px/1 -apple-system,'Segoe UI',system-ui,sans-serif;">` +
-                    `<option value="circle"${l.shape === 'circle' ? ' selected' : ''}>Circle</option>` +
-                    `<option value="rect"${l.shape === 'rect' ? ' selected' : ''}>Rectangle</option></select></label>`;
-                html += rpRow('rp-rot', l.id, 'Rotation', 'range', 0, 360, 1, rotDeg, rotDeg);
-                html += rpRow('rp-edge', l.id, 'Edge', 'range', 0.001, 1, 0.001, l.edge, l.edge.toFixed(3));
-                html += `</div></section>`;
-            }
-
-            html += `</div>`;
-            reflPaintPanel.innerHTML = html;
-
-            document.getElementById('rp-add')?.addEventListener('click', () => {
-                const wasActive = reflPaint.active;
-                reflPaint.addLight({ lat: 45, lon: 90, intensity: 2.0, radiusX: 0.15, radiusY: 0.15, edge: 0.3, shape: 'circle', rotation: 0 });
-                if (deps.lightLinking.getReflectionPaintConstrainToCamera()) {
-                    deps.lightLinking.captureReflectionPaintCameraDirections();
-                }
-                saveReflPaint({ flush: true });
-                notifyReflectionPaintChanged(wasActive, { rebuildLightPanel: true });
-                rebuildReflPaintPanel();
-            });
-            document.getElementById('rp-hide')?.addEventListener('click', () => {
-                setReflPaintPanelVisible(false);
-            });
-
-            for (const btn of reflPaintPanel.querySelectorAll('.rp-del')) {
-                btn.addEventListener('click', () => {
-                    const wasActive = reflPaint.active;
-                    reflPaint.removeLight(Number(btn.dataset.id));
-                    if (deps.lightLinking.getReflectionPaintConstrainToCamera()) {
-                        deps.lightLinking.captureReflectionPaintCameraDirections();
-                    }
-                    saveReflPaint({ flush: true });
-                    notifyReflectionPaintChanged(wasActive);
-                    rebuildReflPaintPanel();
-                });
-            }
-        }
-
-        document.getElementById('btnReflPaint')?.addEventListener('click', () => {
-            if (deps.isSimpleWebGLPipelineActive()) {
-                deps.perfHud.setStatus('max.js - Reflection Paint is unavailable in the simple WebGL pipeline');
-                return;
-            }
-            if (!deps.isStudioMode) {
-                deps.perfHud.setStatus('max.js - Reflection Paint is available in Advanced mode only');
-                return;
-            }
-            setReflPaintPanelVisible(!reflPaintPanelVisible);
-        });
-
         // ── Studio State Persistence ────────────────────────
         let studioPersistTimer = 0;
         let lastProjectStudioSignature = '';
@@ -420,7 +203,6 @@ function createPanelsMisc(deps = {}) {
         let studioPersistInFlight = false;
         let newestLocalStudioSignature = '';
         let suppressStudioPersistenceDepth = 0;
-        let retainedReflectionPaintState = null;
         const STUDIO_PERSIST_IDLE_MS = 550;
 
         function withStudioPersistenceSuppressed(fn) {
@@ -433,31 +215,17 @@ function createPanelsMisc(deps = {}) {
         }
 
         function serializeStudioState() {
-            const reflectionPaint = deps.isStudioMode
-                ? serializeReflectionPaintState()
-                : (retainedReflectionPaintState ?? serializeReflectionPaintState());
-            if (deps.isStudioMode) retainedReflectionPaintState = reflectionPaint;
             return {
                 version: 2,
                 lightLinking: deps.lightLinking.serialize(),
-                reflectionPaint,
             };
         }
 
         function applyStudioState(payload) {
             if (!payload || typeof payload !== 'object') return;
             withStudioPersistenceSuppressed(() => {
-                retainedReflectionPaintState = payload.reflectionPaint
-                    ?? retainedReflectionPaintState
-                    ?? { lights: [], intensity: 1.0 };
-                // Reflection Paint remains a Spectral-only feature. Light links
-                // are renderer-agnostic across every node-renderer raster mode.
-                if (deps.isStudioMode) {
-                    applyReflectionPaintState(retainedReflectionPaintState);
-                }
                 deps.lightLinking.applyPayload(payload.lightLinking);
                 if (deps.lightLinkPanelVisible) deps.rebuildLightLinkPanel();
-                if (reflPaintPanelVisible) rebuildReflPaintPanel();
             });
         }
 
@@ -465,7 +233,6 @@ function createPanelsMisc(deps = {}) {
             if (window.chrome?.webview) return;
             try {
                 localStorage.setItem(LIGHT_LINK_STORAGE_KEY, JSON.stringify(payload.lightLinking ?? {}));
-                localStorage.setItem(REFL_PAINT_STORAGE_KEY, JSON.stringify(payload.reflectionPaint?.lights ?? []));
             } catch {}
         }
 
@@ -473,10 +240,6 @@ function createPanelsMisc(deps = {}) {
             if (window.chrome?.webview) return false;
             withStudioPersistenceSuppressed(() => {
                 deps.lightLinking.restoreFromStorage();
-                retainedReflectionPaintState = readLegacyReflectionPaintState()
-                    ?? retainedReflectionPaintState
-                    ?? { lights: [], intensity: 1.0 };
-                if (deps.isStudioMode) applyReflectionPaintState(retainedReflectionPaintState);
             });
             return true;
         }
@@ -873,7 +636,6 @@ function createPanelsMisc(deps = {}) {
 
             if (simpleWebGL) {
                 deps.setLightLinkPanelVisible(false);
-                setReflPaintPanelVisible(false);
             }
             window.__maxjsSyncSpectralViewUi?.();
         }
@@ -899,7 +661,6 @@ function createPanelsMisc(deps = {}) {
             }
             if (gated) {
                 deps.setLightLinkPanelVisible(false);
-                setReflPaintPanelVisible(false);
             }
             syncSimpleWebGLPipelineUi();
         }
@@ -1078,7 +839,7 @@ function createPanelsMisc(deps = {}) {
 
         function getPanelLayers() {
             // listEntries() is the single source of truth — driven by the
-            // C++ inlines/ folder scan via inline_layers_state.
+            // Host scripts/ folder scan via inline_layers_state.
             return deps._projectRuntimeRef?.listEntries?.() ?? [];
         }
 
@@ -1100,7 +861,7 @@ function createPanelsMisc(deps = {}) {
                     ? `${layer.entry}.disabled`
                     : layer.entry);
             } else if (layer.source === 'inline') {
-                details.push(`inlines/${layer.id}.js${layer.enabled === false ? '.disabled' : ''}`);
+                details.push(`${getProjectRuntimeState().scriptFolderName || 'scripts'}/${layer.id}.js${layer.enabled === false ? '.disabled' : ''}`);
             }
             if (Number.isFinite(layer.profile?.avgUpdateMs) && layer.profile.updateCount > 0) {
                 details.push(`avg ${layer.profile.avgUpdateMs.toFixed(2)}ms`);
@@ -1147,6 +908,12 @@ function createPanelsMisc(deps = {}) {
             }
         }
 
+        function escapePanelText(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
         function formatLayerParamValue(param) {
             if (param?.type === 'color') return String(param.value || '#ffffff').toLowerCase();
             if (param?.type === 'bool') return param.value ? 'On' : 'Off';
@@ -1162,22 +929,22 @@ function createPanelsMisc(deps = {}) {
             const attrs = [];
             if (Number.isFinite(Number(param.min))) attrs.push(`min="${Number(param.min)}"`);
             if (Number.isFinite(Number(param.max))) attrs.push(`max="${Number(param.max)}"`);
-            if (param.step != null) attrs.push(`step="${escapeWebPanelText(param.step)}"`);
+            if (param.step != null) attrs.push(`step="${escapePanelText(param.step)}"`);
             return attrs.join(' ');
         }
 
         function renderLayerParamControl(layer, param) {
             const name = String(param?.name || '');
             if (!name) return '';
-            const idAttr = escapeWebPanelText(layer.id);
-            const nameAttr = escapeWebPanelText(name);
-            const label = escapeWebPanelText(param.label || name);
-            const title = escapeWebPanelText(param.description || param.label || name);
+            const idAttr = escapePanelText(layer.id);
+            const nameAttr = escapePanelText(name);
+            const label = escapePanelText(param.label || name);
+            const title = escapePanelText(param.description || param.label || name);
             const value = param.type === 'color'
-                ? escapeWebPanelText(String(param.value || '#ffffff'))
-                : escapeWebPanelText(String(param.value ?? ''));
-            const common = `data-layer-param-layer="${idAttr}" data-layer-param="${nameAttr}" data-layer-param-type="${escapeWebPanelText(param.type || '')}"`;
-            const valueHtml = `<span class="layer-param-value" data-layer-param-value>${escapeWebPanelText(formatLayerParamValue(param))}</span>`;
+                ? escapePanelText(String(param.value || '#ffffff'))
+                : escapePanelText(String(param.value ?? ''));
+            const common = `data-layer-param-layer="${idAttr}" data-layer-param="${nameAttr}" data-layer-param-type="${escapePanelText(param.type || '')}"`;
+            const valueHtml = `<span class="layer-param-value" data-layer-param-value>${escapePanelText(formatLayerParamValue(param))}</span>`;
 
             if (param.type === 'slider') {
                 return `<label class="layer-param layer-param-slider" title="${title}">
@@ -1264,25 +1031,25 @@ function createPanelsMisc(deps = {}) {
             const canReleaseProject = projectState.sceneSaved === true && !projectReady;
             const sceneExt = getHostProfile().sceneExt;
             const emptyHtml = !projectState.sceneSaved
-                ? `<div class="layers-empty">Save the scene first. max.js creates <code>project.maxjs.json</code> and <code>inlines/</code> next to the <code>${sceneExt}</code> file.</div>`
+                ? `<div class="layers-empty">Save the scene first. max.js creates <code>project.maxjs.json</code> and <code>scripts/</code> next to the <code>${sceneExt}</code> file.</div>`
                 : !projectReady
                     ? `<div class="layers-empty">This scene has no max.js project yet. Create scene-local runtime files next to the <code>${sceneExt}</code> file.<div style="margin-top:10px"><button id="layersReleaseBtn">Release Project Manifest</button></div></div>`
-                    : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>inlines/</code>.</div>';
+                    : '<div class="layers-empty">No layers yet. Scene-local project files live in <code>project.maxjs.json</code> and <code>scripts/</code>.</div>';
 
             const renderLayerItem = (l) => `
                 <div class="layer-item${l.error ? ' error' : ''}${!l.active ? ' inactive' : ''}">
                     <div class="layer-main">
                         <div class="layer-meta">
-                            <span class="layer-name" title="${escapeWebPanelText(l.name)}">${escapeWebPanelText(l.name)}</span>
+                            <span class="layer-name" title="${escapePanelText(l.name)}">${escapePanelText(l.name)}</span>
                             ${Number.isFinite(l.priority) && l.priority !== 100 ? `<span class="layer-priority" title="Load priority (lower = earlier)">${l.priority}</span>` : ''}
                             <span class="layer-source ${l.source === 'project' ? 'project' : 'inline'}">${l.source}</span>
                             <span class="layer-status ${getLayerStatus(l).className}">${getLayerStatus(l).label}</span>
                         </div>
-                        <div class="layer-detail" title="${escapeWebPanelText(getLayerDetails(l))}">${escapeWebPanelText(getLayerDetails(l))}</div>
+                        <div class="layer-detail" title="${escapePanelText(getLayerDetails(l))}">${escapePanelText(getLayerDetails(l))}</div>
                     </div>
                     <div class="layer-actions">
                         ${l.source === 'project' || l.persisted !== false
-                            ? `<button class="layer-action layer-toggle" data-layer-toggle="${escapeWebPanelText(l.id)}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
+                            ? `<button class="layer-action layer-toggle" data-layer-toggle="${escapePanelText(l.id)}">${l.enabled === false ? 'Enable' : 'Disable'}</button>`
                             : ''
                         }
                     </div>
@@ -1323,7 +1090,7 @@ function createPanelsMisc(deps = {}) {
             layersPanel.innerHTML = `
                 <div class="sidepanel-header">
                     <div>
-                        <div class="sidepanel-title">Runtime Layers (inlines)</div>
+                        <div class="sidepanel-title">Runtime Layer (scripts)</div>
                         <div class="sidepanel-subtitle">${layers.length} tracked</div>
                     </div>
                     <div style="display:flex;gap:4px">
@@ -1362,97 +1129,6 @@ function createPanelsMisc(deps = {}) {
                 });
             });
         }
-
-        // ── Web Panels (WebApp Animator flipswitch) ──────────
-        // List-shaped, refresh-driven — same shape as the layers panel. The
-        // flipswitch never mutates viewer state directly: it sends webapp_set
-        // to Max (theHold-wrapped, undoable) and re-renders from the
-        // webapp_update round-trip, so the param block stays authoritative.
-        const btnWebPanels = document.getElementById('btnWebPanels');
-        const webPanelsPanel = document.getElementById('webPanelsPanel');
-        let webPanelsVisible = false;
-        let webPanelsRefreshQueued = false;
-
-        function escapeWebPanelText(value) {
-            return String(value ?? '')
-                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-        }
-
-        function setWebPanelsVisible(visible) {
-            webPanelsVisible = !!visible;
-            if (!webPanelsVisible) {
-                const ae = document.activeElement;
-                if (ae instanceof HTMLElement && webPanelsPanel.contains(ae)) btnWebPanels?.focus();
-            }
-            webPanelsPanel.classList.toggle('visible', webPanelsVisible);
-            webPanelsPanel.toggleAttribute('inert', !webPanelsVisible);
-            webPanelsPanel.setAttribute('aria-hidden', String(!webPanelsVisible));
-            btnWebPanels?.classList.toggle('active', webPanelsVisible);
-            if (webPanelsVisible) queueWebPanelsRefresh();
-        }
-
-        function queueWebPanelsRefresh() {
-            if (!webPanelsVisible || webPanelsRefreshQueued) return;
-            webPanelsRefreshQueued = true;
-            requestAnimationFrame(() => {
-                webPanelsRefreshQueued = false;
-                if (webPanelsVisible) refreshWebPanelsPanel();
-            });
-        }
-
-        function refreshWebPanelsPanel() {
-            const panels = deps.webappSystem?.listPanels?.() ?? [];
-            const renderRow = (p) => `
-                <div class="layer-item${p.visible ? '' : ' inactive'}">
-                    <div class="layer-main">
-                        <div class="layer-meta">
-                            <span class="layer-name" title="${escapeWebPanelText(p.name)}">${escapeWebPanelText(p.name)}</span>
-                            <span class="layer-source inline">#${p.handle}</span>
-                            ${p.layerCount > 1 ? `<span class="layer-priority" title="Layer stack">x${p.layerCount}</span>` : ''}
-                        </div>
-                        <div class="layer-detail" title="${escapeWebPanelText(p.url)}">${escapeWebPanelText(p.url || '(no url)')}</div>
-                    </div>
-                    <div class="layer-actions webpanel-switch" data-webpanel="${p.handle}">
-                        <button class="fx-toggle${p.presentation === 'css3d' ? ' active' : ''}" data-presentation="0" title="DOM overlay — crisp, interactive, outside the framebuffer">CSS3D</button>
-                        <button class="fx-toggle${p.presentation === 'texture' ? ' active' : ''}" data-presentation="1" title="In-scene pixels — post FX, depth, render output apply">Canvas</button>
-                        <button class="fx-toggle${p.depthOcclude ? ' active' : ''}" data-depth-occlude="${p.depthOcclude ? '0' : '1'}"
-                            ${p.presentation === 'texture' ? 'disabled' : ''}
-                            title="CSS3D behind the canvas with punch-through compositing — scene geometry occludes the panel per pixel">Depth</button>
-                    </div>
-                </div>`;
-            webPanelsPanel.innerHTML = `
-                <div class="sidepanel-header">
-                    <div>
-                        <div class="sidepanel-title">Web Panels</div>
-                        <div class="sidepanel-subtitle">${panels.length} WebApp Animator node${panels.length === 1 ? '' : 's'}</div>
-                    </div>
-                    <div style="display:flex;gap:4px">
-                        <button id="webPanelsHideBtn">Hide</button>
-                    </div>
-                </div>
-                <div class="sidepanel-body">${panels.length === 0
-                    ? '<div class="layers-empty">No WebApp Animator nodes in the scene. Create one from the <code>max.js</code> category in the Create panel.</div>'
-                    : panels.map(renderRow).join('')}</div>
-            `;
-            webPanelsPanel.querySelector('#webPanelsHideBtn')?.addEventListener('click', () => setWebPanelsVisible(false));
-            webPanelsPanel.querySelectorAll('.webpanel-switch button').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    if (btn.classList.contains('pending') || btn.disabled) return;
-                    const handle = btn.closest('[data-webpanel]')?.dataset.webpanel;
-                    if (!handle) return;
-                    if (btn.dataset.depthOcclude !== undefined) {
-                        deps.bridge.send('webapp_set', { handle: String(handle), depthOcclude: btn.dataset.depthOcclude === '1' });
-                    } else {
-                        if (btn.classList.contains('active')) return;
-                        deps.bridge.send('webapp_set', { handle: String(handle), presentation: Number(btn.dataset.presentation) });
-                    }
-                    btn.classList.add('pending');  // cleared by the round-trip re-render
-                });
-            });
-        }
-
-        btnWebPanels?.addEventListener('click', () => setWebPanelsVisible(!webPanelsVisible));
 
         btnLayersPanel.addEventListener('click', () => setLayersPanelVisible(!layersPanelVisible));
         btnCanvasPanel?.addEventListener('click', () => setCanvasPanelVisible(!canvasPanelVisible));
@@ -1500,11 +1176,6 @@ function createPanelsMisc(deps = {}) {
             enterAsciiMode,
             exitAsciiMode,
             rebuildAsciiEffect,
-            setReflPaintPanelVisible,
-            serializeReflectionPaintState,
-            applyReflectionPaintState,
-            readLegacyReflectionPaintState,
-            rebuildReflPaintPanel,
             serializeStudioState,
             applyStudioState,
             saveLegacyStudioStateFallback,
@@ -1521,9 +1192,6 @@ function createPanelsMisc(deps = {}) {
             setCanvasPanelVisible,
             attachLayerPanelSubscriptions,
             queueLayersPanelRefresh,
-            setWebPanelsVisible,
-            queueWebPanelsRefresh,
-            escapeWebPanelText,
             setRightDockWidth,
             clampDockWidth,
             btnLightProbe,

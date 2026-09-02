@@ -115,11 +115,6 @@ function allOpcodeFrame() {
             setFloatArray(view, o + 4, IDENTITY);
             view.setUint32(o + 68, 0, true);
         }),
-        command(COMMAND_TYPES.UpdateWebApp, 76, (view, o) => {
-            view.setUint32(o, 14, true);
-            setFloatArray(view, o + 4, IDENTITY);
-            view.setUint32(o + 68, 1, true);
-        }),
         command(COMMAND_TYPES.EndFrame, 4),
     ];
     return { ...buildFrame(commands), commands };
@@ -145,7 +140,6 @@ function protocolGoldenSmoke() {
         onAudio: (handle, matrix, visible) => calls.push(['audio', handle, Array.from(matrix), visible]),
         onTime: data => calls.push(['time', data]),
         onGLTF: (handle, matrix, visible) => calls.push(['gltf', handle, Array.from(matrix), visible]),
-        onWebApp: (handle, matrix, visible) => calls.push(['webapp', handle, Array.from(matrix), visible]),
         onEndFrame: id => calls.push(['end', id]),
     });
 
@@ -154,7 +148,7 @@ function protocolGoldenSmoke() {
     assert.equal(result.bytes, buffer.byteLength);
     assert.deepEqual(calls.map(call => call[0]), [
         'begin', 'transform', 'material', 'selection', 'visibility', 'camera',
-        'light', 'audio', 'time', 'gltf', 'webapp', 'end',
+        'light', 'audio', 'time', 'gltf', 'end',
     ]);
     assert.deepEqual(calls.find(call => call[0] === 'transform').slice(1), [7, IDENTITY]);
     assert.deepEqual(calls.find(call => call[0] === 'selection').slice(1), [9, true]);
@@ -249,10 +243,10 @@ function protocolGoldenSmoke() {
 
     // A malformed command near the tail must be caught before an early handler runs.
     const invalidTail = buffer.slice(0);
-    const webAppOffset = offsets[offsets.length - 2];
-    new DataView(invalidTail).setUint32(webAppOffset + 4 + 68, 2, true);
+    const gltfOffset = offsets[offsets.length - 2];
+    new DataView(invalidTail).setUint32(gltfOffset + 4 + 68, 2, true);
     let applied = 0;
-    assert.throws(() => applyDeltaFrame(invalidTail, { onBeginFrame: () => applied++ }), /Invalid UpdateWebApp.visible/);
+    assert.throws(() => applyDeltaFrame(invalidTail, { onBeginFrame: () => applied++ }), /Invalid UpdateGLTF.visible/);
     assert.equal(applied, 0);
 }
 

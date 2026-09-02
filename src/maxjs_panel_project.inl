@@ -76,7 +76,9 @@
         if (!webview_) return;
 
         const std::wstring projectDir = GetProjectDir();
-        const std::wstring inlineDir = GetInlineLayerDir();
+        const std::wstring inlineDir = GetInlineHotLayerDir();
+        const bool legacyFolder = !inlineDir.empty() &&
+            _wcsicmp(inlineDir.c_str(), GetLegacyProjectInlineLayerDir().c_str()) == 0;
         const bool sceneSaved = !projectDir.empty();
         const bool manifestExists = SceneProjectManifestExists();
         activeProjectDir_ = projectDir;
@@ -85,6 +87,7 @@
         ss << L"{\"type\":\"project_config\",\"dir\":\""
            << EscapeJson(projectDir.c_str())
            << L"\",\"inlineDir\":\"" << EscapeJson(inlineDir.c_str())
+           << L"\",\"scriptFolder\":\"" << (legacyFolder ? L"inlines" : L"scripts")
            << L"\",\"pollMs\":0"
            << L",\"sceneSaved\":" << (sceneSaved ? L"true" : L"false")
            << L",\"manifestExists\":" << (manifestExists ? L"true" : L"false")
@@ -141,7 +144,6 @@
         lightHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
-        webappHandles_.clear();
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
@@ -157,7 +159,6 @@
         lightHashMap_.clear();
         audioHashMap_.clear();
         gltfHashMap_.clear();
-        webappHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
         geoFastTriangleCountMap_.clear();

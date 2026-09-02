@@ -201,6 +201,7 @@ export function createProjectRuntime({
     let projectRootUrlOverride = '';
     let manifestBaseUrl = '';
     let inlineDir = '';
+    let scriptFolderName = 'scripts';
     let pollMs = 0;
     let sceneSaved = false;
     let manifestExists = false;
@@ -1017,7 +1018,8 @@ function stripSettingsFromPostFx(payload) {
         if (result?.path) {
             projectDir = normalizeWindowsPath(result.path).trim();
             projectRootUrl = resolveProjectRootUrl(projectDir);
-            inlineDir = projectDir ? ensureTrailingSlash(`${projectDir}\\inlines`) : '';
+            inlineDir = projectDir ? ensureTrailingSlash(`${projectDir}\\scripts`) : '';
+            scriptFolderName = 'scripts';
         }
         emitChange();
         await reload(true);
@@ -1144,6 +1146,12 @@ function stripSettingsFromPostFx(payload) {
         if (typeof options.inlineDir === 'string') {
             inlineDir = normalizeWindowsPath(options.inlineDir).trim();
         }
+        if (typeof options.scriptFolder === 'string' && options.scriptFolder) {
+            scriptFolderName = options.scriptFolder.toLowerCase() === 'inlines' ? 'inlines' : 'scripts';
+        } else if (inlineDir) {
+            const tail = inlineDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase();
+            scriptFolderName = tail === 'inlines' ? 'inlines' : 'scripts';
+        }
         if (typeof options.sceneSaved === 'boolean') {
             sceneSaved = options.sceneSaved;
         }
@@ -1183,6 +1191,7 @@ function stripSettingsFromPostFx(payload) {
             () => setProjectDirectory(msg.dir || '', {
                 pollMs: msg.pollMs,
                 inlineDir: msg.inlineDir || '',
+                scriptFolder: msg.scriptFolder || '',
                 sceneSaved: msg.sceneSaved === true,
                 manifestExists: msg.manifestExists === true,
                 rootUrl: typeof msg.rootUrl === 'string' ? msg.rootUrl : '',
@@ -1199,8 +1208,8 @@ function stripSettingsFromPostFx(payload) {
         void trackProjectLoad(() => reload(true), 'project reload');
     });
 
-    // Auto-mount layers discovered by C++ scanning the inlines/ folder.
-    // No manifest entry needed — drop a .js into inlines/ and it loads.
+    // Auto-mount layers discovered by the host scanning the scripts/ folder.
+    // No manifest entry needed — drop a .js into scripts/ and it loads.
     // Each call to inline_layers_state is the full current state of the
     // folder; we mount what's new, drop what's gone, and apply the
     // enabled flag as a runtime active state on what stays.
@@ -1210,14 +1219,14 @@ function stripSettingsFromPostFx(payload) {
     // project_config.rootUrl (the Blender add-on); the 3ds Max WebView2 host
     // omits it and keeps the virtual-host mapping. The manifest, settings and
     // postfx already honour it via projectUrl(), and per HOST_CONTRACT.md
-    // inlines/*.js must too — a maxjs-assets.local URL derived from the absolute
+    // scripts/*.js must too — a maxjs-assets.local URL derived from the absolute
     // inlineDir only resolves inside WebView2, so elsewhere the import 404s and
     // the layer silently stays unmounted. With no override this returns exactly
     // what toAssetUrl(inlineDir) always did, leaving the Max path untouched.
     function inlineBaseUrl() {
         if (!inlineDir) return null;
         return projectRootUrlOverride
-            ? projectUrl(projectRootUrl, 'inlines/')
+            ? projectUrl(projectRootUrl, `${scriptFolderName}/`)
             : toAssetUrl(inlineDir);
     }
 
@@ -1230,7 +1239,7 @@ function stripSettingsFromPostFx(payload) {
 
     function inlineEntryRelPath(id, folder) {
         const f = folder ? `${folder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')}/` : '';
-        return `inlines/${f}${id}.js`;
+        return `${scriptFolderName}/${f}${id}.js`;
     }
 
     function inlineLayerUrlWithFolder(id, folder, version) {
@@ -1247,14 +1256,14 @@ function stripSettingsFromPostFx(payload) {
         const priority = Number.isFinite(meta.priority) ? meta.priority : 100;
         const signature = String(meta.signature || '');
         const moduleUrl = inlineLayerUrlWithFolder(rawId, folder, moduleVersion) || inlineLayerUrl(rawId, moduleVersion);
-        if (!moduleUrl) throw new Error(`No inline directory configured for ${rawId}`);
+        if (!moduleUrl) throw new Error(`No scripts directory configured for ${rawId}`);
 
         let moduleNamespace;
         try {
             moduleNamespace = await importModule(moduleUrl);
         } catch (error) {
             const detail = error?.message || String(error);
-            throw new Error(`inline layer import failed: ${rawId} -> ${detail}`);
+            throw new Error(`runtime script import failed: ${rawId} -> ${detail}`);
         }
         const factory = resolveFactory(moduleNamespace);
 
@@ -1299,6 +1308,9 @@ function stripSettingsFromPostFx(payload) {
         // Wait for project settings before mounting so restart-time parameter
         // values are available to the layer factory on its first invocation.
         await waitForLatestProjectLoad();
+        if (msg?.folderName === 'inlines' || msg?.folderName === 'scripts') {
+            scriptFolderName = msg.folderName;
+        }
         const layersRaw = Array.isArray(msg?.layers) ? msg.layers : [];
         const scanStamp = String(msg?.stamp || '');
         // Augment with folder/priority and sort. C++ scanner emits these; older builds
@@ -1440,6 +1452,7 @@ function stripSettingsFromPostFx(payload) {
             projectRootUrlOverride = '';
             manifestBaseUrl = '';
             inlineDir = '';
+            scriptFolderName = 'scripts';
             sceneSaved = false;
             manifestExists = false;
             projectLoadTask = Promise.resolve(false);
@@ -1451,6 +1464,7 @@ function stripSettingsFromPostFx(payload) {
                 projectDir,
                 projectRootUrl,
                 inlineDir,
+                scriptFolderName,
                 pollMs,
                 sceneSaved,
                 manifestExists,

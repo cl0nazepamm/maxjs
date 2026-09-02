@@ -72,4 +72,10 @@ export default {
         // DepthOfFieldNode composite forces a=1; keep scene alpha for transparent backdrop + fog
         return vec4(dofPass.rgb, ctx.beautyAlpha);
     },
+    update(ctx) {
+        const d = ctx.state.dof;
+        ctx.uniforms.dofFocusDistanceU.value = d.focusDistance;
+        ctx.uniforms.dofFocalLengthU.value = d.focalLength;
+        ctx.uniforms.dofBokehScaleU.value = d.bokehScale;
+    },
 };

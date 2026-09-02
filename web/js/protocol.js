@@ -14,7 +14,7 @@ export const COMMAND_TYPES = Object.freeze({
     UpdateAudio: 10,
     UpdateTime: 11,
     UpdateGLTF: 12,
-    UpdateWebApp: 13,
+    // 13 retired — do not reuse
 });
 
 const FRAME_HEADER_SIZE = 16;
@@ -33,7 +33,6 @@ const COMMAND_SIZES = Object.freeze({
     [COMMAND_TYPES.UpdateAudio]: [76],
     [COMMAND_TYPES.UpdateTime]: [16],
     [COMMAND_TYPES.UpdateGLTF]: [76],
-    [COMMAND_TYPES.UpdateWebApp]: [76],
 });
 
 function assertSize(type, actual, expected) {
@@ -100,9 +99,6 @@ function validateCommandPayload(view, type, payloadOffset, commandSize, frameId)
         }
         case COMMAND_TYPES.UpdateGLTF:
             readBoolU32(view, payloadOffset + 68, 'UpdateGLTF.visible');
-            break;
-        case COMMAND_TYPES.UpdateWebApp:
-            readBoolU32(view, payloadOffset + 68, 'UpdateWebApp.visible');
             break;
         default:
             break;
@@ -472,17 +468,6 @@ export function applyDeltaFrame(buffer, handlers = {}, logicalByteLength = undef
                 decodeMs += performance.now() - decodeStart;
                 const applyStart = performance.now();
                 handlers.onGLTF?.(handle, matrix, visible);
-                applyMs += performance.now() - applyStart;
-                break;
-            }
-            case COMMAND_TYPES.UpdateWebApp: {
-                assertSize('UpdateWebApp', commandSize, 76);
-                const handle = view.getUint32(payloadOffset, true);
-                const matrix = new Float32Array(buffer, payloadOffset + 4, 16);
-                const visible = readBoolU32(view, payloadOffset + 68, 'UpdateWebApp.visible');
-                decodeMs += performance.now() - decodeStart;
-                const applyStart = performance.now();
-                handlers.onWebApp?.(handle, matrix, visible);
                 applyMs += performance.now() - applyStart;
                 break;
             }

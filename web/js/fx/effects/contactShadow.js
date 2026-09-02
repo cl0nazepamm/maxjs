@@ -38,7 +38,10 @@ export default {
     update(ctx) {
         const sssPass = ctx.getActivePass('contactShadow');
         if (!sssPass) return;
-        sssPass.maxDistance.value = ctx.derived.effectiveContactShadowMaxDistance;
-        sssPass.thickness.value = ctx.derived.effectiveContactShadowThickness;
+        const {state, derived} = ctx;
+        sssPass.maxDistance.value = derived.effectiveContactShadowMaxDistance;
+        sssPass.thickness.value = derived.effectiveContactShadowThickness;
+        sssPass.shadowIntensity.value = state.contactShadow.shadowIntensity;
+        sssPass.quality.value = state.contactShadow.quality;
     },
 };

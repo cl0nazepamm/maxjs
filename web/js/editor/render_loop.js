@@ -93,14 +93,7 @@ function createRenderLoop(deps = {}) {
             // draw, restored after draw so authored state is what the rest of
             // the system sees between frames.
             deps.layerManager.beforeRender?.(frameElapsed);
-            // Depth-occluded web panels: pick punch mode for this frame.
             // Pipeline active → analytic mask (occluder meshes hidden);
-            // direct render → occluder meshes punch natively. Canvas-readback
-            // captures suppress punching (no alpha holes in output); composited
-            // captures keep it — the DOM behind the holes IS in the output.
-            deps.webappSystem?.setPunchSuppressed?.(
-                deps.renderToImageActive === true && !deps.renderCaptureComposited);
-            deps.webappSystem?.setPunchPipelineActive?.(deps.maxjsFx.isPipelineRenderActive?.() === true);
             try {
                 if (deps.isPathTracingViewActive() && (!deps.renderToImageActive || deps.pendingRenderToImage?.pathTracing)) {
                     // Pathtracing is a live-viewer-only renderer mode. The live
@@ -211,8 +204,6 @@ function createRenderLoop(deps = {}) {
                 deps.pathTracingFx?.setNirGain?.(irGain);
                 deps.updateProbeHelpers();
             }
-            deps.css3dOverlay.tick(deps.scene, deps.camera);
-            deps.css3dOverlay.tickBehind(deps.webappSystem?.getBehindScene?.(), deps.camera);
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (deps.maxjsFx.isCloneEnabled() && !deps.renderToImageActive) {
                 deps.maxjsFx.drawBlobOverlay(deps.blobOverlayCtx, deps.blobOverlayCvs.width, deps.blobOverlayCvs.height);
@@ -266,21 +257,7 @@ function createRenderLoop(deps = {}) {
                         } finally {
                             deps.renderToImageForcePathTracing = false;
                         }
-                        if (capture.composited) {
-                            // C++ captures the WebView composite (CapturePreview)
-                            // on receipt — DOM panels + canvas as displayed. One
-                            // extra frame lets the compositor present the final
-                            // CSS3D state before the grab.
-                            requestAnimationFrame(() => {
-                                deps.bridge.send(capture.responseType, { composited: true });
-                            });
-                        } else {
-                            // Both paths read the canvas back to C++. The Max-bitmap
-                            // path (render_to_image_ready) needs the pixels too — its
-                            // alpha channel only survives from the canvas, not from
-                            // WebView2 CapturePreview.
-                            void deps.sendCurrentCanvasRenderFile(capture);
-                        }
+                        void deps.sendCurrentCanvasRenderFile(capture);
                     });
                 }
             }

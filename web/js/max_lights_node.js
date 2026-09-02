@@ -23,7 +23,6 @@ import PointLightDataNode from 'three/addons/tsl/lighting/data/PointLightDataNod
 import SpotLightDataNode from 'three/addons/tsl/lighting/data/SpotLightDataNode.js';
 import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLightDataNode.js';
 import { AmbientLightNode, HemisphereLightNode, NodeUtils } from 'three/webgpu';
-import { getReflectionPaintNode } from './reflection_paint.js';
 import { getGiVolumeNode, getGiProbeNode, isIrEmitter, getOrCreateIrLightNode } from 'speedball-gi';
 import {
     LIGHT_MASK_HI_KEY,
@@ -52,7 +51,6 @@ function createMaskDefaults() {
         generationNode: uniform(0xFFFFFFFF, 'uint').setGroup(renderGroup),
     };
 }
-
 export function setLightLinkMaskDefaults(renderer, lo = 0xFFFFFFFF, hi = 0xFFFFFFFF, generation = 0xFFFFFFFF) {
     const defaults = renderer?.lighting?.createNode?.maxjsMaskDefaults;
     if (!defaults) return false;
@@ -518,7 +516,6 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 HASH_DATA.push(light.colorNode ? light.colorNode.getCacheKey() : -1);
             }
         }
-        if (getReflectionPaintNode().active) typeSet.add('reflection-paint-global');
         // GI irradiance volume: token carries a generation so enable/disable and
         // grid-resize recompile, but data-only surfel-buffer writes share the same
         // program.
@@ -644,9 +641,6 @@ export default class MaxLightsNode extends DynamicLightsNode {
             lightNodes.push(dataNode);
         }
 
-        const reflectionPaintNode = getReflectionPaintNode();
-        if (reflectionPaintNode.active) lightNodes.push(reflectionPaintNode);
-
         // GI irradiance volume — adds position-dependent local diffuse bounce into
         // builder.context.irradiance for every synced material (global; not
         // per-mesh light-link masked — indirect bounce is unmasked by design).
@@ -728,5 +722,3 @@ export function installMaxLightsRenderer(renderer, options = {}) {
     renderer.lighting.createNode = factory;
     return true;
 }
-
-export { getReflectionPaintNode } from './reflection_paint.js';

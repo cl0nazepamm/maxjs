@@ -116,7 +116,7 @@ const firstRuntime = createProjectRuntime({
 });
 
 await firstRuntime.setProjectDirectory('C:\\ParameterPersistenceSmoke', {
-    inlineDir: 'C:\\ParameterPersistenceSmoke\\inlines',
+    inlineDir: 'C:\\ParameterPersistenceSmoke\\scripts',
     sceneSaved: true,
     manifestExists: true,
 });
@@ -163,7 +163,7 @@ const secondRuntime = createProjectRuntime({
 // delayed settings fetch before mounting the layer.
 await secondBridge.emit('project_config', {
     dir: 'C:\\ParameterPersistenceSmoke',
-    inlineDir: 'C:\\ParameterPersistenceSmoke\\inlines',
+    inlineDir: 'C:\\ParameterPersistenceSmoke\\scripts',
     sceneSaved: true,
     manifestExists: true,
     pollMs: 0,

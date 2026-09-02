@@ -26,12 +26,6 @@
         import { createEnvironment } from './environment.js';
         import { createSky } from './sky.js';
         import { createGiVolumeGlue } from './gi_volume_glue.js';
-        import {
-            createLiveRelayController,
-            DEFAULT_RELAY_URL,
-            DEFAULT_STREAM_ID,
-            validateRelayEndpoint,
-        } from '../live_relay_tap.js';
         import { getHostProfile } from '../host_profile.js';
         import {
             materialEnvIntensity,
@@ -155,10 +149,7 @@
         import { createMaxJSAnimationSystem } from '../maxjs_animation.js';
         import { createMaxJSAudioSystem } from '../maxjs_audio.js';
         import { createMaxJSGLTFSystem } from '../maxjs_gltf.js';
-        import { createMaxJSWebAppSystem } from '../maxjs_webapp.js';
-        import { attachDomPanelForwarding } from '../dom_panel_forwarding.js';
         import { createProjectRuntime } from '../project_runtime.js';
-        import * as css3dOverlay from '../css3d_overlay.js';
         import { attachHTMLClickForwarding } from '../html_texture.js';
         import { createShaderLabFx } from '../shader_lab_fx.js';
         import { createCompositionOverlay } from '../composition_overlay.js';
@@ -262,7 +253,6 @@
         const cameraPositionWorld = new THREE.Vector3();
 
         const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
-        const cameraDefaultDirection = cameraDefaultPosition.clone().normalize();
         function getActiveCameraWorldPosition(target = new THREE.Vector3()) {
             const activeCamera = renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera;
             return activeCamera.getWorldPosition(target);
@@ -393,7 +383,6 @@
             get asciiEffect() { return asciiEffect; },
             get blobOverlayCvs() { return blobOverlayCvs; },
             get compositionOverlay() { return compositionOverlay; },
-            get css3dOverlay() { return css3dOverlay; },
             get maxjsFx() { return maxjsFx; },
             get webglBasicFx() { return webglBasicFx; },
             get lastRenderTimestamp() { return lastRenderTimestamp; },
@@ -475,6 +464,10 @@
         let controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
         controls.dampingFactor = 0.08;
+        // Unlocking the camera enables orbit/pan only. Wheel dolly is too easy
+        // to trigger over interactive runtime content and must never move the
+        // viewer camera implicitly.
+        controls.enableZoom = false;
         controls.zoomToCursor = true;
         controls.screenSpacePanning = false;
         controls.mouseButtons = {
@@ -618,7 +611,6 @@
         let audioSystem = null;
         let audioMuted = readPersistedAudioMuted();
         let gltfSystem = null;
-        let webappSystem = null;
         const perfHud = createPerfHud(document.getElementById('info'));
         perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
 
@@ -713,15 +705,6 @@
         // hit to host pixel coords → dispatch click to the matching DOM
         // element inside the texture's shadow tree.
         attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
-
-        // Pointer input for depth-occluded web panels (behind-canvas CSS3D).
-        // Reads targets lazily — webappSystem is created later in startup.
-        attachDomPanelForwarding({
-            THREE,
-            renderer,
-            getCameraScene: () => ({ camera, scene }),
-            getTargets: () => webappSystem?.listForwardTargets?.() ?? [],
-        });
 
         // Shader Lab FX — optional custom pass consumed by the unified
         // Post FX controller. Toggled from the right rail. Loads React +
@@ -1273,35 +1256,10 @@
         ctx.hostBridge = hostBridge;
         ctx.bridge = bridge;
 
-        // Relay endpoint/stream prefs persist across sessions. Enabled state
-        // also persists (`maxjs.liveRelayEnabled`) so a viewer restart resumes
-        // streaming when the user left relay on. Merely setting an endpoint
-        // override never starts network traffic on its own.
-        const RELAY_ENABLED_KEY = 'maxjs.liveRelayEnabled';
-        let relayEndpoint = DEFAULT_RELAY_URL;
-        let relayStreamId = DEFAULT_STREAM_ID;
-        let relayProducerId;
-        let relayEnabledPreference = false;
-        try {
-            const relayEndpointOverride = localStorage.getItem('maxjs.liveRelayUrl');
-            if (relayEndpointOverride) {
-                try {
-                    relayEndpoint = validateRelayEndpoint(relayEndpointOverride);
-                } catch (error) {
-                    // A stale proof-of-concept override must never prevent the
-                    // editor from booting. Drop it and retain the safe default.
-                    try { localStorage.removeItem('maxjs.liveRelayUrl'); } catch {}
-                    console.warn('[max.js relay] Ignoring unsafe endpoint override:', error);
-                }
-            }
-            relayStreamId = localStorage.getItem('maxjs.liveRelayStream') || relayStreamId;
-            relayEnabledPreference = localStorage.getItem(RELAY_ENABLED_KEY) === 'true';
-            relayProducerId = sessionStorage.getItem('maxjs.liveRelayProducerId') || undefined;
-            if (!relayProducerId) {
-                relayProducerId = `producer-${crypto.randomUUID()}`;
-                sessionStorage.setItem('maxjs.liveRelayProducerId', relayProducerId);
-            }
-        } catch {}
+        // Relay is a hard opt-in boundary. Until the RELAY button (or the
+        // public relay facade) is enabled, the relay module is not imported,
+        // preferences are not read, no producer identity exists, and no host
+        // transport observer, timer, encoder, or network request is installed.
         let relayRenderFrame = null;
         let relayResetRenderTimer = () => { lastRenderTimestamp = 0; };
         let relayRenderingSuspended = false;
@@ -1321,22 +1279,119 @@
                 renderer.setAnimationLoop(relayRenderFrame);
             }
         }
-        const relayController = createLiveRelayController({
-            hostBridge,
-            endpoint: relayEndpoint,
-            streamId: relayStreamId,
-            producerId: relayProducerId,
-            requestScene: details => bridge.send('relay_resync', details),
-            onReadyConsumersChange: count => setRelayReadyConsumers(count),
+        const RELAY_OFF_STATE = Object.freeze({
+            state: 'off',
+            enabled: false,
+            readyConsumers: 0,
+            lastError: '',
         });
-        try { sessionStorage.setItem('maxjs.liveRelayProducerId', relayController.getState().producerId); } catch {}
+        const relaySubscribers = new Set();
+        let relayState = RELAY_OFF_STATE;
+        let relayController = null;
+        let relayControllerLoad = null;
+        let relayDesiredEnabled = false;
+        let relayActivationGeneration = 0;
+        let relayPageHideInstalled = false;
+
+        function publishRelayState(nextState = RELAY_OFF_STATE) {
+            relayState = nextState;
+            for (const listener of relaySubscribers) {
+                try { listener(relayState); }
+                catch (error) { console.warn('[max.js relay subscriber]', error); }
+            }
+        }
+
+        function disposeRelayController() {
+            relayDesiredEnabled = false;
+            relayActivationGeneration += 1;
+            const current = relayController;
+            relayController = null;
+            current?.dispose();
+            setRelayReadyConsumers(0);
+            publishRelayState(RELAY_OFF_STATE);
+            return current != null;
+        }
+
+        async function loadRelayController() {
+            if (relayController) return relayController;
+            if (relayControllerLoad) return relayControllerLoad;
+
+            relayControllerLoad = import('../live_relay_tap.js')
+                .then(relayModule => {
+                    if (!relayDesiredEnabled) return null;
+
+                    let endpoint = relayModule.DEFAULT_RELAY_URL;
+                    let streamId = relayModule.DEFAULT_STREAM_ID;
+                    let producerId;
+                    try {
+                        const endpointOverride = localStorage.getItem('maxjs.liveRelayUrl');
+                        if (endpointOverride) {
+                            try {
+                                endpoint = relayModule.validateRelayEndpoint(endpointOverride);
+                            } catch (error) {
+                                localStorage.removeItem('maxjs.liveRelayUrl');
+                                console.warn('[max.js relay] Ignoring unsafe endpoint override:', error);
+                            }
+                        }
+                        streamId = localStorage.getItem('maxjs.liveRelayStream') || streamId;
+                        producerId = sessionStorage.getItem('maxjs.liveRelayProducerId') || undefined;
+                    } catch {}
+
+                    const controller = relayModule.createLiveRelayController({
+                        hostBridge,
+                        endpoint,
+                        streamId,
+                        producerId,
+                        requestScene: details => bridge.send('relay_resync', details),
+                        onReadyConsumersChange: count => setRelayReadyConsumers(count),
+                    });
+                    if (!relayDesiredEnabled) {
+                        controller.dispose();
+                        return null;
+                    }
+
+                    relayController = controller;
+                    controller.subscribe(nextState => publishRelayState(nextState));
+                    try {
+                        sessionStorage.setItem(
+                            'maxjs.liveRelayProducerId',
+                            controller.getState().producerId,
+                        );
+                    } catch {}
+                    if (!relayPageHideInstalled) {
+                        relayPageHideInstalled = true;
+                        window.addEventListener('pagehide', () => disposeRelayController(), { once: true });
+                    }
+                    return controller;
+                })
+                .finally(() => { relayControllerLoad = null; });
+            return relayControllerLoad;
+        }
+
+        const relayFacade = Object.freeze({
+            enable: () => setRelayEnabled(true),
+            disable: () => setRelayEnabled(false),
+            toggle: () => setRelayEnabled(!relayDesiredEnabled),
+            emit: data => relayController?.emit(data) ?? false,
+            subscribe(listener, { immediate = true } = {}) {
+                if (typeof listener !== 'function') throw new TypeError('relay subscriber must be a function');
+                relaySubscribers.add(listener);
+                if (immediate) listener(relayState);
+                return () => relaySubscribers.delete(listener);
+            },
+            dispose: () => disposeRelayController(),
+            getState: () => relayState,
+            get state() { return relayState.state; },
+            get enabled() { return relayState.enabled === true; },
+            get readyConsumers() { return Number(relayState.readyConsumers) || 0; },
+        });
 
         const giVolumeGlue = createGiVolumeGlue({
             pageParams,
             maxTimeline,
             hostBridge,
             bridge,
-            relayEmit: data => relayController.emit(data),
+            relayEmit: data => relayFacade.emit(data),
             maxjsDebugWarn,
             savePostFxState: () => savePostFxState(),
             bakeStateSignature: () => bakeStateSignature(),
@@ -1508,43 +1563,62 @@
             recovering: ['Relay Recovering', 'Relay is requesting a fresh scene baseline'],
             error: ['Relay Error', 'Relay unavailable - click to turn relay off'],
         };
-        function persistRelayEnabled(enabled) {
-            try { localStorage.setItem(RELAY_ENABLED_KEY, enabled ? 'true' : 'false'); } catch {}
-        }
-        function setRelayEnabled(enabled) {
+        async function setRelayEnabled(enabled) {
             const next = enabled === true;
-            if (next === relayController.enabled) {
-                persistRelayEnabled(next);
-                return;
-            }
-            if (next) {
-                relayController.enable();
-                relayController.emit({
+            const activationGeneration = ++relayActivationGeneration;
+            relayDesiredEnabled = next;
+            if (!next) return disposeRelayController();
+            if (relayController?.enabled) return false;
+
+            publishRelayState({
+                ...RELAY_OFF_STATE,
+                state: 'connecting',
+                enabled: true,
+            });
+            try {
+                const controller = await loadRelayController();
+                if (!relayDesiredEnabled
+                    || activationGeneration !== relayActivationGeneration
+                    || !controller) return false;
+                controller.enable();
+                controller.emit({
                     type: 'speedballGiSettings',
                     settings: { ...getSpeedballGiSettings() },
                 });
-                relayController.emit(serializeRelayProbeGrids());
-            } else {
-                relayController.disable();
+                controller.emit(serializeRelayProbeGrids());
+                return true;
+            } catch (error) {
+                if (!relayDesiredEnabled) return false;
+                const message = error?.message || String(error);
+                relayDesiredEnabled = false;
+                relayActivationGeneration += 1;
+                relayController?.dispose();
+                relayController = null;
+                setRelayReadyConsumers(0);
+                publishRelayState({
+                    ...RELAY_OFF_STATE,
+                    state: 'error',
+                    lastError: message,
+                });
+                console.warn('[max.js relay] Failed to enable:', error);
+                return false;
             }
-            persistRelayEnabled(next);
         }
-        relayController.subscribe(relayState => {
-            const [label, title] = RELAY_UI[relayState.state] || RELAY_UI.off;
+        relayFacade.subscribe(nextRelayState => {
+            const [label, title] = RELAY_UI[nextRelayState.state] || RELAY_UI.off;
             if (relayLabel) relayLabel.textContent = label;
             if (!relayButton) return;
-            relayButton.dataset.relayState = relayState.state;
-            relayButton.classList.toggle('active', relayState.enabled);
-            relayButton.setAttribute('aria-pressed', relayState.enabled ? 'true' : 'false');
-            const stateTitle = relayState.lastError ? `${title}: ${relayState.lastError}` : title;
-            relayButton.title = relayState.readyConsumers > 0
-                ? `${stateTitle} (${relayState.readyConsumers} ready consumer${relayState.readyConsumers === 1 ? '' : 's'}; local renderer stopped)`
+            relayButton.dataset.relayState = nextRelayState.state;
+            relayButton.classList.toggle('active', nextRelayState.enabled);
+            relayButton.setAttribute('aria-pressed', nextRelayState.enabled ? 'true' : 'false');
+            const stateTitle = nextRelayState.lastError ? `${title}: ${nextRelayState.lastError}` : title;
+            relayButton.title = nextRelayState.readyConsumers > 0
+                ? `${stateTitle} (${nextRelayState.readyConsumers} ready consumer${nextRelayState.readyConsumers === 1 ? '' : 's'}; local renderer stopped)`
                 : stateTitle;
         });
         relayButton?.addEventListener('click', () => {
-            setRelayEnabled(!relayController.enabled);
+            void setRelayEnabled(!relayDesiredEnabled);
         });
-        if (relayEnabledPreference) setRelayEnabled(true);
 
         bridge.on('live_sync_settings', msg => {
             applyLiveSyncSettings(
@@ -1731,7 +1805,6 @@
             applyHairInstances: (...args) => applyHairInstances(...args),
             applyForestInstances: (...args) => applyForestInstances(...args),
             applyVolumes: (...args) => applyVolumes(...args),
-            fitCamera: (...args) => fitCamera(...args),
             applyHairTransform: (...args) => applyHairTransform(...args),
             applyHairVisibility: (...args) => applyHairVisibility(...args),
             applyLightData: (...args) => applyLightData(...args),
@@ -1754,7 +1827,6 @@
             get lightHandleMap() { return lightHandleMap; },
             get audioSystem() { return audioSystem; },
             get gltfSystem() { return gltfSystem; },
-            get webappSystem() { return webappSystem; },
             get animationSystem() { return animationSystem; },
         });
         const {
@@ -1877,7 +1949,6 @@
             get perspCamera() { return perspCamera; },
             get orthoCamera() { return orthoCamera; },
             get cameraTargetWorld() { return cameraTargetWorld; },
-            get cameraDefaultDirection() { return cameraDefaultDirection; },
             get maxjsFx() { return maxjsFx; },
             get webglBasicFx() { return webglBasicFx; },
             get shaderLabFx() { return shaderLabFx; },
@@ -1898,14 +1969,13 @@
             computeVisibleSceneBounds,
             serializeCurrentCameraState,
             applyStandaloneCameraState,
-            fitCamera,
             syncOrbitNavigationFeel,
             getKnownSceneCameras,
         } = cameraSystem;
 
         hostBridge.installHostWiring();
         window.maxJS = bridge;
-        window.maxJS.relay = relayController;
+        window.maxJS.relay = relayFacade;
         bridge.materials = {
             getStats() {
                 return { ...getMaterialRegistryStats() };
@@ -2063,12 +2133,6 @@
             if (Array.isArray(msg?.gltfs)) gltfSystem?.applyGLTFUpdates(msg.gltfs);
         });
 
-        // WebApp Animator param channels (curve-driven) + page/size edits.
-        // Binary UpdateWebApp carries transform + visibility only.
-        bridge.on('webapp_update', msg => {
-            if (Array.isArray(msg?.webapps)) webappSystem?.applyWebAppUpdates(msg.webapps);
-        });
-
         const lightsSystem = createLights({
             MAXJS_SELF_HIDDEN_LAYER,
             LIGHT_LINK_STORAGE_KEY,
@@ -2207,7 +2271,6 @@
             get _projectRuntimeRef() { return _projectRuntimeRef; },
             set _projectRuntimeRef(value) { _projectRuntimeRef = value; },
             get projectRuntime() { return projectRuntime; },
-            get webappSystem() { return webappSystem; },
             get lightHelpersVisible() { return lightHelpersVisible; },
             get postPanelVisible() { return postPanelVisible; },
             set postPanelVisible(value) { postPanelVisible = value; },
@@ -2228,7 +2291,6 @@
             enterAsciiMode,
             exitAsciiMode,
             rebuildAsciiEffect,
-            setReflPaintPanelVisible,
             serializeStudioState,
             saveStudioState,
             restoreStudioState,
@@ -2237,7 +2299,6 @@
             syncShaderLabAvailability,
             attachLayerPanelSubscriptions,
             queueLayersPanelRefresh,
-            queueWebPanelsRefresh,
             setRightDockWidth,
             clampDockWidth,
             btnLightProbe,
@@ -2257,9 +2318,6 @@
         let renderToImageActive = false;
         let pendingRenderToImage = null;
         let renderToImageForcePathTracing = false;
-        // Sticky across sequence frames (pendingRenderToImage clears between
-        // them) so punch state doesn't flicker mid-sequence.
-        let renderCaptureComposited = false;
 
         // ── UI Controls ─────────────────────────────────────
         document.getElementById('btnKill').onclick = () => {
@@ -2680,8 +2738,6 @@
             get audioSystem() { return audioSystem; },
             get gltfSystem() { return gltfSystem; },
             get perfHud() { return perfHud; },
-            get webappSystem() { return webappSystem; },
-            get renderCaptureComposited() { return renderCaptureComposited; },
             get pathTracingFx() { return pathTracingFx; },
             get pathTracingRasterWarmupFrames() { return pathTracingRasterWarmupFrames; },
             set pathTracingRasterWarmupFrames(value) { pathTracingRasterWarmupFrames = value; },
@@ -2691,7 +2747,6 @@
             set speedballGiLastInteractionMs(value) { speedballGiLastInteractionMs = value; },
             get speedballGi() { return speedballGi; },
             get isPathTracingMode() { return isPathTracingMode; },
-            get css3dOverlay() { return css3dOverlay; },
             get blobOverlayCtx() { return blobOverlayCtx; },
             get blobOverlayCvs() { return blobOverlayCvs; },
             get latestAppliedSyncSerial() { return latestAppliedSyncSerial; },
@@ -2705,7 +2760,7 @@
         });
         const { renderViewerFrame, renderFrame } = renderLoop;
 
-        // ── JS_Inline Layer Manager ──────────────────────────
+        // ── Runtime Script Layer Manager ─────────────────────
         const inlineTimer = new THREE.Timer();
         inlineTimer.connect?.(document);
         const inlineClock = inlineTimer;
@@ -2869,14 +2924,6 @@
         if (projectRuntime) {
             layerManager.bindProjectRuntime(projectRuntime);
         }
-        webappSystem = createMaxJSWebAppSystem({
-            THREE,
-            parent: maxBasisRoot,
-            getProjectBaseUrl: () => projectRuntime?.getState?.().projectRootUrl || '',
-            onPunchRectsChanged: (rects) => maxjsFx.setWebPanelPunchRects?.(rects),
-        });
-        webappSystem.subscribe(() => queueWebPanelsRefresh());
-        window.maxJS.webapps = webappSystem;
         window.maxJSProjectRuntime = projectRuntime;
         window.maxJS.layers = layerManager;
         window.maxJS.animation = animationSystem;
@@ -2926,7 +2973,6 @@
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             get bridge() { return bridge; },
             get renderer() { return renderer; },
-            get webappSystem() { return webappSystem; },
             get maxjsFx() { return maxjsFx; },
             get scene() { return scene; },
             get camera() { return camera; },
@@ -2957,14 +3003,9 @@
             get localHdriShowBg() { return localHdriShowBg; },
             set localHdriShowBg(value) { localHdriShowBg = value; },
             get pathTracingFx() { return pathTracingFx; },
-            get renderCaptureComposited() { return renderCaptureComposited; },
-            set renderCaptureComposited(value) { renderCaptureComposited = value; },
         });
         const {
             sendCurrentCanvasRenderFile,
-            cleanupCss3dMaskDomLeaks,
-            renderCss3dMaskFrame,
-            sendCss3dMaskPng,
             renderCurrentFrameOnce,
             beginRenderImageFrame,
             finishRenderImageFrame,

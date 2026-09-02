@@ -94,7 +94,7 @@ assert.doesNotMatch(qpcHelper, /GetTickCount64/,
     'QpcNowMs must not fall back to the coarse tick clock');
 for (const setName of [
     'helperHandles_', 'geomHandles_', 'lightHandles_',
-    'audioHandles_', 'gltfHandles_', 'webappHandles_', 'hairHandles_',
+    'audioHandles_', 'gltfHandles_', 'hairHandles_',
 ]) {
     assert.doesNotMatch(deltaSend, new RegExp(`for\\s*\\([^)]*:\\s*${setName}`),
         `playback must not rediscover the complete ${setName} set`);

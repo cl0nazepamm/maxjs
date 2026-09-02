@@ -19,7 +19,6 @@
     std::unordered_set<ULONG> lightHandles_;
     std::unordered_set<ULONG> audioHandles_;
     std::unordered_set<ULONG> gltfHandles_;
-    std::unordered_set<ULONG> webappHandles_;
     std::unordered_set<ULONG> hairHandles_;
     std::unordered_set<ULONG> helperHandles_;
     // Meshes with a modifier stack whose output can change between frames
@@ -51,7 +50,6 @@
     std::unordered_map<ULONG, uint64_t> lightHashMap_; // node handle → light state hash
     std::unordered_map<ULONG, uint64_t> audioHashMap_; // node handle → audio source state hash
     std::unordered_map<ULONG, uint64_t> gltfHashMap_;  // node handle → gltf source state hash
-    std::unordered_map<ULONG, uint64_t> webappHashMap_; // node handle → webapp animator state hash
     std::unordered_map<ULONG, uint64_t> geoHashMap_;   // node handle → geometry topology hash
     std::unordered_map<ULONG, int> geoFastTriangleCountMap_; // node handle -> capped triangle count for geo_fast eligibility
     std::unordered_map<ULONG, uint64_t> deformChannelHashMap_; // node handle -> UV/topology hash for deform fast path
@@ -281,21 +279,53 @@
     std::wstring GetInlineLayerDir() {
         const std::wstring projectDir = GetProjectDir();
         if (projectDir.empty()) return {};
+        return projectDir + L"\\scripts\\";
+    }
+
+    std::wstring GetLegacyProjectInlineLayerDir() {
+        const std::wstring projectDir = GetProjectDir();
+        if (projectDir.empty()) return {};
         return projectDir + L"\\inlines\\";
     }
 
+    static bool ContainsInlineLayerFilesRecursive(const std::wstring& dir) {
+        if (!DirectoryExists(dir)) return false;
+        WIN32_FIND_DATAW fd = {};
+        HANDLE hFind = FindFirstFileW((dir + L"*").c_str(), &fd);
+        if (hFind == INVALID_HANDLE_VALUE) return false;
+        bool found = false;
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                if (ContainsInlineLayerFilesRecursive(dir + fd.cFileName + L"\\")) {
+                    found = true;
+                    break;
+                }
+                continue;
+            }
+            std::wstring id;
+            bool enabled = false;
+            if (TryParseInlineLayerFileName(fd.cFileName, id, enabled)) {
+                found = true;
+                break;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+        return found;
+    }
+
     std::wstring GetInlineHotLayerDir() {
-        // Source of truth for inline-layer scan/rename/inject is the
-        // scene-local `inlines/` folder. The legacy %TEMP% location is
-        // only kept around for the one-shot migration in
-        // MigrateLegacyInlineLayers().
-        return GetInlineLayerDir();
+        const std::wstring scriptsDir = GetInlineLayerDir();
+        if (ContainsInlineLayerFilesRecursive(scriptsDir)) return scriptsDir;
+        const std::wstring legacyDir = GetLegacyProjectInlineLayerDir();
+        if (ContainsInlineLayerFilesRecursive(legacyDir)) return legacyDir;
+        return scriptsDir;
     }
 
     struct InlineLayerScanEntry {
         std::wstring id;           // raw filename (sans extension) — stable identity, incl. NN_ prefix
         std::wstring displayName;  // NN_ prefix stripped
-        std::wstring folder;       // forward-slash path relative to inlines/, empty for top-level
+        std::wstring folder;       // forward-slash path relative to the active scripts folder
         std::wstring stamp;        // content identity from file write time + size
         int priority;              // 100 default, from NN_ prefix
         bool enabled;
@@ -366,7 +396,10 @@
 
         std::wostringstream ss;
         const std::uint64_t dirStamp = dir.empty() ? 0 : GetDirectoryWriteStamp(dir);
-        ss << L"{\"type\":\"inline_layers_state\",\"stamp\":\"" << dirStamp << L"\",\"layers\":[";
+        const bool legacyFolder = !dir.empty() && _wcsicmp(dir.c_str(), GetLegacyProjectInlineLayerDir().c_str()) == 0;
+        ss << L"{\"type\":\"inline_layers_state\",\"folderName\":\""
+           << (legacyFolder ? L"inlines" : L"scripts")
+           << L"\",\"stamp\":\"" << dirStamp << L"\",\"layers\":[";
         bool first = true;
         std::wstring lastKey;
         for (const auto& layer : layers) {
@@ -400,7 +433,7 @@
         webview_->PostWebMessageAsJson(L"{\"type\":\"snapshot_export_request\",\"source\":\"maxscript\"}");
     }
 
-    // Inline-folder scan — just notifies the JS project runtime of the
+    // Script-folder scan — just notifies the JS project runtime of the
     // current file list. The runtime imports each .js as an ES module
     // via the asset URL host. There is no legacy sandbox-inject path.
     void ScanInlineLayers() {

@@ -1,7 +1,7 @@
 // scene_sky.js - explicit snapshot sky controller.
 //
 // Only used when snapshot.json contains env.sky. Inline sky scripts are
-// handled by project/inlines and should not be replaced by default sky data.
+// handled by project scripts and should not be replaced by default sky data.
 
 import * as THREE from 'three';
 

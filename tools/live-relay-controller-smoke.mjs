@@ -20,8 +20,12 @@ assert.doesNotMatch(relaySource, /maxjsRelayEmit/);
 assert.match(bootSource, /renderer\.setAnimationLoop\(null\)/);
 assert.match(bootSource, /inlineTimer\.reset\(\)/);
 assert.match(bootSource, /localStorage\.removeItem\('maxjs\.liveRelayUrl'\)/);
-assert.match(bootSource, /maxjs\.liveRelayEnabled/);
-assert.match(bootSource, /if \(relayEnabledPreference\) setRelayEnabled\(true\)/);
+assert.doesNotMatch(bootSource, /from ['"]\.\.\/live_relay_tap\.js['"]/,
+    'relay producer code must not be in the default editor module graph');
+assert.match(bootSource, /import\(['"]\.\.\/live_relay_tap\.js['"]\)/,
+    'the relay toggle must load the producer lazily');
+assert.doesNotMatch(bootSource, /maxjs\.liveRelayEnabled|relayEnabledPreference/,
+    'a viewer boot must never restore or auto-enable relay');
 
 const fullSceneRepairBody = /    void RequestFullSceneRepair\(\) \{([\s\S]*?)\n    \}/.exec(syncEntrySource)?.[1];
 assert.ok(fullSceneRepairBody, 'native full-scene repair handler must remain present');
@@ -56,13 +60,17 @@ async function waitFor(predicate, label, timeoutMs = 2000) {
 
 function fakeHostBridge() {
     let observer = null;
+    let registrations = 0;
     return {
         observeTransport(fn) {
+            registrations += 1;
             observer = fn;
             return () => { if (observer === fn) observer = null; };
         },
         shared(buffer, meta) { observer?.({ kind: 'shared-buffer', buffer, meta }); },
         message(data) { observer?.({ kind: 'message', data }); },
+        get observerCount() { return observer ? 1 : 0; },
+        get registrations() { return registrations; },
     };
 }
 
@@ -72,6 +80,43 @@ function fakeResponse(status) {
         status: 200,
         async json() { return { ...status }; },
     };
+}
+
+// Constructing a controller is cheap and inert. Only enable() may join the
+// host transport path; disable() must remove that observer again.
+{
+    const host = fakeHostBridge();
+    let fetchCalls = 0;
+    const controller = createLiveRelayController({
+        hostBridge: host,
+        producerId: 'producer-off-boundary',
+        createSessionId: () => 'session-off-boundary',
+        heartbeatMs: 10000,
+        fetchImpl: async () => {
+            fetchCalls += 1;
+            return fakeResponse({
+                kind: 'relay_status', version: 1, relayId: 'relay-off-boundary',
+                streamId: 'default', producerId: 'producer-off-boundary',
+                sessionId: 'session-off-boundary', consumers: 0,
+                readyConsumers: 0, needScene: false, sceneRequestId: 0,
+                sceneRevision: 0,
+            });
+        },
+    });
+    assert.equal(controller.state, RELAY_STATES.OFF);
+    assert.equal(host.observerCount, 0);
+    assert.equal(host.registrations, 0);
+    assert.equal(fetchCalls, 0);
+    host.shared(new ArrayBuffer(1024), { type: 'scene_bin' });
+    assert.equal(fetchCalls, 0);
+
+    controller.enable();
+    assert.equal(host.observerCount, 1);
+    assert.equal(host.registrations, 1);
+    assert.equal(fetchCalls, 1);
+    controller.disable();
+    assert.equal(host.observerCount, 0);
+    controller.dispose();
 }
 
 // host_bridge must notify observers synchronously before the shared buffer is

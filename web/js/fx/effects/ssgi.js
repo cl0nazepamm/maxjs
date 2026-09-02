@@ -48,6 +48,7 @@ export default {
         ssgiPass.useTemporalFiltering = state.ssgi.temporal;
         ctx.applyNodeResolutionScale(ssgiPass);
         ctx.pushNode(ssgiPass);
+        ctx.setActivePass('ssgi', ssgiPass);
 
         const ssgiAO = ssgiPass.getAONode().r;
         const ssgiGI = ssgiPass.getGINode().rgb;
@@ -59,5 +60,19 @@ export default {
             ),
             ctx.beautyAlpha
         );
+    },
+    update(ctx) {
+        const pass = ctx.getActivePass('ssgi');
+        if (!pass) return;
+        const s = ctx.state.ssgi;
+        pass.sliceCount.value = s.sliceCount;
+        pass.stepCount.value = s.stepCount;
+        pass.radius.value = s.radius;
+        pass.thickness.value = s.thickness;
+        pass.aoIntensity.value = s.aoIntensity;
+        pass.giIntensity.value = s.giIntensity;
+        pass.expFactor.value = s.expFactor;
+        pass.useTemporalFiltering = s.temporal;
+        ctx.applyNodeResolutionScale(pass);
     },
 };

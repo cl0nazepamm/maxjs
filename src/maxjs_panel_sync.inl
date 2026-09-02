@@ -1009,7 +1009,7 @@
         std::unordered_set<ULONG> seen;
         seen.reserve(
             geomHandles_.size() + lightHandles_.size() +
-            audioHandles_.size() + gltfHandles_.size() + webappHandles_.size() +
+            audioHandles_.size() + gltfHandles_.size() +
             hairHandles_.size() + helperHandles_.size());
         Interface* gateIp = flowMode_ ? GetCOREInterface() : nullptr;
         const TimeValue gateTime = gateIp ? gateIp->GetTime() : 0;
@@ -1042,7 +1042,6 @@
         appendUnique(lightHandles_);
         appendUnique(audioHandles_);
         appendUnique(gltfHandles_);
-        appendUnique(webappHandles_);
         appendUnique(hairHandles_);
 
         Interface* ip = GetCOREInterface();
@@ -2301,11 +2300,6 @@
                             playbackSnapshotFrame_.UpdateGLTF(
                                 static_cast<std::uint32_t>(handle), xform, visible);
                         }
-                    } else if (webappHandles_.find(handle) != webappHandles_.end()) {
-                        if (transformChanged || visibilityChanged) {
-                            playbackSnapshotFrame_.UpdateWebApp(
-                                static_cast<std::uint32_t>(handle), xform, visible);
-                        }
                     } else {
                         if (transformChanged) {
                             playbackSnapshotFrame_.UpdateTransform(
@@ -2634,7 +2628,6 @@
         lightHashMap_.clear();
         audioHashMap_.clear();
         gltfHashMap_.clear();
-        webappHashMap_.clear();
         propHashMap_.clear();
         jsmodStateMap_.clear();
         ClearMaterialEditHandleCache();
@@ -2667,7 +2660,6 @@
         if (!os.obj) return false;
         if (IsThreeJSAudioClassID(os.obj->ClassID())) return true;
         if (IsThreeJSGLTFClassID(os.obj->ClassID())) return true;
-        if (IsThreeJSWebAppClassID(os.obj->ClassID())) return true;
 
         const SClass_ID superClass = os.obj->SuperClassID();
         return superClass == GEOMOBJECT_CLASS_ID || superClass == LIGHT_CLASS_ID
@@ -3007,7 +2999,6 @@
         fastDirtyHandles_.insert(lightHandles_.begin(), lightHandles_.end());
         fastDirtyHandles_.insert(audioHandles_.begin(), audioHandles_.end());
         fastDirtyHandles_.insert(gltfHandles_.begin(), gltfHandles_.end());
-        fastDirtyHandles_.insert(webappHandles_.begin(), webappHandles_.end());
         fastDirtyHandles_.insert(hairHandles_.begin(), hairHandles_.end());
         fastDirtyHandles_.insert(helperHandles_.begin(), helperHandles_.end());
         QueueFastFlush();
@@ -3288,39 +3279,6 @@
             haveLastSentCamera_ = false;  // force camera resend
             fastCameraDirty_ = true;
             QueueFastFlush();
-            return;
-        }
-        // Viewer-side Web Panels UI writes settings back onto the WebApp
-        // Animator node. The param block stays the single source of truth:
-        // no direct viewer-side mutation — DetectWebAppChanges hash-detects
-        // the edit and round-trips a webapp_update on the next tick.
-        if (type == L"webapp_set") {
-            std::wstring handleStr;
-            ExtractJsonString(msg, L"handle", handleStr);
-            ULONG h = 0;
-            if (!handleStr.empty()) {
-                try { h = static_cast<ULONG>(std::stoul(handleStr)); } catch (...) { h = 0; }
-            }
-            Interface* ip = GetCOREInterface();
-            INode* node = (ip && h != 0) ? ip->GetINodeByHandle(h) : nullptr;
-            if (!node) return;
-            ObjectState os = node->EvalWorldState(ip->GetTime());
-            if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) return;
-            IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
-            if (!pb) return;
-
-            int presentation = -1;
-            const bool hasPresentation =
-                ExtractJsonInt(msg, L"presentation", presentation) &&
-                presentation >= 0 && presentation <= 1;
-            bool depthOcclude = false;
-            const bool hasDepthOcclude = ExtractJsonBool(msg, L"depthOcclude", depthOcclude);
-            if (!hasPresentation && !hasDepthOcclude) return;
-
-            theHold.Begin();
-            if (hasPresentation) pb->SetValue(pw_presentation, 0, presentation);
-            if (hasDepthOcclude) pb->SetValue(pw_depth_occlude, 0, depthOcclude ? TRUE : FALSE);
-            theHold.Accept(_T("Web Panel Setting"));
             return;
         }
         if (type == L"pathtracing_settings") {
@@ -3634,13 +3592,6 @@
             if (ExtractJsonString(msg, L"error", jsError) && !jsError.empty()) {
                 renderSequenceLastError_ = jsError;
                 FinishRenderSequence(false);
-            } else if (renderSequenceComposited_) {
-                // CSS3D web panels in the scene: the frame only exists in the
-                // WebView composite. CapturePreview CANNOT run from inside
-                // this WebMessageReceived handler (its completion dispatches
-                // through the event queue this handler is blocking — pumping
-                // here deadlocks). Defer to a clean WndProc stack.
-                PostMessage(hwnd_, WM_RENDER_SEQUENCE_CAPTURE, 0, 0);
             } else if (!ExtractJsonString(msg, L"imageBase64", imageBase64) || imageBase64.empty()) {
                 renderSequenceLastError_ = L"Missing browser render payload";
                 FinishRenderSequence(false);
@@ -3661,16 +3612,6 @@
             renderToImageBase64_.clear();
             ExtractJsonString(msg, L"imageBase64", renderToImageBase64_);
             if (renderImageEvent_) SetEvent(renderImageEvent_);
-            return;
-        }
-        if (type == L"render_css3d_mask_ready") {
-            renderCss3dMaskBase64_.clear();
-            std::wstring jsError;
-            if (ExtractJsonString(msg, L"error", jsError) && !jsError.empty()) {
-                renderSequenceLastError_ = jsError;
-            }
-            ExtractJsonString(msg, L"imageBase64", renderCss3dMaskBase64_);
-            if (renderCss3dMaskEvent_) SetEvent(renderCss3dMaskEvent_);
             return;
         }
         if (type == L"sync_lightmap_uvs" || type == L"sync_uv2") {
@@ -3698,14 +3639,12 @@
             lightHandles_.clear();
             audioHandles_.clear();
             gltfHandles_.clear();
-            webappHandles_.clear();
             hairHandles_.clear();
             helperHandles_.clear();
             deformHandles_.clear();
             pointInstanceHandles_.clear();
             audioHashMap_.clear();
             gltfHashMap_.clear();
-            webappHashMap_.clear();
             geoScanCursor_ = 0;
             ClearFastDeformState();
             lastSkinnedLivePollTick_ = 0;
@@ -3877,10 +3816,6 @@
                 DetectAudioChanges();
                 DetectGLTFChanges();
             }
-            // WebApp animator params are driven by Max animation curves, so
-            // unlike audio/glTF (UI-edit-only params) they must keep sampling
-            // during playback. Cheap: few nodes, hash compare per tick.
-            DetectWebAppChanges();
             if (allowHeavyGeometryPolling && slowPhase == 6) DetectGeometryChanges();
             if (allowIdlePolling && slowPhase == 9) DetectJsModChanges();
             if (allowRealtimeAuxPolling && lightPhase == 2) PollViewportModes();
@@ -4714,7 +4649,6 @@
                 lightHashMap_.erase(handle);
                 audioHashMap_.erase(handle);
                 gltfHashMap_.erase(handle);
-                webappHashMap_.erase(handle);
                 geoHashMap_.erase(handle);
                 deformChannelHashMap_.erase(handle);
                 EraseFastDeformState(handle);
@@ -4722,7 +4656,6 @@
                 lightHandles_.erase(handle);
                 audioHandles_.erase(handle);
                 gltfHandles_.erase(handle);
-                webappHandles_.erase(handle);
                 hairHandles_.erase(handle);
                 helperHandles_.erase(handle);
                 deformHandles_.erase(handle);
@@ -4774,13 +4707,6 @@
                 stagedVisibility.emplace_back(handle, visible);
                 continue;
             }
-            if (webappHandles_.find(handle) != webappHandles_.end()) {
-                frame.UpdateWebApp(static_cast<std::uint32_t>(handle), xform, visible);
-                stageTransform(handle, xform);
-                stagedVisibility.emplace_back(handle, visible);
-                continue;
-            }
-
             // Regular geometry node
             frame.UpdateTransform(static_cast<std::uint32_t>(handle), xform);
             const bool selected = node->Selected() != 0;
@@ -5465,65 +5391,6 @@
         return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
     }
 
-    uint64_t ComputeWebAppStateHash(INode* node, TimeValue t) {
-        if (!node) return 0;
-
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) {
-            const std::wstring payload = L"null";
-            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-        }
-
-        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
-        if (!pb) {
-            const std::wstring payload = L"null";
-            return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-        }
-
-        const MCHAR* rawUrl = pb->GetStr(pw_url);
-
-        std::wostringstream ss;
-        ss.imbue(std::locale::classic());
-        ss << L"{\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
-        ss << L",\"url\":\"" << EscapeJson(rawUrl ? rawUrl : L"") << L"\"";
-        ss << L",\"width\":" << pb->GetInt(pw_width);
-        ss << L",\"height\":" << pb->GetInt(pw_height);
-        ss << L",\"displaySize\":" << pb->GetFloat(pw_display_size, t);
-        ss << L",\"opacity\":" << pb->GetFloat(pw_opacity, t);
-        ss << L",\"interactive\":" << (pb->GetInt(pw_interactive) ? L'1' : L'0');
-        ss << L",\"presentation\":" << pb->GetInt(pw_presentation);
-        ss << L",\"depthOcclude\":" << (pb->GetInt(pw_depth_occlude) ? L'1' : L'0');
-        ss << L",\"layerCount\":" << pb->GetInt(pw_layer_count);
-        ss << L",\"layerGap\":" << pb->GetFloat(pw_layer_gap, t);
-        static const ParamID valueIds[kWebAppParamChannels] = {
-            pw_param1, pw_param2, pw_param3, pw_param4,
-            pw_param5, pw_param6, pw_param7, pw_param8,
-            pw_param9, pw_param10, pw_param11, pw_param12,
-            pw_param13, pw_param14, pw_param15, pw_param16,
-            pw_param17, pw_param18, pw_param19, pw_param20,
-            pw_param21, pw_param22, pw_param23, pw_param24,
-            pw_param25, pw_param26, pw_param27, pw_param28,
-            pw_param29, pw_param30, pw_param31, pw_param32,
-        };
-        static const ParamID nameIds[kWebAppParamChannels] = {
-            pw_param1_name, pw_param2_name, pw_param3_name, pw_param4_name,
-            pw_param5_name, pw_param6_name, pw_param7_name, pw_param8_name,
-            pw_param9_name, pw_param10_name, pw_param11_name, pw_param12_name,
-            pw_param13_name, pw_param14_name, pw_param15_name, pw_param16_name,
-            pw_param17_name, pw_param18_name, pw_param19_name, pw_param20_name,
-            pw_param21_name, pw_param22_name, pw_param23_name, pw_param24_name,
-            pw_param25_name, pw_param26_name, pw_param27_name, pw_param28_name,
-            pw_param29_name, pw_param30_name, pw_param31_name, pw_param32_name,
-        };
-        for (int i = 0; i < kWebAppParamChannels; ++i) {
-            const MCHAR* name = pb->GetStr(nameIds[i]);
-            ss << L",\"" << EscapeJson(name ? name : L"") << L"\":" << pb->GetFloat(valueIds[i], t);
-        }
-        ss << L"}";
-        const std::wstring payload = ss.str();
-        return HashFNV1a(payload.data(), payload.size() * sizeof(wchar_t));
-    }
-
     // Material graph/physical edits use full sync. Preview-safe scalar edits
     // stay on delta_bin so interactive material work does not rebuild the scene.
     void DetectMaterialChanges() {
@@ -5725,51 +5592,6 @@
             if (WriteGLTFJson(gltfJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
                 if (!first) ss << L',';
                 ss << gltfJson.str();
-                first = false;
-            }
-        }
-        ss << L"]}";
-        webview_->PostWebMessageAsJson(ss.str().c_str());
-    }
-
-    void DetectWebAppChanges() {
-        Interface* ip = GetCOREInterface();
-        if (!ip || webappHandles_.empty()) return;
-
-        TimeValue t = ip->GetTime();
-        std::vector<INode*> dirty;
-        dirty.reserve(webappHandles_.size());
-
-        for (ULONG handle : webappHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            const uint64_t hash = ComputeWebAppStateHash(node, t);
-            auto it = webappHashMap_.find(handle);
-            if (it == webappHashMap_.end()) {
-                webappHashMap_[handle] = hash;
-                dirty.push_back(node);  // first observation — push so JS has initial state
-            } else if (it->second != hash) {
-                it->second = hash;
-                dirty.push_back(node);
-            }
-        }
-
-        if (dirty.empty() || !webview_) return;
-
-        // Param values ride a dedicated JSON message; the binary UpdateWebApp
-        // delta command only carries transform/visibility. Curve-animated
-        // params change every playback frame, but the payload is tiny.
-        std::wostringstream ss;
-        ss.imbue(std::locale::classic());
-        ss << L"{\"type\":\"webapp_update\",\"webapps\":[";
-        bool first = true;
-        for (INode* node : dirty) {
-            std::wostringstream webappJson;
-            webappJson.imbue(std::locale::classic());
-            if (WriteWebAppJson(webappJson, node, t, /*includeHandle*/ true, /*includeVisibility*/ true, /*trackHandle*/ false)) {
-                if (!first) ss << L',';
-                ss << webappJson.str();
                 first = false;
             }
         }
@@ -6760,123 +6582,6 @@
         return true;
     }
 
-    bool WriteWebAppJson(std::wostringstream& ss, INode* node, TimeValue t,
-                         bool includeHandle = false, bool includeVisibility = false,
-                         bool trackHandle = false) {
-        if (!node) return false;
-
-        ObjectState os = node->EvalWorldState(t);
-        if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) return false;
-
-        IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
-        if (!pb) return false;
-
-        const MCHAR* rawUrl = pb->GetStr(pw_url);
-        std::wstring url = rawUrl ? MapWebAppUrl(rawUrl) : std::wstring{};
-
-        const ULONG handle = node->GetHandle();
-        float xform[16];
-        GetTransform16(node, t, xform);
-        if (trackHandle) {
-            webappHandles_.insert(handle);
-            RememberSentTransform(handle, xform);
-        }
-
-        ss << L'{';
-        bool needsComma = false;
-        auto appendComma = [&]() {
-            if (needsComma) ss << L',';
-            needsComma = true;
-        };
-
-        if (includeHandle) {
-            appendComma();
-            ss << L"\"h\":" << handle;
-        }
-
-        appendComma();
-        ss << L"\"n\":\"" << EscapeJson(node->GetName()) << L'"';
-
-        if (includeVisibility) {
-            appendComma();
-            ss << L"\"v\":" << (IsMaxJsSyncDrawVisible(node) ? L'1' : L'0');
-        }
-
-        appendComma();
-        ss << L"\"t\":";
-        WriteFloats(ss, xform, 16);
-
-        appendComma();
-        ss << L"\"url\":\"" << EscapeJson(url.c_str()) << L"\"";
-
-        appendComma();
-        ss << L"\"width\":" << pb->GetInt(pw_width);
-
-        appendComma();
-        ss << L"\"height\":" << pb->GetInt(pw_height);
-
-        appendComma();
-        ss << L"\"displaySize\":";
-        WriteFloatValue(ss, pb->GetFloat(pw_display_size, t), 50.0f);
-
-        appendComma();
-        ss << L"\"opacity\":";
-        WriteFloatValue(ss, pb->GetFloat(pw_opacity, t), 1.0f);
-
-        appendComma();
-        ss << L"\"interactive\":" << (pb->GetInt(pw_interactive) ? L"true" : L"false");
-
-        appendComma();
-        ss << L"\"presentation\":\"" << (pb->GetInt(pw_presentation) == 1 ? L"texture" : L"css3d") << L"\"";
-
-        appendComma();
-        ss << L"\"depthOcclude\":" << (pb->GetInt(pw_depth_occlude) ? L"true" : L"false");
-
-        appendComma();
-        ss << L"\"layerCount\":" << pb->GetInt(pw_layer_count);
-
-        appendComma();
-        ss << L"\"layerGap\":";
-        WriteFloatValue(ss, pb->GetFloat(pw_layer_gap, t), 5.0f);
-
-        // Named animatable channels — evaluated at t, so Max curves drive them.
-        static const ParamID valueIds[kWebAppParamChannels] = {
-            pw_param1, pw_param2, pw_param3, pw_param4,
-            pw_param5, pw_param6, pw_param7, pw_param8,
-            pw_param9, pw_param10, pw_param11, pw_param12,
-            pw_param13, pw_param14, pw_param15, pw_param16,
-            pw_param17, pw_param18, pw_param19, pw_param20,
-            pw_param21, pw_param22, pw_param23, pw_param24,
-            pw_param25, pw_param26, pw_param27, pw_param28,
-            pw_param29, pw_param30, pw_param31, pw_param32,
-        };
-        static const ParamID nameIds[kWebAppParamChannels] = {
-            pw_param1_name, pw_param2_name, pw_param3_name, pw_param4_name,
-            pw_param5_name, pw_param6_name, pw_param7_name, pw_param8_name,
-            pw_param9_name, pw_param10_name, pw_param11_name, pw_param12_name,
-            pw_param13_name, pw_param14_name, pw_param15_name, pw_param16_name,
-            pw_param17_name, pw_param18_name, pw_param19_name, pw_param20_name,
-            pw_param21_name, pw_param22_name, pw_param23_name, pw_param24_name,
-            pw_param25_name, pw_param26_name, pw_param27_name, pw_param28_name,
-            pw_param29_name, pw_param30_name, pw_param31_name, pw_param32_name,
-        };
-        appendComma();
-        ss << L"\"params\":{";
-        bool firstParam = true;
-        for (int i = 0; i < kWebAppParamChannels; ++i) {
-            const MCHAR* name = pb->GetStr(nameIds[i]);
-            if (!name || !name[0]) continue;
-            if (!firstParam) ss << L',';
-            ss << L"\"" << EscapeJson(name) << L"\":";
-            WriteFloatValue(ss, pb->GetFloat(valueIds[i], t), 0.0f);
-            firstParam = false;
-        }
-        ss << L'}';
-
-        ss << L'}';
-        return true;
-    }
-
     void WriteLightsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
                          bool includeHandle = false, bool includeVisibility = false,
                          bool trackHandles = false) {
@@ -6973,37 +6678,6 @@
         ss << L']';
     }
 
-    void WriteWebAppsJson(std::wostringstream& ss, Interface* ip, TimeValue t,
-                          bool includeHandle = false, bool includeVisibility = false,
-                          bool trackHandles = false) {
-        ss << L"\"webapps\":[";
-        bool firstWebApp = true;
-        INode* root = ip ? ip->GetRootNode() : nullptr;
-        if (root) {
-            std::function<void(INode*)> collectWebApps = [&](INode* parent) {
-                for (int i = 0; i < parent->NumberOfChildren(); i++) {
-                    INode* node = parent->GetChildNode(i);
-                    if (!node) continue;
-                    if (node->IsNodeHidden(TRUE) && !includeVisibility) {
-                        collectWebApps(node);
-                        continue;
-                    }
-
-                    std::wostringstream webappJson;
-                    webappJson.imbue(std::locale::classic());
-                    if (WriteWebAppJson(webappJson, node, t, includeHandle, includeVisibility, trackHandles)) {
-                        if (!firstWebApp) ss << L',';
-                        ss << webappJson.str();
-                        firstWebApp = false;
-                    }
-
-                    collectWebApps(node);
-                }
-            };
-            collectWebApps(root);
-        }
-        ss << L']';
-    }
 
     std::uint32_t AllocateFrameId() {
         return nextFrameId_++;

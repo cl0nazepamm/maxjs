@@ -34,31 +34,6 @@
         return resolvedPath.empty() ? std::wstring{} : MapAssetPath(resolvedPath, false);
     }
 
-    std::wstring MapWebAppUrl(const std::wstring& rawUrl) {
-        if (rawUrl.empty()) return {};
-        // Web URLs pass through untouched; absolute disk paths map onto the
-        // same-origin asset host. Anything else (project-relative path) is
-        // resolved by the viewer against the active project root.
-        if (rawUrl.rfind(L"http://", 0) == 0 || rawUrl.rfind(L"https://", 0) == 0 ||
-            rawUrl.rfind(L"data:", 0) == 0) {
-            return rawUrl;
-        }
-        if (rawUrl.size() >= 3 && rawUrl[1] == L':') {
-            // Disk paths may carry viewer flags (e.g. ?maxjs-host=div) —
-            // strip the query for file mapping, re-append afterwards.
-            std::wstring path = rawUrl;
-            std::wstring query;
-            const size_t queryPos = rawUrl.find(L'?');
-            if (queryPos != std::wstring::npos) {
-                path = rawUrl.substr(0, queryPos);
-                query = rawUrl.substr(queryPos);
-            }
-            std::wstring mapped = MapAssetPath(path, false);
-            return mapped.empty() ? rawUrl : mapped + query;
-        }
-        return rawUrl;
-    }
-
     // ── Callbacks & sync ─────────────────────────────────────
 
     bool IsTrackedHandle(ULONG handle) const {
@@ -66,14 +41,13 @@
             || lightHandles_.find(handle) != lightHandles_.end()
             || audioHandles_.find(handle) != audioHandles_.end()
             || gltfHandles_.find(handle) != gltfHandles_.end()
-            || webappHandles_.find(handle) != webappHandles_.end()
             || hairHandles_.find(handle) != hairHandles_.end()
             || helperHandles_.find(handle) != helperHandles_.end();
     }
 
     bool HasTrackedNodes() const {
         return !geomHandles_.empty() || !lightHandles_.empty()
-            || !audioHandles_.empty() || !gltfHandles_.empty() || !webappHandles_.empty()
+            || !audioHandles_.empty() || !gltfHandles_.empty()
             || !hairHandles_.empty()
             || !helperHandles_.empty();
     }

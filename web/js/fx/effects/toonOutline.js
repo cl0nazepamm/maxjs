@@ -15,6 +15,7 @@ export default {
         thickness: 0.003,
         alpha: 1.0,
     },
+    topologyKeys: ['color', 'thickness', 'alpha'],
     build(ctx) {
         // Only takes over the scene pass when toon materials exist; the core
         // falls back to a plain pass(scene, camera) otherwise.

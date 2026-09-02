@@ -82,31 +82,33 @@ baseline before any continuation frame and requests resync on a sequence gap.
 variant), `gltf_update`, `hair_fast`, `host_action_result`,
 `inline_layers_state`, `live_sync_settings`, `pathtracing_settings`,
 `probeGrids`, `project_config`, `project_reload`,
-`render_css3d_mask_begin`, `render_css3d_mask_end`, `render_output_settings`,
+`render_output_settings`,
 `render_sequence_done`, `render_sequence_frame`, `render_to_image`,
-`render_to_image_done`, `scene`, `snapshot_export_request`, `webapp_update`,
+`render_to_image_done`, `scene`, `snapshot_export_request`,
 `xform`.
 
 A host only has to send what it supports — the viewer treats every type as
 optional.
 
 `project_config` configures the scene-local project runtime:
-`{dir, inlineDir, pollMs, sceneSaved, manifestExists, rootUrl?}`. `rootUrl`
+`{dir, inlineDir, scriptFolder, pollMs, sceneSaved, manifestExists, rootUrl?}`. `rootUrl`
 is optional: when present, the viewer fetches/imports project files
 (`project.maxjs.json`, `settings.maxjs.json`, `postfx.maxjs.json`,
-`inlines/*.js`) from that base URL (resolved against the page URL) instead of
+`scripts/*.js`) from that base URL (resolved against the page URL) instead of
 deriving `https://maxjs-assets.local/...` from `dir`. Hosts that serve the
 project directory over HTTP themselves (the Blender add-on) send it; the
 3ds Max WebView2 host omits it and keeps the virtual-host mapping.
-`inline_layers_state` is the host's full scan of `inlines/`:
-`{stamp, layers:[{key, id, name, folder, stamp, priority, enabled}]}`.
+`inline_layers_state` is the host's full scan of `scripts/`:
+`{folderName, stamp, layers:[{key, id, name, folder, stamp, priority, enabled}]}`.
+`scriptFolder: "inlines"` and `folderName: "inlines"` are accepted only for
+legacy project fallback.
 
 ## JSON control messages, viewer → host (`postMessage`)
 
 `ready`, `gi_probe_refresh`, `gpu_normals`, `kill`, `live_sync_settings`,
-`lock_camera`, `pathtracing_settings`, `refresh`, `render_css3d_mask_ready`,
+`lock_camera`, `pathtracing_settings`, `refresh`,
 `render_to_image_ready`, `relay_resync`, `scene_dirty`, `snapshot_export`, `snapshot_serve`,
-`sync_lightmap_uvs`, `webapp_set`.
+`sync_lightmap_uvs`.
 
 `relay_resync` asks the active DCC host for an authoritative full scene for a
 relay baseline. It may carry `{reason, sceneRequestId, streamId, producerId,

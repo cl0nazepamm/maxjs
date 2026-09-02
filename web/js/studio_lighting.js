@@ -2,14 +2,13 @@
 //
 // Live mode owns the editing UI in index.html. This module owns the portable
 // pieces needed by exported snapshots: MaxLightsNode renderer wiring, per-mesh
-// light masks, per-material environment intensity, reflection paint, and
-// camera-relative constraints.
+// light masks, per-material environment intensity, and camera-relative
+// constraints.
 
 import * as THREE from 'three';
 
 import {
     clearUnownedLightLinkMaterialObserver,
-    getReflectionPaintNode,
     installMaxLightsRenderer,
     setLightLinkMaterialObserver,
     setLightLinkMaskDefaults,
@@ -22,8 +21,6 @@ import {
     hasActiveLightLinksPayload,
 } from './light_linking_core.js';
 
-const constraintCameraQuat = new THREE.Quaternion();
-const constraintInverseQuat = new THREE.Quaternion();
 const constraintWorldPos = new THREE.Vector3();
 
 export function installStudioLightingRenderer(renderer, options = {}) {
@@ -32,9 +29,7 @@ export function installStudioLightingRenderer(renderer, options = {}) {
 
 export function studioStateNeedsMaxLightsNode(studioState) {
     if (!studioState || typeof studioState !== 'object') return false;
-    if (hasActiveLightLinksPayload(studioState.lightLinking)) return true;
-    return Array.isArray(studioState.reflectionPaint?.lights)
-        && studioState.reflectionPaint.lights.length > 0;
+    return hasActiveLightLinksPayload(studioState.lightLinking);
 }
 
 function vectorFromPlain(value) {
@@ -80,7 +75,6 @@ export function createStudioLightingController({
     const links = new Map();
     const envIntensityByName = new Map();
     const envBaseIntensityByMaterial = new WeakMap();
-    const reflectionPaintCameraDirections = new Map();
     const lightCameraConstraints = new Map();
     const materialObserverOwner = {};
     const observedMaterials = new Set();
@@ -88,7 +82,6 @@ export function createStudioLightingController({
 
     let hdriConstrainToCamera = false;
     let hdriBaseRotationY = 0;
-    let reflectionPaintConstrainToCamera = false;
 
     function forEachRenderableMesh(fn) {
         const seen = new WeakSet();
@@ -229,37 +222,6 @@ export function createStudioLightingController({
         return Math.atan2(camera.matrixWorld.elements[8], camera.matrixWorld.elements[10]);
     }
 
-    function getCameraWorldQuaternion(target = new THREE.Quaternion()) {
-        camera.updateMatrixWorld(true);
-        return camera.getWorldQuaternion(target);
-    }
-
-    function captureReflectionPaintCameraDirections(saved = null) {
-        reflectionPaintCameraDirections.clear();
-        const savedById = new Map();
-        for (const item of (Array.isArray(saved) ? saved : [])) {
-            const id = Number(item?.id);
-            const direction = vectorFromPlain(item?.cameraDirection ?? item?.direction);
-            if (Number.isFinite(id) && direction) savedById.set(id, direction.normalize());
-        }
-        getCameraWorldQuaternion(constraintCameraQuat);
-        constraintInverseQuat.copy(constraintCameraQuat).invert();
-        for (const l of getReflectionPaintNode().getLights()) {
-            const id = Number(l.id);
-            const savedDir = savedById.get(id);
-            if (savedDir) {
-                reflectionPaintCameraDirections.set(id, savedDir);
-                continue;
-            }
-            const worldDir = vectorFromPlain(l.direction);
-            if (!worldDir) continue;
-            reflectionPaintCameraDirections.set(
-                id,
-                worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize(),
-            );
-        }
-    }
-
     function toCameraLocalOffset(worldPosition) {
         camera.updateMatrixWorld(true);
         return camera.worldToLocal(worldPosition.clone());
@@ -291,38 +253,11 @@ export function createStudioLightingController({
         return { posOffset, targetOffset };
     }
 
-    function applyReflectionPaintState(payload) {
-        const paint = getReflectionPaintNode();
-        const wasActive = paint.active;
-        paint.clearLights();
-        paint.setGlobalIntensity(Number.isFinite(Number(payload?.intensity)) ? Number(payload.intensity) : 1.0);
-        for (const item of (Array.isArray(payload?.lights) ? payload.lights : [])) {
-            paint.addLight({
-                id: item.id,
-                direction: vectorFromPlain(item.direction),
-                lat: item.lat,
-                lon: item.lon,
-                color: item.color,
-                colorOuter: item.colorOuter,
-                intensity: item.intensity,
-                radiusX: item.radiusX,
-                radiusY: item.radiusY,
-                edge: item.edge,
-                rotation: item.rotation,
-                shape: item.shape,
-            });
-        }
-        if (wasActive !== paint.active) onSceneChanged?.();
-        onOutputChanged?.();
-    }
-
     function applyLightLinkingPayload(data = {}, options = {}) {
         links.clear();
         clearEnvIntensityOverrides();
         lightCameraConstraints.clear();
-        reflectionPaintCameraDirections.clear();
         hdriConstrainToCamera = false;
-        reflectionPaintConstrainToCamera = false;
 
         if (!data || typeof data !== 'object') {
             reapply();
@@ -346,11 +281,6 @@ export function createStudioLightingController({
             hdriBaseRotationY = (scene.environmentRotation?.y ?? 0) + getCameraYaw();
         }
 
-        reflectionPaintConstrainToCamera = !!rawConstrain.reflectionPaint;
-        if (reflectionPaintConstrainToCamera) {
-            captureReflectionPaintCameraDirections(rawConstrain.reflectionPaintDirections);
-        }
-
         const lightConstraints = Array.isArray(rawConstrain.lightOffsets)
             ? rawConstrain.lightOffsets
             : (rawConstrain.lights || []).map(name => ({ name }));
@@ -362,19 +292,13 @@ export function createStudioLightingController({
             if (constraint) lightCameraConstraints.set(handleToken(lh), constraint);
         }
 
-        if (options.applyReflectionPaintIntensity !== false && Number.isFinite(Number(data.reflectionPaintIntensity))) {
-            getReflectionPaintNode().setGlobalIntensity(Number(data.reflectionPaintIntensity));
-        }
         reapply();
         onOutputChanged?.();
     }
 
     function applyState(studioState = {}) {
         if (!studioState || typeof studioState !== 'object') return;
-        applyReflectionPaintState(studioState.reflectionPaint ?? { lights: [], intensity: 1.0 });
-        applyLightLinkingPayload(studioState.lightLinking ?? {}, {
-            applyReflectionPaintIntensity: studioState.reflectionPaint == null,
-        });
+        applyLightLinkingPayload(studioState.lightLinking ?? {});
         updateCameraConstraints();
     }
 
@@ -384,31 +308,6 @@ export function createStudioLightingController({
             const y = hdriBaseRotationY - camYaw;
             if (scene.environmentRotation) scene.environmentRotation.y = y;
             if (scene.backgroundRotation) scene.backgroundRotation.y = y;
-        }
-
-        if (reflectionPaintConstrainToCamera) {
-            getCameraWorldQuaternion(constraintCameraQuat);
-            const paint = getReflectionPaintNode();
-            const liveIds = new Set();
-            for (const l of paint.getLights()) {
-                const id = Number(l.id);
-                liveIds.add(id);
-                let localDir = reflectionPaintCameraDirections.get(id);
-                if (!localDir) {
-                    const worldDir = vectorFromPlain(l.direction);
-                    if (!worldDir) continue;
-                    constraintInverseQuat.copy(constraintCameraQuat).invert();
-                    localDir = worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize();
-                    reflectionPaintCameraDirections.set(id, localDir);
-                }
-                paint.updateLight(id, {
-                    direction: localDir.clone().applyQuaternion(constraintCameraQuat).normalize(),
-                });
-            }
-            for (const id of reflectionPaintCameraDirections.keys()) {
-                if (!liveIds.has(id)) reflectionPaintCameraDirections.delete(id);
-            }
-            onOutputChanged?.();
         }
 
         if (lightCameraConstraints.size === 0) return;
@@ -452,20 +351,14 @@ export function createStudioLightingController({
     function dispose() {
         links.clear();
         clearEnvIntensityOverrides();
-        reflectionPaintCameraDirections.clear();
         lightCameraConstraints.clear();
         hdriConstrainToCamera = false;
-        reflectionPaintConstrainToCamera = false;
-        const paint = getReflectionPaintNode();
-        paint.clearLights();
-        paint.setGlobalIntensity(1.0);
         reapply();
     }
 
     return {
         applyState,
         applyLightLinkingPayload,
-        applyReflectionPaintState,
         reapply,
         refreshSceneBindings: () => {
             reapply();
@@ -474,7 +367,5 @@ export function createStudioLightingController({
         updateCameraConstraints,
         setEnvIntensity,
         dispose,
-        hasReflectionPaint: () => getReflectionPaintNode().active,
-        getReflectionPaintNode,
     };
 }

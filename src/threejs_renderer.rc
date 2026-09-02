@@ -1,20 +1,19 @@
 #include "threejs_renderer_res.h"
 #include <windows.h>
 
-IDD_THREEJS_RENDERER_PT DIALOGEX 0, 0, 260, 128
+IDD_THREEJS_RENDERER_PT DIALOGEX 0, 0, 260, 114
 STYLE DS_SETFONT | WS_CHILD | WS_CLIPSIBLINGS
 FONT 8, "MS Shell Dlg"
 BEGIN
-    GROUPBOX        "Render Output", -1, 6, 6, 248, 44
+    GROUPBOX        "Render Output", -1, 6, 6, 248, 30
     CONTROL         "Use Max.js Orchestrator", IDC_RENDERER_USE_ORCHESTRATOR, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 20, 160, 10
-    CONTROL         "Write CSS3D mask alongside render", IDC_RENDERER_WRITE_CSS3D_MASK, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 34, 220, 10
-    GROUPBOX        "Pathtracing", -1, 6, 54, 248, 66
-    LTEXT           "Samples / frame", -1, 16, 72, 68, 8
-    CONTROL         "", IDC_RENDERER_PT_SPF_EDIT, "CustEdit", WS_TABSTOP, 96, 69, 34, 10
-    CONTROL         "", IDC_RENDERER_PT_SPF_SPIN, "SpinnerControl", 0, 132, 69, 11, 10
-    LTEXT           "GI clamp", -1, 16, 88, 68, 8
-    CONTROL         "", IDC_RENDERER_PT_GI_CLAMP_EDIT, "CustEdit", WS_TABSTOP, 96, 85, 34, 10
-    CONTROL         "", IDC_RENDERER_PT_GI_CLAMP_SPIN, "SpinnerControl", 0, 132, 85, 11, 10
-    CONTROL         "Freeze scene sync while pathtracing", IDC_RENDERER_PT_FREEZE_SYNC, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 106, 160, 10
-    LTEXT           "Changes push to the max.js viewer immediately. Use PT render mode in the viewer.", -1, 16, 120, 220, 8
+    GROUPBOX        "Pathtracing", -1, 6, 40, 248, 66
+    LTEXT           "Samples / frame", -1, 16, 58, 68, 8
+    CONTROL         "", IDC_RENDERER_PT_SPF_EDIT, "CustEdit", WS_TABSTOP, 96, 55, 34, 10
+    CONTROL         "", IDC_RENDERER_PT_SPF_SPIN, "SpinnerControl", 0, 132, 55, 11, 10
+    LTEXT           "GI clamp", -1, 16, 74, 68, 8
+    CONTROL         "", IDC_RENDERER_PT_GI_CLAMP_EDIT, "CustEdit", WS_TABSTOP, 96, 71, 34, 10
+    CONTROL         "", IDC_RENDERER_PT_GI_CLAMP_SPIN, "SpinnerControl", 0, 132, 71, 11, 10
+    CONTROL         "Freeze scene sync while pathtracing", IDC_RENDERER_PT_FREEZE_SYNC, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 92, 160, 10
+    LTEXT           "Changes push to the max.js viewer immediately. Use PT render mode in the viewer.", -1, 16, 106, 220, 8
 END

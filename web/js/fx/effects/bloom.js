@@ -30,7 +30,16 @@ export default {
         // was OVERRIDING BloomNode's half-res default up to full resolution.
         ctx.applyNodeResolutionScale(bloomPass, state.bloom.resolutionScale ?? 0.5);
         ctx.pushNode(bloomPass);
+        ctx.setActivePass('bloom', bloomPass);
         const bloomLuma = bloomPass.r.mul(0.2126).add(bloomPass.g.mul(0.7152)).add(bloomPass.b.mul(0.0722));
         return vec4(ctx.beauty.rgb.add(bloomPass.rgb), ctx.raiseBeautyAlpha(bloomLuma));
+    },
+    update(ctx) {
+        const bloomPass = ctx.getActivePass('bloom');
+        if (!bloomPass) return;
+        bloomPass.strength.value = ctx.state.bloom.strength;
+        bloomPass.radius.value = ctx.state.bloom.radius;
+        bloomPass.threshold.value = ctx.state.bloom.threshold;
+        ctx.applyNodeResolutionScale(bloomPass, ctx.state.bloom.resolutionScale ?? 0.5);
     },
 };

@@ -216,6 +216,9 @@ export function createScene({ renderer, canvas } = {}) {
     const controls = new OrbitControls(camera, canvas ?? renderer.domElement);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
+    // Snapshot navigation matches the live viewer: interactive orbit/pan is
+    // available, but the wheel never dollies the camera.
+    controls.enableZoom = false;
     controls.zoomToCursor = true;
     controls.screenSpacePanning = false;
     controls.mouseButtons = {

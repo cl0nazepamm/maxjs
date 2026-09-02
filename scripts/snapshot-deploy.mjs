@@ -52,7 +52,8 @@ const KEEP_PATHS_DOC = [
     // Kept when iterating an export made before the M3 filename migration.
     'scene.bin',
     'scene_anim.bin',
-    'inlines',             // scene-local layer modules — Phase 9 imports these live
+    'scripts',             // scene-local runtime modules
+    'inlines',             // legacy runtime-module fallback
     'project.maxjs.json',
     'postfx.maxjs.json',
     'assets',              // copied texture / audio assets

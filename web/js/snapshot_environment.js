@@ -1,7 +1,7 @@
 // snapshot_environment.js - standalone snapshot HDRI / authored sky apply.
 //
 // This owns only data that comes from snapshot.json env. Scene-local sky
-// scripts still belong to the layer/inlines path and are not synthesized here.
+// authored runtime scripts still belong to the layer path and are not synthesized here.
 
 import * as THREE from 'three';
 import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
@@ -77,9 +77,12 @@ function loadTexture(loader, url) {
 }
 
 function createPMREMGenerator(renderer) {
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    pmrem.compileEquirectangularShader?.();
-    return pmrem;
+    // Do not eagerly compile here. Embedders such as R3F can construct the
+    // environment controller while their canvas still has the browser's
+    // default 300x150 drawing buffer. WebGPU then retains that depth attachment
+    // after the host resizes, making later render passes invalid. The first
+    // fromEquirectangular() call compiles at the renderer's current size.
+    return new THREE.PMREMGenerator(renderer);
 }
 
 function retainPMREMTexture(renderTarget) {
@@ -180,7 +183,10 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
     hdrLoader.setCrossOrigin?.('anonymous');
     exrLoader.setCrossOrigin?.('anonymous');
 
-    const pmremGenerator = createPMREMGenerator(renderer);
+    // WebGPU node materials prefilter equirectangular environments lazily via
+    // PMREMNode during their normal render pass. Running PMREMGenerator here
+    // would mutate a shared R3F renderer before its canvas resize is complete.
+    const pmremGenerator = renderer.isWebGPURenderer ? null : createPMREMGenerator(renderer);
     let fallbackBackground = cloneBackground(scene.background);
     let skyController = null;
     let envMap = null;
@@ -289,9 +295,13 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
         texture.colorSpace = colorSpaceForEnvironmentTexture(ext);
         texture.mapping = THREE.EquirectangularReflectionMapping;
 
-        const target = pmremGenerator.fromEquirectangular(texture);
-        envMap = retainPMREMTexture(target);
-        texture.dispose?.();
+        if (renderer.isWebGPURenderer) {
+            envMap = texture;
+        } else {
+            const target = pmremGenerator.fromEquirectangular(texture);
+            envMap = retainPMREMTexture(target);
+            texture.dispose?.();
+        }
 
         if (!envMap) throw new Error(`PMREM failed for ${url}`);
         return applyHdriState({ ...params, source: url });
@@ -424,7 +434,7 @@ export function createSnapshotEnvironment({ scene, renderer, rootUrl = '.' } = {
     function dispose() {
         disposeSky();
         disposeEnvMap();
-        try { pmremGenerator.dispose?.(); } catch {}
+        try { pmremGenerator?.dispose?.(); } catch {}
     }
 
     return {

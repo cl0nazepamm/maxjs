@@ -235,6 +235,26 @@ export function createPowerShotFinal({
     let powerShotFrame = 0;
     const drawBufferSize = new THREE.Vector2();
 
+    function disposePipelines() {
+        try { powerShotInputTarget?.dispose?.(); } catch (_) {}
+        powerShotInputTarget = null;
+        try { powerShotPipeline?.dispose?.(); } catch (_) {}
+        powerShotPipeline = null;
+        try { filmPipeline?.dispose?.(); } catch (_) {}
+        filmPipeline = null;
+        try { infraredPipeline?.dispose?.(); } catch (_) {}
+        infraredPipeline = null;
+        infraredProfileKey = null;
+        try { nightshotPipeline?.dispose?.(); } catch (_) {}
+        nightshotPipeline = null;
+        try { flareTarget?.dispose?.(); } catch (_) {}
+        flareTarget = null;
+        try { flarePipeline?.dispose?.(); } catch (_) {}
+        flarePipeline = null;
+        flareProfilePromise = null;
+        flareFailed = false;
+    }
+
     function readRendererDrawBufferSize() {
         if (typeof renderer.getDrawingBufferSize === 'function') {
             return renderer.getDrawingBufferSize(drawBufferSize);
@@ -725,23 +745,8 @@ export function createPowerShotFinal({
         renderFinal,
         hasPipeline: () => !!powerShotPipeline || !!filmPipeline || !!infraredPipeline || !!nightshotPipeline,
         dispose() {
-            try { powerShotInputTarget?.dispose?.(); } catch (_) {}
-            powerShotInputTarget = null;
-            try { powerShotPipeline?.dispose?.(); } catch (_) {}
-            powerShotPipeline = null;
-            try { filmPipeline?.dispose?.(); } catch (_) {}
-            filmPipeline = null;
-            try { infraredPipeline?.dispose?.(); } catch (_) {}
-            infraredPipeline = null;
-            infraredProfileKey = null;
-            try { nightshotPipeline?.dispose?.(); } catch (_) {}
-            nightshotPipeline = null;
-            try { flareTarget?.dispose?.(); } catch (_) {}
-            flareTarget = null;
-            try { flarePipeline?.dispose?.(); } catch (_) {}
-            flarePipeline = null;
-            flareProfilePromise = null;
-            flareFailed = false;
+            disposePipelines();
+            powerShotFrame = 0;
         },
     };
 }

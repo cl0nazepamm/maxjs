@@ -18,13 +18,20 @@ export default {
         const { state } = ctx;
         const motionBlurInput = convertToTexture(ctx.beauty);
         ctx.pushNode(motionBlurInput);
+        const amount = uniform(state.motionBlur.amount);
         const motionBlurPass = motionBlur(
             motionBlurInput,
-            ctx.prePass.velocity.mul(uniform(state.motionBlur.amount)),
+            ctx.prePass.velocity.mul(amount),
             int(Math.max(2, Math.round(state.motionBlur.samples)))
         );
         ctx.applyNodeResolutionScale(motionBlurPass);
         ctx.pushNode(motionBlurPass);
+        ctx.setActivePass('motionBlurAmount', amount);
         return vec4(motionBlurPass.rgb, ctx.beautyAlpha);
+    },
+    topologyKeys: ['samples'],
+    update(ctx) {
+        const amount = ctx.getActivePass('motionBlurAmount');
+        if (amount) amount.value = ctx.state.motionBlur.amount;
     },
 };

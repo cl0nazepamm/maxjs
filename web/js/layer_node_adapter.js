@@ -3,6 +3,7 @@
 import { freezePlainObject } from './layer_utils.js';
 
 const surfaceTopologyCache = new WeakMap();
+const surfaceWorldAreaCache = new WeakMap();
 
 // Read-only material summary for layer code. Only assigned texture slots are
 // reported; mutation stays with setMap / overrides / deform decorators.
@@ -64,15 +65,30 @@ function getSurfaceTopologyCache(geometry, THREE) {
     if (!position || position.itemSize < 3 || position.count < 3) return null;
 
     const index = geometry.index ?? null;
-    const topologyKey = `${index?.count ?? 0}:${position.count}`;
+    const groupSignature = (geometry.groups ?? [])
+        .map(group => `${group.start}:${group.count}:${group.materialIndex ?? 0}`)
+        .join('|');
+    const topologyKey = [
+        index?.count ?? 0,
+        index?.version ?? 0,
+        position.count,
+        position.version ?? 0,
+        groupSignature,
+    ].join(':');
     const cached = surfaceTopologyCache.get(geometry);
-    if (cached?.topologyKey === topologyKey) return cached;
+    if (
+        cached?.topologyKey === topologyKey
+        && cached.position === position
+        && cached.index === index
+    ) return cached;
 
     const triangleCount = index ? Math.floor(index.count / 3) : Math.floor(position.count / 3);
     if (triangleCount <= 0) return null;
 
     const triangleIndices = new Uint32Array(triangleCount * 3);
-    const cumulativeAreas = new Float32Array(triangleCount);
+    const materialIndices = new Int32Array(triangleCount);
+    const triangleAreas = new Float64Array(triangleCount);
+    const cumulativeAreas = new Float64Array(triangleCount);
     const vA = new THREE.Vector3();
     const vB = new THREE.Vector3();
     const vC = new THREE.Vector3();
@@ -99,20 +115,203 @@ function getSurfaceTopologyCache(geometry, THREE) {
         edgeAB.subVectors(vB, vA);
         edgeAC.subVectors(vC, vA);
         cross.crossVectors(edgeAB, edgeAC);
-        totalArea += cross.length() * 0.5;
+        const area = cross.length() * 0.5;
+        triangleAreas[triangleIndex] = area;
+        totalArea += area;
         cumulativeAreas[triangleIndex] = totalArea;
+    }
+
+    for (const group of geometry.groups ?? []) {
+        const startTriangle = Math.max(0, Math.floor(Number(group.start) / 3));
+        const endTriangle = Math.min(
+            triangleCount,
+            Math.ceil((Number(group.start) + Number(group.count)) / 3),
+        );
+        for (let triangleIndex = startTriangle; triangleIndex < endTriangle; triangleIndex += 1) {
+            materialIndices[triangleIndex] = Number(group.materialIndex) || 0;
+        }
     }
 
     if (totalArea <= 0) {
         for (let triangleIndex = 0; triangleIndex < triangleCount; triangleIndex++) {
+            triangleAreas[triangleIndex] = 1;
             cumulativeAreas[triangleIndex] = triangleIndex + 1;
         }
         totalArea = triangleCount;
     }
 
-    const nextCache = { topologyKey, triangleCount, triangleIndices, cumulativeAreas, totalArea };
+    const nextCache = {
+        topologyKey,
+        position,
+        index,
+        triangleCount,
+        triangleIndices,
+        materialIndices,
+        triangleAreas,
+        cumulativeAreas,
+        totalArea,
+    };
     surfaceTopologyCache.set(geometry, nextCache);
     return nextCache;
+}
+
+function getWorldAreaCache(mesh, topology, THREE) {
+    if (!mesh?.isObject3D || mesh.isSkinnedMesh) return topology;
+    mesh.updateWorldMatrix?.(true, false);
+    const matrixKey = mesh.matrixWorld.elements.join(',');
+    const cached = surfaceWorldAreaCache.get(mesh);
+    if (
+        cached?.geometry === mesh.geometry
+        && cached.topology === topology
+        && cached.matrixKey === matrixKey
+    ) return cached;
+
+    const position = mesh.geometry?.getAttribute?.('position') ?? mesh.geometry?.attributes?.position;
+    if (!position) return topology;
+    const triangleAreas = new Float64Array(topology.triangleCount);
+    const cumulativeAreas = new Float64Array(topology.triangleCount);
+    const vA = new THREE.Vector3();
+    const vB = new THREE.Vector3();
+    const vC = new THREE.Vector3();
+    const edgeAB = new THREE.Vector3();
+    const edgeAC = new THREE.Vector3();
+    const cross = new THREE.Vector3();
+    let totalArea = 0;
+
+    for (let triangleIndex = 0; triangleIndex < topology.triangleCount; triangleIndex += 1) {
+        const base = triangleIndex * 3;
+        vA.fromBufferAttribute(position, topology.triangleIndices[base]).applyMatrix4(mesh.matrixWorld);
+        vB.fromBufferAttribute(position, topology.triangleIndices[base + 1]).applyMatrix4(mesh.matrixWorld);
+        vC.fromBufferAttribute(position, topology.triangleIndices[base + 2]).applyMatrix4(mesh.matrixWorld);
+        edgeAB.subVectors(vB, vA);
+        edgeAC.subVectors(vC, vA);
+        cross.crossVectors(edgeAB, edgeAC);
+        const area = cross.length() * 0.5;
+        triangleAreas[triangleIndex] = area;
+        totalArea += area;
+        cumulativeAreas[triangleIndex] = totalArea;
+    }
+
+    if (totalArea <= 0) {
+        for (let triangleIndex = 0; triangleIndex < topology.triangleCount; triangleIndex += 1) {
+            triangleAreas[triangleIndex] = 1;
+            cumulativeAreas[triangleIndex] = triangleIndex + 1;
+        }
+        totalArea = topology.triangleCount;
+    }
+
+    const next = {
+        geometry: mesh.geometry,
+        topology,
+        topologyKey: topology.topologyKey,
+        matrixKey,
+        triangleAreas,
+        cumulativeAreas,
+        totalArea,
+    };
+    surfaceWorldAreaCache.set(mesh, next);
+    return next;
+}
+
+function hashSurfaceSeed(seed) {
+    const value = typeof seed === 'string' ? seed : String(seed);
+    let hash = 2166136261;
+    for (let i = 0; i < value.length; i += 1) {
+        hash ^= value.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return hash >>> 0;
+}
+
+function createSurfaceRng(seed) {
+    let state = hashSurfaceSeed(seed);
+    return () => {
+        state = (state + 0x6D2B79F5) >>> 0;
+        let value = state;
+        value = Math.imul(value ^ (value >>> 15), value | 1);
+        value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+        return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+function resolveSurfaceRng(options) {
+    if (typeof options.rng === 'function') return options.rng;
+    if (options.seed !== undefined) return createSurfaceRng(options.seed);
+    return Math.random;
+}
+
+function testSurfaceRegExp(regexp, value) {
+    regexp.lastIndex = 0;
+    return regexp.test(value);
+}
+
+function materialSpecMatches(spec, material, mesh, materialIndex) {
+    if (spec == null) return true;
+    if (Array.isArray(spec)) return spec.some(item => materialSpecMatches(item, material, mesh, materialIndex));
+    if (spec?.isMaterial) return spec === material;
+    if (typeof spec === 'number') return materialIndex === spec;
+    if (typeof spec === 'function') {
+        try { return spec(material, { mesh, materialIndex }) === true; }
+        catch { return false; }
+    }
+    const names = [material?.name, material?.userData?.maxjsSourceMaterialName]
+        .filter((name, index, all) => typeof name === 'string' && name && all.indexOf(name) === index);
+    if (spec instanceof RegExp) return names.some(name => testSurfaceRegExp(spec, name));
+    if (typeof spec === 'string') {
+        const requested = spec.toLowerCase();
+        if (requested.endsWith('*')) {
+            const prefix = requested.slice(0, -1);
+            return names.some(name => name.toLowerCase().startsWith(prefix));
+        }
+        return names.some(name => name.toLowerCase() === requested);
+    }
+    return false;
+}
+
+function materialAt(mesh, materialIndex) {
+    if (Array.isArray(mesh?.material)) return mesh.material[materialIndex] ?? null;
+    return materialIndex === 0 ? (mesh?.material ?? null) : null;
+}
+
+function materialIndexMatches(requested, materialIndex) {
+    if (requested == null) return true;
+    if (Array.isArray(requested)) return requested.some(value => Number(value) === materialIndex);
+    return Number(requested) === materialIndex;
+}
+
+function getSurfaceDistribution(mesh, topology, options, THREE) {
+    const areaSource = String(options.areaSpace ?? 'local').toLowerCase() === 'world'
+        ? getWorldAreaCache(mesh, topology, THREE)
+        : topology;
+    const materialSpec = options.materials ?? options.material;
+    const requestedMaterialIndex = options.materialIndex ?? options.materialIndices;
+    if (materialSpec == null && requestedMaterialIndex == null) {
+        return {
+            cumulativeAreas: areaSource.cumulativeAreas,
+            totalArea: areaSource.totalArea,
+            eligibleTriangles: null,
+        };
+    }
+
+    const eligible = [];
+    const cumulative = [];
+    let totalArea = 0;
+    for (let triangleIndex = 0; triangleIndex < topology.triangleCount; triangleIndex += 1) {
+        const materialIndex = topology.materialIndices[triangleIndex] ?? 0;
+        const material = materialAt(mesh, materialIndex);
+        if (!materialIndexMatches(requestedMaterialIndex, materialIndex)) continue;
+        if (!materialSpecMatches(materialSpec, material, mesh, materialIndex)) continue;
+        const area = areaSource.triangleAreas[triangleIndex] ?? 0;
+        if (!(area > 0)) continue;
+        eligible.push(triangleIndex);
+        totalArea += area;
+        cumulative.push(totalArea);
+    }
+    return {
+        cumulativeAreas: Float64Array.from(cumulative),
+        totalArea,
+        eligibleTriangles: Uint32Array.from(eligible),
+    };
 }
 
 function pickWeightedIndex(cumulativeAreas, totalArea, rng) {
@@ -122,7 +321,7 @@ function pickWeightedIndex(cumulativeAreas, totalArea, rng) {
     let hi = cumulativeAreas.length - 1;
     while (lo < hi) {
         const mid = (lo + hi) >> 1;
-        if (cumulativeAreas[mid] < target) lo = mid + 1;
+        if (cumulativeAreas[mid] <= target) lo = mid + 1;
         else hi = mid;
     }
     return lo;
@@ -495,6 +694,12 @@ function createMaxNodeAdapter({
         vA: new THREE.Vector3(),
         vB: new THREE.Vector3(),
         vC: new THREE.Vector3(),
+        nA: new THREE.Vector3(),
+        nB: new THREE.Vector3(),
+        nC: new THREE.Vector3(),
+        uvA: new THREE.Vector2(),
+        uvB: new THREE.Vector2(),
+        uvC: new THREE.Vector2(),
         edgeAB: new THREE.Vector3(),
         edgeAC: new THREE.Vector3(),
         localPoint: new THREE.Vector3(),
@@ -630,16 +835,35 @@ function createMaxNodeAdapter({
             if (!topology) return;
             meshes.push({ mesh: obj, topology });
         });
+        meshes.sort((a, b) => {
+            const aHandle = Number(a.mesh.userData?.maxjsHandle);
+            const bHandle = Number(b.mesh.userData?.maxjsHandle);
+            if (Number.isFinite(aHandle) && Number.isFinite(bHandle) && aHandle !== bHandle) return aHandle - bHandle;
+            if (Number.isFinite(aHandle) !== Number.isFinite(bHandle)) return Number.isFinite(aHandle) ? -1 : 1;
+            return String(a.mesh.name ?? '').localeCompare(String(b.mesh.name ?? ''))
+                || String(a.mesh.uuid ?? '').localeCompare(String(b.mesh.uuid ?? ''));
+        });
         return meshes;
     }
 
-    function sampleMeshSurface(mesh, topology, options = {}) {
-        const rng = typeof options.rng === 'function' ? options.rng : Math.random;
+    function sampleMeshSurface(mesh, topology, options = {}, distribution = null) {
+        const rng = resolveSurfaceRng(options);
         const point = options.point ?? new THREE.Vector3();
         const normal = options.normal ?? new THREE.Vector3();
         const barycentric = options.barycentric ?? new THREE.Vector3();
+        const uvAttribute = mesh.geometry?.getAttribute?.('uv') ?? mesh.geometry?.attributes?.uv ?? null;
+        const uv = uvAttribute ? (options.uv ?? new THREE.Vector2()) : null;
+        const surfaceDistribution = distribution ?? getSurfaceDistribution(mesh, topology, options, THREE);
+        if (!(surfaceDistribution.totalArea > 0) || surfaceDistribution.cumulativeAreas.length === 0) return null;
 
-        const triangleIndex = pickWeightedIndex(topology.cumulativeAreas, topology.totalArea, rng);
+        const weightedIndex = pickWeightedIndex(
+            surfaceDistribution.cumulativeAreas,
+            surfaceDistribution.totalArea,
+            rng,
+        );
+        const triangleIndex = surfaceDistribution.eligibleTriangles
+            ? surfaceDistribution.eligibleTriangles[weightedIndex]
+            : weightedIndex;
         const base = triangleIndex * 3;
         const iA = topology.triangleIndices[base];
         const iB = topology.triangleIndices[base + 1];
@@ -669,6 +893,30 @@ function createMaxNodeAdapter({
         if (scratch.localNormal.lengthSq() > 0) scratch.localNormal.normalize();
         else scratch.localNormal.set(0, 1, 0);
 
+        const requestedNormalMode = String(options.normalMode ?? 'face').toLowerCase();
+        const normalAttribute = mesh.geometry?.getAttribute?.('normal') ?? mesh.geometry?.attributes?.normal ?? null;
+        const smoothNormal = requestedNormalMode === 'smooth' && normalAttribute && !mesh.isSkinnedMesh;
+        if (smoothNormal) {
+            scratch.nA.fromBufferAttribute(normalAttribute, iA);
+            scratch.nB.fromBufferAttribute(normalAttribute, iB);
+            scratch.nC.fromBufferAttribute(normalAttribute, iC);
+            scratch.localNormal
+                .copy(scratch.nA).multiplyScalar(w)
+                .addScaledVector(scratch.nB, u)
+                .addScaledVector(scratch.nC, v);
+            if (scratch.localNormal.lengthSq() > 0) scratch.localNormal.normalize();
+            else scratch.localNormal.crossVectors(scratch.edgeAB, scratch.edgeAC).normalize();
+        }
+
+        if (uv) {
+            scratch.uvA.fromBufferAttribute(uvAttribute, iA);
+            scratch.uvB.fromBufferAttribute(uvAttribute, iB);
+            scratch.uvC.fromBufferAttribute(uvAttribute, iC);
+            uv.copy(scratch.uvA).multiplyScalar(w)
+                .addScaledVector(scratch.uvB, u)
+                .addScaledVector(scratch.uvC, v);
+        }
+
         if (options.local === true) {
             point.copy(scratch.localPoint);
             normal.copy(scratch.localNormal);
@@ -678,16 +926,59 @@ function createMaxNodeAdapter({
             normal.copy(scratch.localNormal).applyMatrix3(scratch.normalMatrix).normalize();
         }
 
+        const materialIndex = topology.materialIndices[triangleIndex] ?? 0;
+        const material = materialAt(mesh, materialIndex);
         return {
             point,
             normal,
             barycentric,
+            uv,
             triangleIndex,
+            material,
+            materialIndex,
+            materialName: material?.name ?? '',
+            normalMode: smoothNormal ? 'smooth' : 'face',
             object: mesh,
             mesh,
             meshHandle: mesh.userData?.maxjsHandle ?? handle,
             meshName: mesh.name ?? '',
         };
+    }
+
+    function prepareSurfaceSampling(obj, options) {
+        const meshes = obj.isMesh
+            ? (() => {
+                const topology = getSurfaceTopologyCache(obj.geometry, THREE);
+                return topology ? [{ mesh: obj, topology }] : [];
+            })()
+            : collectSampleableMeshes(obj, options.includeInvisible === true);
+        return meshes.map(entry => ({
+            ...entry,
+            distribution: getSurfaceDistribution(entry.mesh, entry.topology, options, THREE),
+        })).filter(entry => entry.distribution.totalArea > 0);
+    }
+
+    function samplePreparedSurface(entries, options) {
+        if (entries.length === 0) return null;
+        if (entries.length === 1) {
+            const { mesh, topology, distribution } = entries[0];
+            return sampleMeshSurface(mesh, topology, options, distribution);
+        }
+
+        let totalArea = 0;
+        for (const entry of entries) totalArea += entry.distribution.totalArea;
+        if (!(totalArea > 0)) return null;
+        const rng = options.rng;
+        const target = Math.min(Math.max(rng(), 0), 0.9999999999999999) * totalArea;
+        let running = 0;
+        for (const entry of entries) {
+            running += entry.distribution.totalArea;
+            if (target < running) {
+                return sampleMeshSurface(entry.mesh, entry.topology, options, entry.distribution);
+            }
+        }
+        const last = entries[entries.length - 1];
+        return sampleMeshSurface(last.mesh, last.topology, options, last.distribution);
     }
 
     return freezePlainObject({
@@ -967,48 +1258,38 @@ function createMaxNodeAdapter({
             return createAnchor(handle, options);
         },
         sampleSurface: function sampleSurface(options = {}) {
-            const count = Math.max(0, Math.floor(Number(options.count) || 0));
-            if (count > 1) {
-                const out = [];
-                const nextOptions = { ...options };
-                delete nextOptions.count;
-                for (let i = 0; i < count; i += 1) {
-                    const hit = sampleSurface(nextOptions);
-                    if (hit) out.push(hit);
-                }
-                return Object.freeze(out);
+            const requestedCount = options.count == null ? 0 : Number(options.count);
+            if (
+                !Number.isFinite(requestedCount)
+                || !Number.isInteger(requestedCount)
+                || requestedCount < 0
+                || requestedCount > 100000
+            ) {
+                throw new RangeError('sampleSurface: count must be an integer between 0 and 100000');
             }
-
+            const count = requestedCount;
+            const rng = resolveSurfaceRng(options);
             const obj = getObject();
             if (!obj?.isObject3D) return null;
             if (!options.includeInvisible && !obj.visible) return null;
+            const resolvedOptions = options.rng === rng ? options : { ...options, rng };
+            const entries = prepareSurfaceSampling(obj, resolvedOptions);
+            if (count <= 1) return samplePreparedSurface(entries, resolvedOptions);
 
-            if (obj.isMesh) {
-                const topology = getSurfaceTopologyCache(obj.geometry, THREE);
-                return topology ? sampleMeshSurface(obj, topology, options) : null;
+            const batchOptions = { ...resolvedOptions };
+            delete batchOptions.count;
+            // A batch returns independent records. Reusing caller-provided
+            // output targets here made every result alias the final sample.
+            delete batchOptions.point;
+            delete batchOptions.normal;
+            delete batchOptions.barycentric;
+            delete batchOptions.uv;
+            const out = [];
+            for (let i = 0; i < count; i += 1) {
+                const hit = samplePreparedSurface(entries, batchOptions);
+                if (hit) out.push(hit);
             }
-
-            const meshes = collectSampleableMeshes(obj, options.includeInvisible === true);
-            if (meshes.length === 0) return null;
-            if (meshes.length === 1) {
-                const { mesh, topology } = meshes[0];
-                return sampleMeshSurface(mesh, topology, options);
-            }
-
-            const rng = typeof options.rng === 'function' ? options.rng : Math.random;
-            let totalArea = 0;
-            for (const entry of meshes) totalArea += entry.topology.totalArea;
-            if (totalArea <= 0) return null;
-
-            const target = Math.min(Math.max(rng(), 0), 0.9999999999999999) * totalArea;
-            let running = 0;
-            for (const entry of meshes) {
-                running += entry.topology.totalArea;
-                if (target <= running) return sampleMeshSurface(entry.mesh, entry.topology, options);
-            }
-
-            const last = meshes[meshes.length - 1];
-            return sampleMeshSurface(last.mesh, last.topology, options);
+            return Object.freeze(out);
         },
     });
 }

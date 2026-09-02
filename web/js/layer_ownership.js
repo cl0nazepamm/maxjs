@@ -181,6 +181,13 @@ function disposeOwnedResource(resource, options = {}) {
         }
         disposeOwnedResource(resource.geometry, { seen, force });
         disposeOwnedMaterial(resource.material, { seen, force });
+        // Unlike ordinary Mesh, InstancedMesh owns GPU-side instance state and
+        // exposes dispose(). The geometry/material may still be Max-owned and
+        // are protected by the calls above; only the JS-owned batch itself is
+        // released here.
+        if (resource.isInstancedMesh && (force || isOwnedByJs(resource)) && isDisposable(resource)) {
+            resource.dispose();
+        }
         return;
     }
 

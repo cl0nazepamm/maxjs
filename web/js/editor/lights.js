@@ -2,7 +2,6 @@
 import * as THREE from 'three';
 import {
     clearUnownedLightLinkMaterialObserver,
-    getReflectionPaintNode,
     setLightLinkMaterialObserver,
     setLightLinkMaskDefaults,
 } from '../max_lights_node.js';
@@ -879,51 +878,6 @@ function createLights(deps = {}) {
             }
             function getHdriConstrainToCamera() { return hdriConstrainToCamera; }
 
-            let reflectionPaintConstrainToCamera = false;
-            const reflectionPaintCameraDirections = new Map();
-            const constraintCameraQuat = new THREE.Quaternion();
-            const constraintInverseQuat = new THREE.Quaternion();
-            function vectorFromPlain(value) {
-                if (value?.isVector3) return value.clone();
-                if (Array.isArray(value) && value.length >= 3) {
-                    return new THREE.Vector3(value[0] || 0, value[1] || 0, value[2] || 0);
-                }
-                if (value && typeof value === 'object') {
-                    return new THREE.Vector3(value.x || 0, value.y || 0, value.z || 0);
-                }
-                return null;
-            }
-            function captureReflectionPaintCameraDirections(saved = null) {
-                reflectionPaintCameraDirections.clear();
-                const savedById = new Map();
-                for (const item of (Array.isArray(saved) ? saved : [])) {
-                    const id = Number(item?.id);
-                    const direction = vectorFromPlain(item?.cameraDirection ?? item?.direction);
-                    if (Number.isFinite(id) && direction) savedById.set(id, direction.normalize());
-                }
-                getCameraWorldQuaternion(constraintCameraQuat);
-                constraintInverseQuat.copy(constraintCameraQuat).invert();
-                for (const l of getReflectionPaintNode().getLights()) {
-                    const savedDir = savedById.get(Number(l.id));
-                    if (savedDir) {
-                        reflectionPaintCameraDirections.set(Number(l.id), savedDir);
-                        continue;
-                    }
-                    const worldDir = vectorFromPlain(l.direction);
-                    if (!worldDir) continue;
-                    reflectionPaintCameraDirections.set(
-                        Number(l.id),
-                        worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize()
-                    );
-                }
-            }
-            function setReflectionPaintConstrainToCamera(v) {
-                reflectionPaintConstrainToCamera = !!v;
-                if (reflectionPaintConstrainToCamera) captureReflectionPaintCameraDirections();
-                save({ flush: true });
-            }
-            function getReflectionPaintConstrainToCamera() { return reflectionPaintConstrainToCamera; }
-
             // Constrain-to-camera: per-light camera-relative offset
             // lightHandle -> { posOffset: Vector3, targetOffset: Vector3 }
             const lightCameraConstraints = new Map();
@@ -983,30 +937,6 @@ function createLights(deps = {}) {
                     deps.scene.environmentRotation.y = hdriBaseRotationY - camYaw;
                     deps.scene.backgroundRotation.y = hdriBaseRotationY - camYaw;
                 }
-                if (reflectionPaintConstrainToCamera) {
-                    getCameraWorldQuaternion(constraintCameraQuat);
-                    const paint = getReflectionPaintNode();
-                    const liveIds = new Set();
-                    for (const l of paint.getLights()) {
-                        const id = Number(l.id);
-                        liveIds.add(id);
-                        let localDir = reflectionPaintCameraDirections.get(id);
-                        if (!localDir) {
-                            const worldDir = vectorFromPlain(l.direction);
-                            if (!worldDir) continue;
-                            constraintInverseQuat.copy(constraintCameraQuat).invert();
-                            localDir = worldDir.normalize().applyQuaternion(constraintInverseQuat).normalize();
-                            reflectionPaintCameraDirections.set(id, localDir);
-                        }
-                        paint.updateLight(id, {
-                            direction: localDir.clone().applyQuaternion(constraintCameraQuat).normalize(),
-                        });
-                    }
-                    for (const id of reflectionPaintCameraDirections.keys()) {
-                        if (!liveIds.has(id)) reflectionPaintCameraDirections.delete(id);
-                    }
-                    notifyLightingParamChanged();
-                }
                 if (lightCameraConstraints.size === 0) return;
                 deps.camera.updateMatrixWorld(true);
                 for (const [lh, c] of lightCameraConstraints) {
@@ -1053,20 +983,6 @@ function createLights(deps = {}) {
                 return (typeof v === 'number') ? v : 1.0;
             }
 
-            function setReflectionPaintIntensity(value) {
-                const paint = getReflectionPaintNode();
-                const wasActive = paint.active;
-                const v = Number.isFinite(value) ? Math.max(0, value) : 1.0;
-                paint.setGlobalIntensity(v);
-                if (wasActive !== paint.active) notifyLightLinkTopologyChanged();
-                else notifyLightingParamChanged();
-                save();
-            }
-
-            function getReflectionPaintIntensity() {
-                return getReflectionPaintNode().getGlobalIntensity();
-            }
-
             function serialize() {
                 const data = {
                     ...serializeLightLinks(links, {
@@ -1076,15 +992,7 @@ function createLights(deps = {}) {
                     env: {},
                     constrain: {},
                 };
-                data.reflectionPaintIntensity = getReflectionPaintIntensity();
                 data.constrain.hdri = hdriConstrainToCamera;
-                data.constrain.reflectionPaint = reflectionPaintConstrainToCamera;
-                if (reflectionPaintCameraDirections.size > 0) {
-                    data.constrain.reflectionPaintDirections = [...reflectionPaintCameraDirections].map(([id, direction]) => ({
-                        id,
-                        cameraDirection: direction.toArray(),
-                    }));
-                }
                 const constrainedLightNames = [];
                 const constrainedLights = [];
                 for (const [lh, constraint] of lightCameraConstraints) {
@@ -1147,10 +1055,6 @@ function createLights(deps = {}) {
                     const rawConstrain = data.constrain || {};
                     hdriConstrainToCamera = !!rawConstrain.hdri;
                     if (hdriConstrainToCamera) hdriBaseRotationY = deps.scene.environmentRotation.y + getCameraYaw();
-                    reflectionPaintConstrainToCamera = !!rawConstrain.reflectionPaint;
-                    if (reflectionPaintConstrainToCamera) {
-                        captureReflectionPaintCameraDirections(rawConstrain.reflectionPaintDirections);
-                    }
                     const lightConstraints = Array.isArray(rawConstrain.lightOffsets)
                         ? rawConstrain.lightOffsets
                         : (rawConstrain.lights || []).map(name => ({ name }));
@@ -1160,9 +1064,6 @@ function createLights(deps = {}) {
                         if (lh == null) continue;
                         const constraint = buildCameraConstraintForLight(lh, item);
                         if (constraint) lightCameraConstraints.set(handleToken(lh), constraint);
-                    }
-                    if (options.applyReflectionPaintIntensity !== false && Number.isFinite(data.reflectionPaintIntensity)) {
-                        getReflectionPaintNode().setGlobalIntensity(data.reflectionPaintIntensity);
                     }
                     const state = reapply();
                     if (hadSpecializedLighting || state.activeCount > 0 || state.sceneTopologyChanged) {
@@ -1192,13 +1093,9 @@ function createLights(deps = {}) {
                 hasPortableState: () => links.size > 0
                     || envIntensityByName.size > 0
                     || lightCameraConstraints.size > 0
-                    || hdriConstrainToCamera
-                    || reflectionPaintConstrainToCamera,
+                    || hdriConstrainToCamera,
                 setEnvIntensity, getEnvIntensity,
-                setReflectionPaintIntensity, getReflectionPaintIntensity,
                 setHdriConstrainToCamera, getHdriConstrainToCamera,
-                setReflectionPaintConstrainToCamera, getReflectionPaintConstrainToCamera,
-                captureReflectionPaintCameraDirections,
                 setLightConstrainToCamera, getLightConstrainToCamera,
                 updateCameraConstraints,
             };
@@ -1261,8 +1158,7 @@ function createLights(deps = {}) {
                 `<div class="sidepanel-body" style="gap:6px;">`;
 
             const hdriAvailable = !!deps.scene.environment;
-            const reflectionPaintAvailable = getReflectionPaintNode().count > 0;
-            if (lights.length === 0 && !hdriAvailable && !reflectionPaintAvailable) {
+            if (lights.length === 0 && !hdriAvailable) {
                 html += `<div style="color:#666;padding:8px 0;">No lights or HDRI in scene</div>`;
             } else {
                 // Target selector: HDRI first, then individual lights.
@@ -1273,9 +1169,6 @@ function createLights(deps = {}) {
                 }
                 for (const l of lights) {
                     html += `<option value="${l.h}">${l.name}</option>`;
-                }
-                if (reflectionPaintAvailable) {
-                    html += `<option value="__rp__">Reflection Paint (global intensity)</option>`;
                 }
                 html += `</select>`;
 
@@ -1304,7 +1197,7 @@ function createLights(deps = {}) {
             html += `</div>`;
             lightLinkPanel.innerHTML = html;
 
-            if (lights.length === 0 && !hdriAvailable && !reflectionPaintAvailable) return;
+            if (lights.length === 0 && !hdriAvailable) return;
 
             const lightSel = document.getElementById('ll-light-sel');
             const modeRow = document.getElementById('ll-mode-row');
@@ -1319,7 +1212,6 @@ function createLights(deps = {}) {
             const availableTargetValues = new Set();
             if (hdriAvailable) availableTargetValues.add('__hdri__');
             for (const l of lights) availableTargetValues.add(String(l.h));
-            if (reflectionPaintAvailable) availableTargetValues.add('__rp__');
             if (availableTargetValues.has(previousTarget)) {
                 lightSel.value = previousTarget;
                 lightLinkPanelSelectedTarget = previousTarget;
@@ -1328,11 +1220,10 @@ function createLights(deps = {}) {
             }
 
             function isHdriMode() { return lightSel.value === '__hdri__'; }
-            function isRpMode() { return lightSel.value === '__rp__'; }
-            function isSliderMode() { return isHdriMode() || isRpMode(); }
+            function isSliderMode() { return isHdriMode(); }
             function getSelectedLight() {
                 const v = lightSel.value;
-                if (v === '__hdri__' || v === '__rp__') return v;
+                if (v === '__hdri__') return v;
                 return v;
             }
 
@@ -1352,15 +1243,7 @@ function createLights(deps = {}) {
 
             function renderObjectList() {
                 let inner = '';
-                if (isRpMode()) {
-                    const v = lightLinking.getReflectionPaintIntensity();
-                    sliderTargets = [{ key: '__reflection_paint_global__', name: 'Global Intensity' }];
-                    inner += `<div style="display:flex;align-items:center;gap:6px;padding:1px 2px;font-size:10px;">`;
-                    inner += `<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Global Intensity</span>`;
-                    inner += `<input type="range" data-index="0" min="0" max="2" step="0.01" value="${v}" style="width:90px;accent-color:#e8e8e8;">`;
-                    inner += `<span data-index="0" style="width:30px;text-align:right;color:#aaa;font-variant-numeric:tabular-nums;">${v.toFixed(2)}</span>`;
-                    inner += `</div>`;
-                } else if (isHdriMode()) {
+                if (isHdriMode()) {
                     sliderTargets = collectSliderMaterials();
                     const getV = (key) => lightLinking.getEnvIntensity(key);
                     for (let i = 0; i < sliderTargets.length; i++) {
@@ -1391,17 +1274,13 @@ function createLights(deps = {}) {
                 if (isSliderMode()) {
                     modeRow.style.display = 'none';
                     hdriHint.style.display = '';
-                    listLabel.textContent = isRpMode() ? 'Reflection Paint' : 'Materials';
-                    hdriHint.textContent = isRpMode()
-                        ? 'Global multiplier for the painted environment overlay.'
-                        : 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.';
+                    listLabel.textContent = 'Materials';
+                    hdriHint.textContent = 'Drag sliders per material \u2014 0 removes HDRI contribution, 1 = default.';
                     bulkBtns.style.display = 'none';
                     objList.style.opacity = '1';
                     objList.style.pointerEvents = 'auto';
                     constrainRow.style.display = 'flex';
-                    constrainCam.checked = isRpMode()
-                        ? lightLinking.getReflectionPaintConstrainToCamera()
-                        : lightLinking.getHdriConstrainToCamera();
+                    constrainCam.checked = lightLinking.getHdriConstrainToCamera();
                     renderObjectList();
                     return;
                 }
@@ -1458,8 +1337,7 @@ function createLights(deps = {}) {
                 const v = parseFloat(tgt.value);
                 const lbl = tgt.parentElement?.querySelector('span[data-index]');
                 if (lbl) lbl.textContent = v.toFixed(2);
-                if (isRpMode()) lightLinking.setReflectionPaintIntensity(v);
-                else lightLinking.setEnvIntensity(target.key, v);
+                lightLinking.setEnvIntensity(target.key, v);
             });
             objList.addEventListener('change', (ev) => {
                 if (isSliderMode()) return;
@@ -1479,9 +1357,7 @@ function createLights(deps = {}) {
 
             constrainCam.addEventListener('change', () => {
                 const sel = getSelectedLight();
-                if (isRpMode()) {
-                    lightLinking.setReflectionPaintConstrainToCamera(constrainCam.checked);
-                } else if (isHdriMode()) {
+                if (isHdriMode()) {
                     lightLinking.setHdriConstrainToCamera(constrainCam.checked);
                 } else {
                     lightLinking.setLightConstrainToCamera(sel, constrainCam.checked);

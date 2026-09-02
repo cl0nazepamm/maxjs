@@ -8,6 +8,7 @@ import { createInputHelper, createInstancesFacade, createMaxSceneFacade, createN
 import { createDeformSystem } from './layer_deform.js';
 import { createLayerParamController } from './layer_params.js';
 import { createMorphSystem } from './layer_morph.js';
+import { createLayerMeshReuse } from './layer_mesh_reuse.js';
 import { createMaxNodeAdapter } from './layer_node_adapter.js';
 import { createRigFacade } from './layer_rig.js';
 import { createRuntimeOverrideController } from './layer_runtime_overrides.js';
@@ -26,7 +27,6 @@ import {
     setSnapshotTargetId,
 } from './layer_ownership.js';
 import { freezePlainObject, normalizeFolder, normalizePriority } from './layer_utils.js';
-import { createWebappLayer } from './webapp_layer.js';
 
 const MAX_CONSECUTIVE_ERRORS = 60;
 
@@ -837,11 +837,12 @@ export function createLayerManager({
         const readQuaternionLike = (value, target = new THREE.Quaternion()) => {
             if (value?.isQuaternion) return target.copy(value);
             if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+                const w = Number(value[3]);
                 return target.set(
                     Number(value[0]) || 0,
                     Number(value[1]) || 0,
                     Number(value[2]) || 0,
-                    Number(value[3]) || 1
+                    Number.isFinite(w) ? w : 1
                 ).normalize();
             }
             if (value?.isEuler) return target.setFromEuler(value);
@@ -1044,17 +1045,6 @@ export function createLayerManager({
             },
         });
 
-        const ctxRef = { current: null };
-        const webappFacade = freezePlainObject({
-            create(spec) {
-                if (!isLayerCurrent(layer)) {
-                    warnStaleLayerMutation(layer);
-                    return null;
-                }
-                return createWebappLayer(ctxRef.current, THREE, spec);
-            },
-        });
-
         const busFacade = freezePlainObject({
             on(event, handler) {
                 if (typeof event !== 'string' || !event) throw new TypeError('bus.on: event must be a non-empty string');
@@ -1181,6 +1171,9 @@ export function createLayerManager({
             const parent = options.overlay ? layer.overlayGroup : layer.group;
             const targetParent = options.parent?.isObject3D ? options.parent : parent;
             placeRuntimeClone(clone, adapter, targetParent, options);
+            // Clones remain layer-owned even if layer code later detaches or
+            // reparents them, so teardown cannot lose their private resources.
+            layer.tracked.add(clone);
             if (clone.userData?.maxjsFollowSourceMaterial) {
                 layer.liveMaterialClones.set(clone, clone.material);
             }
@@ -1188,6 +1181,25 @@ export function createLayerManager({
             return clone;
         };
         layer.cloneFromMax = cloneFromMaxForLayer;
+
+        const meshReuse = createLayerMeshReuse({
+            THREE,
+            layerId: layer.id,
+            group: layer.group,
+            overlayGroup: layer.overlayGroup,
+            isActive: () => isLayerCurrent(layer),
+            resolveAdapter: source => resolveNodeAdapter(source),
+            listUnder: (source, options = {}) => maxSceneFacade.under(source, options),
+            cloneMaterial: (material, owner) => cloneMaterialForLayer(material, owner),
+            cloneFromMax: cloneFromMaxForLayer,
+            registerBatch: batch => layer.sourceInstanceBatches.add(batch),
+            unregisterBatch: batch => layer.sourceInstanceBatches.delete(batch),
+            registerComposite: composite => layer.meshReuseComposites.add(composite),
+            unregisterComposite: composite => layer.meshReuseComposites.delete(composite),
+            untrackResource: resource => layer.tracked.delete(resource),
+            notifyChanged: notifyRuntimeSceneChanged,
+            debugWarn,
+        });
 
         const jsFacade = freezePlainObject({
             root: layer.group,
@@ -1276,6 +1288,9 @@ export function createLayerManager({
                 }
                 return Object.freeze(out);
             },
+            instanceFromMax(source, options = {}) {
+                return meshReuse.instanceFromMax(source, options);
+            },
             track(resource, options = {}) {
                 if (!resource) return resource;
                 if (!isLayerCurrent(layer)) {
@@ -1354,6 +1369,7 @@ export function createLayerManager({
             camera: cameraFacade,
             renderer: rendererFacade,
             instances: instancesFacade,
+            kits: meshReuse.kits,
             params: paramController.createFacade(layer),
             deform: deformSystem.createLayerFacade(
                 layer.id,
@@ -1390,12 +1406,10 @@ export function createLayerManager({
             project: projectFacade,
             bus: busFacade,
             services: servicesFacade,
-            webapp: webappFacade,
             track(resource, options = {}) {
                 return jsFacade.track(resource, options);
             },
         };
-        ctxRef.current = ctx;
         return ctx;
     }
 
@@ -1461,6 +1475,20 @@ export function createLayerManager({
         }
     }
 
+    function syncSourceInstanceBatches(layer) {
+        let changed = false;
+        for (const batch of [...layer.sourceInstanceBatches]) {
+            try {
+                changed = batch.syncSource?.() === true || changed;
+            } catch (err) {
+                debugWarn(`[LayerManager] Layer "${layer.id}" instance source sync error:`, err);
+            }
+        }
+        if (changed) {
+            notifyRuntimeSceneChanged({ type: 'jsScene', layerId: layer.id, action: 'instanceSourceSync' });
+        }
+    }
+
     function createLayerState(id, options = {}) {
         if (layers.has(id)) remove(id);
 
@@ -1497,6 +1525,8 @@ export function createLayerManager({
             tracked: new Set(),
             anchors: [],
             liveMaterialClones: new Map(),
+            sourceInstanceBatches: new Set(),
+            meshReuseComposites: new Set(),
             nodeAdapters: new Map(),
             disposers: [],
             input: null,
@@ -1624,6 +1654,10 @@ export function createLayerManager({
         }
         layer.tracked.clear();
         layer.liveMaterialClones.clear();
+        for (const composite of [...layer.meshReuseComposites]) composite.retire?.();
+        layer.meshReuseComposites.clear();
+        for (const batch of [...layer.sourceInstanceBatches]) batch.retire?.();
+        layer.sourceInstanceBatches.clear();
         layer.anchors.length = 0;
         layer.nodeAdapters.clear();
         if (layer.input) { layer.input.dispose(); layer.input = null; }
@@ -1716,12 +1750,14 @@ export function createLayerManager({
             if (layer.loading || !layer.active || !layer.hooks || typeof layer.hooks.update !== 'function') {
                 syncAnchors(layer, anchorSyncCache);
                 syncLiveMaterialClones(layer);
+                syncSourceInstanceBatches(layer);
                 continue;
             }
             try {
                 const updateStart = performance.now();
                 syncAnchors(layer, anchorSyncCache);
                 syncLiveMaterialClones(layer);
+                syncSourceInstanceBatches(layer);
                 layer.hooks.update(layer.ctx, dt, elapsed);
                 const updateMs = performance.now() - updateStart;
                 totalUpdateMs += updateMs;

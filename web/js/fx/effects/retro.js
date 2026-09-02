@@ -72,4 +72,7 @@ export default {
         }
         return ctx.withBeautyAlpha(beauty);
     },
+    update(ctx) {
+        syncRetroUniforms(ctx);
+    },
 };

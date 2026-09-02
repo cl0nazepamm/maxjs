@@ -50,7 +50,6 @@ const JSON_FORWARD_TYPES = new Set([
     'cam',
     'audio_update',
     'gltf_update',
-    'webapp_update',
     'env_update',
     'probeGrids',
     'clay_mode',
@@ -62,7 +61,6 @@ const JSON_FORWARD_TYPES = new Set([
 const KEYED_JSON_STATE = Object.freeze({
     audio_update: 'audios',
     gltf_update: 'gltfs',
-    webapp_update: 'webapps',
 });
 const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'speedballGiSettings', 'clay_mode']);
 const PANEL_JSON_TYPES = new Set(['speedballGiSettings', 'probeGrids']);
@@ -222,6 +220,7 @@ function createLiveRelayController(options = {}) {
     let resyncReason = '';
     let lastError = '';
     let transportGeneration = 0;
+    let unobserveTransport = null;
 
     function snapshot() {
         return Object.freeze({
@@ -760,6 +759,10 @@ function createLiveRelayController(options = {}) {
     function enable() {
         if (disposed) throw new Error('live relay controller is disposed');
         if (enabled) return false;
+        // Host traffic can contain large shared buffers. Register the observer
+        // only for an explicitly enabled relay session so an OFF controller is
+        // completely absent from the editor's hot transport path.
+        unobserveTransport = hostBridge.observeTransport(observeTransport);
         enabled = true;
         handshakeReady = false;
         everConnected = false;
@@ -787,7 +790,11 @@ function createLiveRelayController(options = {}) {
     }
 
     function disable() {
-        if (!enabled && state === RELAY_STATES.OFF) return false;
+        if (!enabled && state === RELAY_STATES.OFF) {
+            unobserveTransport?.();
+            unobserveTransport = null;
+            return false;
+        }
         // A hello may have reached the broker even if its response was aborted
         // or ambiguous. Releasing any enabled session is safe; an unknown
         // session simply receives a harmless rejection and the lease remains a
@@ -795,6 +802,8 @@ function createLiveRelayController(options = {}) {
         const goodbyeSessionId = enabled ? sessionId : '';
         enabled = false;
         handshakeReady = false;
+        unobserveTransport?.();
+        unobserveTransport = null;
         transportGeneration += 1;
         if (heartbeatTimer) clearIntervalImpl(heartbeatTimer);
         if (reconnectTimer) clearTimeoutImpl(reconnectTimer);
@@ -831,11 +840,8 @@ function createLiveRelayController(options = {}) {
         if (disposed) return;
         disable();
         disposed = true;
-        unobserveTransport();
         listeners.clear();
     }
-
-    const unobserveTransport = hostBridge.observeTransport(observeTransport);
 
     return Object.freeze({
         enable,

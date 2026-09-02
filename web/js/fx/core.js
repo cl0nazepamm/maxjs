@@ -87,6 +87,7 @@ export function createFxCore({
 
     let activeNodes = [];
     const activePasses = new Map();
+    const resolutionScaleBindings = new Map();
     let activeScenePass = null;
 
     // ── Effect context ──────────────────────────────────────────────────
@@ -212,6 +213,7 @@ export function createFxCore({
 
     function applyNodeResolutionScale(node, extraScale = 1.0) {
         if (!node) return;
+        resolutionScaleBindings.set(node, extraScale);
         const scale = getCombinedPostFxResolutionScale(extraScale);
         if (typeof node.setResolutionScale === 'function') {
             node.setResolutionScale(scale);
@@ -436,6 +438,7 @@ export function createFxCore({
         if (recreatePipeline) recreatePostPipeline();
         else retirePostPipeline({ recreate: false });
         activePasses.clear();
+        resolutionScaleBindings.clear();
         activeScenePass = null;
         const seen = new Set();
         for (const node of activeNodes) {
@@ -829,6 +832,15 @@ export function createFxCore({
         }
     }
 
+    function refreshResolutionScales() {
+        for (const [node, extraScale] of resolutionScaleBindings) {
+            const scale = getCombinedPostFxResolutionScale(extraScale);
+            if (typeof node.setResolutionScale === 'function') node.setResolutionScale(scale);
+            else if ('resolutionScale' in node) node.resolutionScale = scale;
+        }
+        if (postProcessing) postProcessing.needsUpdate = true;
+    }
+
     return {
         // Live accessor: the instance is REPLACED on every clearNodes(); a
         // cached reference would render (and resurrect) the old zombie graph.
@@ -861,5 +873,6 @@ export function createFxCore({
         getCombinedPostFxResolutionScale,
         getScaledPostFxSize,
         applyNodeResolutionScale,
+        refreshResolutionScales,
     };
 }

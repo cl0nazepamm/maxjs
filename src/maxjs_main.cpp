@@ -46,7 +46,6 @@
 #include "threejs_sky.h"
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
-#include "threejs_webapp.h"
 #include "threejs_probegrid.h"
 #include <iskin.h>
 
@@ -96,7 +95,6 @@ using namespace Microsoft::WRL;
 #define WM_PLAYBACK_FLUSH         (WM_USER + 6)
 #define WM_EXPORT_SNAPSHOT        (WM_USER + 7)
 #define WM_RENDER_SEQUENCE_STEP   (WM_USER + 8)
-#define WM_RENDER_SEQUENCE_CAPTURE (WM_USER + 9)
 #define WM_REFRESH_INSTANCES      (WM_USER + 10)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
@@ -211,7 +209,7 @@ public:
             return false;
         }
         if (!DirectoryExists(inlineDir) && SHCreateDirectoryExW(nullptr, inlineDir.c_str(), nullptr) != ERROR_SUCCESS && !DirectoryExists(inlineDir)) {
-            error = L"Failed to create inlines folder";
+            error = L"Failed to create scripts folder";
             return false;
         }
         if (!MigrateLegacyInlineLayers(inlineDir, error)) {
@@ -878,7 +876,9 @@ public:
         std::wstring normalized = entryPath;
         std::replace(normalized.begin(), normalized.end(), L'\\', L'/');
         while (!normalized.empty() && normalized.front() == L'/') normalized.erase(0, 1);
-        const std::wstring prefix = L"inlines/";
+        std::wstring folderName = std::filesystem::path(inlineDir).lexically_normal().filename().wstring();
+        if (folderName.empty()) folderName = L"scripts";
+        const std::wstring prefix = folderName + L"/";
         if (normalized.rfind(prefix, 0) != 0) return false;
         const std::wstring rel = normalized.substr(prefix.size());
         if (rel.empty() || !EndsWithInsensitive(rel, L".js")) return false;
@@ -1495,7 +1495,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, ULONG fdwReason, LPVOID) {
 }
 
 __declspec(dllexport) const TCHAR* LibDescription()   { return MAXJS_NAME; }
-__declspec(dllexport) int LibNumberClasses()           { return 22; }
+__declspec(dllexport) int LibNumberClasses()           { return 21; }
 __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
     switch (i) {
         case 0: return &maxJSDesc;
@@ -1518,8 +1518,7 @@ __declspec(dllexport) ClassDesc* LibClassDesc(int i) {
         case 17: return GetThreeJSTSLTexDesc();
         case 18: return GetThreeJSHTMLTexDesc();
         case 19: return GetThreeJSGLTFDesc();
-        case 20: return GetThreeJSWebAppDesc();
-        case 21: return GetThreeJSProbeGridDesc();
+        case 20: return GetThreeJSProbeGridDesc();
         default: return nullptr;
     }
 }

@@ -482,7 +482,7 @@
             lower.find(L"\"snapshot_backend\": \"webgpu") != std::wstring::npos) {
             return L"webgpu";
         }
-        // Studio state replays through MaxLightsNode / reflection paint, which
+        // Studio light-linking state replays through MaxLightsNode, which
         // requires the WebGPU/TSL snapshot shell even if older UI payloads did
         // not include an explicit rendererBackend field.
         if (lower.find(L"\"studio\":{") != std::wstring::npos ||
@@ -1149,7 +1149,7 @@
         ss << L"\"snapshotUi\":" << (features.snapshotUi ? L"true" : L"false");
         ss << L",\"runtimeScene\":" << (features.runtimeScene ? L"true" : L"false");
         ss << L",\"project\":" << (features.projectManifest ? L"true" : L"false");
-        ss << L",\"inlines\":" << (features.inlineLayers ? L"true" : L"false");
+        ss << L",\"scripts\":" << (features.inlineLayers ? L"true" : L"false");
         ss << L"}";
         ss << L",\"counts\":{";
         ss << L"\"meshes\":" << features.meshNodes;
@@ -1203,7 +1203,7 @@
         runtimeFeatures.runtimeScene = options.includeRuntimeScene && !runtimeSceneJson.empty();
         runtimeFeatures.rendererPref = DetectRendererPrefFromSnapshotUi(snapshotUiJson);
         const std::wstring projectManifestPath = GetProjectManifestPath();
-        const std::wstring inlineLayerDir = GetInlineLayerDir();
+        const std::wstring inlineLayerDir = GetInlineHotLayerDir();
         runtimeFeatures.projectManifest =
             !projectManifestPath.empty() && FileExists(projectManifestPath);
         runtimeFeatures.inlineLayers =
@@ -1232,10 +1232,6 @@
                     if (options.includeGLTFs && !node->IsNodeHidden(TRUE)) {
                         runtimeFeatures.gltfs = true;
                     }
-                    collect(node);
-                    continue;
-                }
-                if (os.obj && IsThreeJSWebAppClassID(os.obj->ClassID())) {
                     collect(node);
                     continue;
                 }
@@ -1730,8 +1726,6 @@
             ss << L",";
             WriteGLTFsJson(ss, ip, t, true, false, false);
         }
-        ss << L",";
-        WriteWebAppsJson(ss, ip, t, true, false, false);
         if (options.includeAnimations) {
             runtimeFeatures.animations = WriteSnapshotAnimationsJson(
                 ss, nodes, ip, t, options, outAnimBinary, skinRigMeshHandles, lockedCameraHandle_);
@@ -1951,7 +1945,7 @@
         }
 
         // Copy project layers when present. They are sidecars, not part of the
-        // baked runtimeScene JSON, so snapshots can replay inlines even when
+        // baked runtimeScene JSON, so snapshots can replay scripts even when
         // runtimeScene export is omitted or empty.
         const std::wstring projectManifestPath = GetProjectManifestPath();
         if (!projectManifestPath.empty() && FileExists(projectManifestPath)) {
@@ -1961,7 +1955,7 @@
                     std::filesystem::path(snapshotManifestPath))) {
                 const std::wstring manifestText = FilterProjectManifestForSnapshot(
                     ReadUtf8File(projectManifestPath),
-                    GetInlineLayerDir());
+                    GetInlineHotLayerDir());
                 if (!WriteUtf8File(snapshotManifestPath, manifestText)) {
                     error = L"Failed to copy project.maxjs.json into snapshot";
                     cleanupOnFail();
@@ -1970,13 +1964,15 @@
             }
         }
 
-        const std::wstring inlineDir = GetInlineLayerDir();
+        const std::wstring inlineDir = GetInlineHotLayerDir();
         if (!inlineDir.empty() && DirectoryExists(inlineDir)) {
+            const bool legacyFolder =
+                _wcsicmp(inlineDir.c_str(), GetLegacyProjectInlineLayerDir().c_str()) == 0;
             if (!CopyInlineDirectoryForSnapshot(
                     inlineDir,
-                    outDir + L"\\inlines",
+                    outDir + (legacyFolder ? L"\\inlines" : L"\\scripts"),
                     options.includeDisabledLayers)) {
-                error = L"Failed to copy inlines into snapshot";
+                error = L"Failed to copy scripts into snapshot";
                 cleanupOnFail();
                 return false;
             }

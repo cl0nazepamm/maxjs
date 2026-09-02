@@ -59,7 +59,7 @@ are already attached to the message.
 | `bin` | Snapshot-relative payload URL. New Max exports use `scene.m3`. |
 | `frame` | Producer frame/revision marker; it is not an MXJB frame header. |
 | `nodes` | Hierarchy and byte-range descriptors. |
-| `materials`, `camera`, `sceneCameras`, `lights`, `audios`, `gltfs`, `webapps`, `env` | JSON-side scene descriptors; not embedded in M3. |
+| `materials`, `camera`, `sceneCameras`, `lights`, `audios`, `gltfs`, `env` | JSON-side scene descriptors; not embedded in M3. |
 | `forestInstances` | Optional instanced geometry and transform ranges in M3. |
 | `animations` | Animation manifest. Its optional binary is a separate file, normally `scene_anim.bin`. |
 
@@ -255,7 +255,7 @@ must reject opcode 9, and must consume the frame exactly with no trailing bytes.
 | 10 | `UpdateAudio` | 76 | `u32 handle`, matrix, `u32 visible` |
 | 11 | `UpdateTime` | 16 | `i32 ticks`, `i32 ticksPerFrame`, `u8 flags`, three zero pad bytes |
 | 12 | `UpdateGLTF` | 76 | `u32 handle`, matrix, `u32 visible` |
-| 13 | `UpdateWebApp` | 76 | `u32 handle`, matrix, `u32 visible` |
+| 13 | retired | — | Never reuse |
 
 The legacy 52-byte `UpdateCamera` command (ending after `viewWidth`) remains
 readable. No other alternate sizes are valid. Boolean `u32` fields are 0 or 1;

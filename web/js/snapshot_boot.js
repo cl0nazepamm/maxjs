@@ -30,7 +30,7 @@
 //   6. Apply scene.m3 (legacy scene.bin is still accepted)
 //   7. Apply snapshotUi block (tone mapping, exposure, env, fog, postfx/studio state)
 //   8. Apply runtimeScene block (baked Object3D JSON)
-//   9. Bind layer project (inlines/ + project.maxjs.json)
+//   9. Bind layer project (scripts/ + project.maxjs.json)
 //  10. Run (setAnimationLoop)
 //
 // STAGE 5 STATUS (this file)
@@ -2221,7 +2221,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     await materialBuilder.loadTslTextures({ required: snapshotNeedsTslTextures(meta) });
 
     // Authored environment/HDRI from snapshot.json. This stays separate
-    // from inlines: script-authored sky belongs to the layer runtime.
+    // from scripts: script-authored sky belongs to the layer runtime.
     const snapshotEnvironment = createSnapshotEnvironment({
         scene,
         renderer,
@@ -2239,8 +2239,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         });
     };
     const syncDefaultLights = () => {
-        const studioLightingActive = studioLighting?.hasReflectionPaint?.() === true;
-        defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive() && !studioLightingActive;
+        defaultLights.visible = authoredLightCount === 0 && !snapshotEnvironment.isLightingActive();
     };
 
     const animationSystem = createMaxJSAnimationSystem({
@@ -2412,7 +2411,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     }
 
     // Phase 9: layer project. Project sidecars are independent of the baked
-    // runtimeScene payload: a snapshot may ship project.maxjs.json + inlines/
+    // runtimeScene payload: a snapshot may ship project.maxjs.json + scripts/
     // even when runtimeScene was omitted or empty.
     const layerReplay = await bindLayerProject(root, meta, layerManager, runtimeSceneState);
     restoreSnapshotTransformOverrides(runtimeSceneState, layerReplay.mountedIds, layerManager);

@@ -25,7 +25,6 @@ import { createInstanceBuckets } from '../instance_buckets.js';
 
 function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
-        let firstSync = true;
         // Flatten Groups: Max group members merged into one mesh per material
         // under the group head. Keyed by head handle.
         const flattenedGroups = new Map();
@@ -830,7 +829,6 @@ function createSceneSync(deps = {}) {
             if (snapshot.sceneCameras) deps.updateSceneCameraList(snapshot.sceneCameras, snapshot.lockedCamera);
             deps.audioSystem?.applyAudios(snapshot.audios ?? []);
             deps.gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
-            deps.webappSystem?.applyWebApps(snapshot.webapps ?? []);
             deps.applyHairInstances(snapshot.hairInstances ?? []);
             deps.applyForestInstances(snapshot.forestInstances ?? [], options.binaryBuffer ?? null);
             deps.applyVolumes(snapshot.volumes ?? []);
@@ -869,10 +867,6 @@ function createSceneSync(deps = {}) {
             options.afterWorldUpdate?.();
             deps.syncSpeedballProbeVolumes();
 
-            if (firstSync && snapshot.nodes.length > 0) {
-                firstSync = false;
-                if (!deps.camLock) deps.fitCamera();
-            }
             const applyMs = performance.now() - applyStart;
             deps.markInitialSync();
             deps.updateSyncHud({
@@ -1495,9 +1489,6 @@ function createSceneSync(deps = {}) {
                 onGLTF(handle, matrix, visible) {
                     deps.gltfSystem?.applyGLTFTransformBinary(handle, matrix, visible);
                     pathTraceStructuralChanged = true;
-                },
-                onWebApp(handle, matrix, visible) {
-                    deps.webappSystem?.applyWebAppTransformBinary(handle, matrix, visible);
                 },
                 onTime(td) {
                     maxTimeline.onTime(td);

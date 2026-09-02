@@ -2,7 +2,6 @@
 
     HANDLE renderImageEvent_ = nullptr;  // signaled when JS confirms a Max-path frame rendered
     std::wstring renderToImageBase64_;   // canvas PNG (straight alpha) sent by JS for the Max path
-    std::wstring renderCss3dMaskBase64_;
     bool renderLocked_ = false;          // panel is locked to render resolution
     bool renderImageWarmed_ = false;     // first Max-path capture needs camera/sync settle time
     RECT preRenderRect_ = {};            // saved window rect before render
@@ -52,120 +51,12 @@
         }
     }
 
-    // ── Composited render capture (CSS3D web panels) ─────────
-    // CSS3D WebApp Animator panels live in the DOM, not the WebGL canvas, so
-    // canvas readback can never include them. When any visible CSS3D panel
-    // exists, the render paths switch to capturing the WebView's composited
-    // surface (CapturePreview): DOM + canvas exactly as displayed. Trade-off:
-    // the composite is opaque — no alpha matte (documented in
-    // docs/WEBAPP_ANIMATOR.md).
-    bool renderCompositedCapture_ = false;       // single-frame (VFB bitmap) path
-    bool renderSequenceComposited_ = false;      // sequence path
-    bool renderSequenceWriteCss3dMask_ = false;
-    HANDLE renderCss3dMaskEvent_ = nullptr;
-    double preCaptureRasterScale_ = 0.0;
-    bool rasterScaleOverridden_ = false;
-
-    bool HasVisibleCss3dWebPanels() {
-        Interface* ip = GetCOREInterface();
-        if (!ip || webappHandles_.empty()) return false;
-        const TimeValue t = ip->GetTime();
-        for (ULONG handle : webappHandles_) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node || !IsMaxJsSyncDrawVisible(node)) continue;
-            ObjectState os = node->EvalWorldState(t);
-            if (!os.obj || !IsThreeJSWebAppClassID(os.obj->ClassID())) continue;
-            IParamBlock2* pb = os.obj->GetParamBlockByID(threejs_webapp_params);
-            if (pb && pb->GetInt(pw_presentation) == 0) return true;
-        }
-        return false;
-    }
-
-    // CSS px must equal physical px during composited capture, or the page
-    // viewport (innerWidth = client / rasterizationScale) disagrees with the
-    // locked render size and the capture comes back DPI-scaled.
-    void OverrideRasterizationScaleForCapture(bool enable) {
-        if (!controller_) return;
-        ComPtr<ICoreWebView2Controller3> ctrl3;
-        if (FAILED(controller_->QueryInterface(IID_PPV_ARGS(&ctrl3))) || !ctrl3) return;
-        if (enable) {
-            if (rasterScaleOverridden_) return;
-            double scale = 0.0;
-            if (FAILED(ctrl3->get_RasterizationScale(&scale)) || scale <= 0.0) scale = 1.0;
-            preCaptureRasterScale_ = scale;
-            ctrl3->put_ShouldDetectMonitorScaleChanges(FALSE);
-            ctrl3->put_RasterizationScale(1.0);
-            rasterScaleOverridden_ = true;
-        } else {
-            if (!rasterScaleOverridden_) return;
-            if (preCaptureRasterScale_ > 0.0) ctrl3->put_RasterizationScale(preCaptureRasterScale_);
-            ctrl3->put_ShouldDetectMonitorScaleChanges(TRUE);
-            rasterScaleOverridden_ = false;
-        }
-    }
-
-    // Blocking CapturePreview on the UI thread (pumps messages while waiting,
-    // same pattern as the render-image event wait above).
-    bool CaptureCompositedImage(std::string& outBytes, bool jpeg, DWORD timeoutMs = 15000) {
-        if (!webview_) return false;
-        ComPtr<IStream> stream;
-        CreateStreamOnHGlobal(nullptr, TRUE, &stream);
-        if (!stream) return false;
-
-        HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (!done) return false;
-        HRESULT captureResult = E_FAIL;
-
-        const HRESULT hr = webview_->CapturePreview(
-            jpeg ? COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_JPEG
-                 : COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
-            stream.Get(),
-            Callback<ICoreWebView2CapturePreviewCompletedHandler>(
-                [&captureResult, done](HRESULT cbHr) -> HRESULT {
-                    captureResult = cbHr;
-                    SetEvent(done);
-                    return S_OK;
-                }).Get());
-        if (FAILED(hr)) { CloseHandle(done); return false; }
-
-        const DWORD start = GetTickCount();
-        bool timedOut = false;
-        while (WaitForSingleObject(done, 0) != WAIT_OBJECT_0) {
-            if (GetTickCount() - start > timeoutMs) { timedOut = true; break; }
-            MSG winMsg;
-            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&winMsg);
-                DispatchMessage(&winMsg);
-            }
-            Sleep(1);
-        }
-        // On timeout the callback may still fire later referencing the stack —
-        // wait briefly for it rather than risk a dangling reference.
-        if (timedOut) WaitForSingleObject(done, 5000);
-        CloseHandle(done);
-        if (timedOut || FAILED(captureResult)) return false;
-
-        STATSTG st = {};
-        if (FAILED(stream->Stat(&st, STATFLAG_NONAME))) return false;
-        const ULONG size = static_cast<ULONG>(st.cbSize.QuadPart);
-        if (size == 0) return false;
-        outBytes.resize(size);
-        LARGE_INTEGER zero = {};
-        stream->Seek(zero, STREAM_SEEK_SET, nullptr);
-        ULONG read = 0;
-        if (FAILED(stream->Read(outBytes.data(), size, &read)) || read == 0) return false;
-        outBytes.resize(read);
-        return true;
-    }
-
     bool RenderMimeSupportsAlpha(const std::wstring& mime) const {
         return _wcsicmp(mime.c_str(), L"image/png") == 0 ||
                _wcsicmp(mime.c_str(), L"image/webp") == 0;
     }
 
-    // Decode a PNG from an IStream into a Max bitmap, preserving the alpha
-    // channel. Scales to the bitmap's resolution (identity when the canvas was
-    // already rendered at the render size). Shared by the canvas-pixel capture.
+
     bool DecodePngStreamToBitmap(IStream* stream, Bitmap* target) {
         if (!stream || !target) return false;
 
@@ -236,8 +127,6 @@
                 webview_->PostWebMessageAsJson(L"{\"type\":\"render_to_image_done\"}");
             }
             renderCameraOverrideActive_ = false;
-            renderCompositedCapture_ = false;
-            OverrideRasterizationScaleForCapture(false);
             UnlockRenderSize();
             SetWebViewBackgroundTransparent(false);
         };
@@ -259,19 +148,10 @@
             }
         }
 
-        // One shared alpha decision for both render paths: render with alpha
-        // only when the output actually wants it. Legacy path keys off the Max
-        // output bitmap's alpha channel (the PNG/TGA "alpha channel" setting);
-        // the orchestrator path keys off RenderMimeSupportsAlpha(mime). Both end
-        // up at the same JS wantsAlpha gate. Composited capture (CSS3D web
-        // panels present) can never deliver alpha — the panel pixels only exist
-        // in the composite, so the composite wins over the matte.
-        renderCompositedCapture_ = HasVisibleCss3dWebPanels();
-        const bool wantsAlpha = !renderCompositedCapture_ && target->HasAlpha() != 0;
+        const bool wantsAlpha = target->HasAlpha() != 0;
 
         LockToRenderSize(width, height);
         SetWebViewBackgroundTransparent(wantsAlpha);
-        if (renderCompositedCapture_) OverrideRasterizationScaleForCapture(true);
         if (prog) prog->SetTitle(_T("three.js - syncing frame..."));
 
         target->UseScaleColors(0);
@@ -284,9 +164,8 @@
         const int frame = t / GetTicksPerFrame();
         const int warmupMs = renderImageWarmed_ ? 250 : 2000;
         wchar_t msg[384];
-        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":%s,\"composited\":%s,\"pathTracingSamples\":%d}",
+        swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":%s,\"pathTracingSamples\":%d}",
                    width, height, frame, fps, warmupMs, wantsAlpha ? L"true" : L"false",
-                   renderCompositedCapture_ ? L"true" : L"false",
                    pathTracingSamplesPerFrame_);
 
         Interface* ip = GetCOREInterface();
@@ -323,20 +202,11 @@
             Sleep(1);
         }
 
-        // WebView2 CapturePreview composites the transparent canvas onto an
-        // opaque background, so it can never deliver an alpha matte. The default
-        // path therefore decodes renderToImageBase64_ — the canvas read back by
-        // JS as a straight-alpha PNG (render_to_image_ready payload) — so the
-        // alpha channel survives into the Max bitmap. With CSS3D web panels in
-        // the scene the trade inverts: the panels only exist in the composite,
-        // so capture the composited surface and accept the opaque output.
         bool captureOk = false;
         if (prog) prog->SetTitle(_T("three.js - capturing frame..."));
 
         std::string pngBytes;
-        const bool haveBytes = renderCompositedCapture_
-            ? CaptureCompositedImage(pngBytes, /*jpeg*/ false)
-            : (DecodeBase64Wide(renderToImageBase64_, pngBytes) && !pngBytes.empty());
+        const bool haveBytes = DecodeBase64Wide(renderToImageBase64_, pngBytes) && !pngBytes.empty();
         if (haveBytes && !pngBytes.empty()) {
             ComPtr<IStream> stream;
             if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &stream)) && stream) {
@@ -431,75 +301,6 @@
         return true;
     }
 
-    std::wstring RenderSequenceCss3dMaskPath() const {
-        const std::wstring framePath = RenderSequenceFramePath();
-        if (framePath.empty()) return {};
-        std::filesystem::path fsPath(framePath);
-        fsPath.replace_filename(fsPath.stem().wstring() + L"_css3d_mask.png");
-        return fsPath.wstring();
-    }
-
-    bool WriteRenderSequenceCss3dMaskBytes(const std::string& imageBytes, std::wstring& error) {
-        const std::wstring outputPath = RenderSequenceCss3dMaskPath();
-        if (outputPath.empty()) {
-            error = L"Missing CSS3D mask output path";
-            return false;
-        }
-
-        std::error_code ec;
-        const std::filesystem::path fsPath(outputPath);
-        const std::filesystem::path parent = fsPath.parent_path();
-        if (!parent.empty()) std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            error = L"Failed to create CSS3D mask output directory";
-            return false;
-        }
-
-        if (!WriteBinaryFile(outputPath, imageBytes)) {
-            error = L"Failed to write CSS3D mask frame";
-            return false;
-        }
-        return true;
-    }
-
-    bool CaptureCss3dMaskImage(std::string& outBytes, DWORD timeoutMs = 15000) {
-        if (!webview_) return false;
-        if (!renderCss3dMaskEvent_) {
-            renderCss3dMaskEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        }
-        if (!renderCss3dMaskEvent_) return false;
-        renderCss3dMaskBase64_.clear();
-        ResetEvent(renderCss3dMaskEvent_);
-
-        const int fps = GetFrameRate();
-        std::wstringstream msg;
-        msg << L"{\"type\":\"render_css3d_mask_begin\""
-            << L",\"width\":" << renderSequenceWidth_
-            << L",\"height\":" << renderSequenceHeight_
-            << L",\"frame\":" << renderSequenceCurrentFrame_
-            << L",\"fps\":" << fps << L"}";
-        webview_->PostWebMessageAsJson(msg.str().c_str());
-
-        const DWORD start = GetTickCount();
-        while (WaitForSingleObject(renderCss3dMaskEvent_, 0) != WAIT_OBJECT_0) {
-            if (GetTickCount() - start > timeoutMs) {
-                webview_->PostWebMessageAsJson(L"{\"type\":\"render_css3d_mask_end\"}");
-                return false;
-            }
-            MSG winMsg;
-            while (PeekMessage(&winMsg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&winMsg);
-                DispatchMessage(&winMsg);
-            }
-            Sleep(1);
-        }
-
-        const bool ok = DecodeBase64Wide(renderCss3dMaskBase64_, outBytes);
-        renderCss3dMaskBase64_.clear();
-        webview_->PostWebMessageAsJson(L"{\"type\":\"render_css3d_mask_end\"}");
-        return ok && !outBytes.empty();
-    }
-
     void FinishRenderSequence(bool restoreTime = true) {
         if (webview_) {
             webview_->PostWebMessageAsJson(L"{\"type\":\"render_sequence_done\"}");
@@ -520,10 +321,7 @@
         renderSequenceRestoreTime_ = false;
         renderSequenceFirstFrame_ = true;
         renderSequenceAlpha_ = false;
-        renderSequenceComposited_ = false;
-        renderSequenceWriteCss3dMask_ = false;
         renderCameraOverrideActive_ = false;
-        OverrideRasterizationScaleForCapture(false);
         UnlockRenderSize();
         SetWebViewBackgroundTransparent(false);
     }
@@ -536,46 +334,6 @@
         } else {
             PostMessage(hwnd_, WM_RENDER_SEQUENCE_STEP, 0, 0);
         }
-    }
-
-    // Composited sequence frames must NOT be captured from inside the
-    // WebMessageReceived handler: CapturePreview's completion is dispatched
-    // through the same WebView2 event queue the handler occupies, so pumping
-    // there deadlocks until timeout and the sequence dies with zero frames.
-    // The handler posts WM_RENDER_SEQUENCE_CAPTURE instead; this runs on a
-    // clean WndProc stack where the pump can deliver the completion.
-    void PumpRenderSequenceCompositedCapture() {
-        if (!renderSequenceActive_ || !renderSequenceComposited_) return;
-
-        std::string imageBytes;
-        std::wstring error;
-        const bool jpegOut = _wcsicmp(renderSequenceMime_.c_str(), L"image/jpeg") == 0;
-        if (!CaptureCompositedImage(imageBytes, jpegOut) || imageBytes.empty()) {
-            renderSequenceLastError_ = L"Composited capture failed";
-            FinishRenderSequence(false);
-            return;
-        }
-        if (!WriteRenderSequenceFrameBytes(imageBytes, error)) {
-            renderSequenceLastError_ = error;
-            FinishRenderSequence(false);
-            return;
-        }
-        if (renderSequenceWriteCss3dMask_) {
-            std::string maskBytes;
-            if (!CaptureCss3dMaskImage(maskBytes) || maskBytes.empty()) {
-                renderSequenceLastError_ = L"CSS3D mask capture failed";
-                FinishRenderSequence(false);
-                return;
-            }
-            if (!WriteRenderSequenceCss3dMaskBytes(maskBytes, error)) {
-                renderSequenceLastError_ = error;
-                FinishRenderSequence(false);
-                return;
-            }
-        }
-        renderSequenceFrameInFlight_ = false;
-        renderSequenceCurrentFrame_ += renderSequenceStep_;
-        QueueRenderSequenceStep();
     }
 
     void PumpRenderSequenceStep() {
@@ -624,7 +382,6 @@
             << L",\"fps\":" << fps
             << L",\"warmupMs\":" << warmupMs
             << L",\"alpha\":" << (renderSequenceAlpha_ ? L"true" : L"false")
-            << L",\"composited\":" << (renderSequenceComposited_ ? L"true" : L"false")
             << L",\"pathTracingSamples\":" << pathTracingSamplesPerFrame_
             << L",\"mime\":\"" << EscapeJson(renderSequenceMime_.c_str()) << L"\"}";
 
@@ -640,7 +397,6 @@
                              int startFrame,
                              int endFrame,
                              int step,
-                             bool writeCss3dMask,
                              INode* renderViewNode,
                              const ViewParams* renderViewParams) {
         if (basePath.empty() || width <= 0 || height <= 0) return false;
@@ -652,16 +408,12 @@
         Interface* ip = GetCOREInterface();
         renderSequencePreviousTime_ = ip ? ip->GetTime() : 0;
         renderSequenceRestoreTime_ = ip != nullptr;
-        renderSequenceComposited_ = HasVisibleCss3dWebPanels();
-        if (renderSequenceComposited_) OverrideRasterizationScaleForCapture(true);
         renderSequenceActive_ = true;
         renderSequenceQueued_ = false;
         renderSequenceFrameInFlight_ = false;
         renderSequenceBasePath_ = basePath;
         renderSequenceMime_ = mime.empty() ? L"image/png" : mime;
-        // Composited capture is opaque by construction — no alpha matte.
-        renderSequenceAlpha_ = !renderSequenceComposited_ && RenderMimeSupportsAlpha(renderSequenceMime_);
-        renderSequenceWriteCss3dMask_ = writeCss3dMask && renderSequenceComposited_;
+        renderSequenceAlpha_ = RenderMimeSupportsAlpha(renderSequenceMime_);
         renderSequenceWidth_ = width;
         renderSequenceHeight_ = height;
         renderSequenceStartFrame_ = startFrame;
@@ -1246,7 +998,6 @@
         lightHandles_.clear();
         audioHandles_.clear();
         gltfHandles_.clear();
-        webappHandles_.clear();
         hairHandles_.clear();
         helperHandles_.clear();
         deformHandles_.clear();
@@ -1256,7 +1007,6 @@
         lightHashMap_.clear();
         audioHashMap_.clear();
         gltfHashMap_.clear();
-        webappHashMap_.clear();
         propHashMap_.clear();
         geoHashMap_.clear();
         geoFastTriangleCountMap_.clear();
@@ -1326,9 +1076,6 @@
             return 0;
         case WM_RENDER_SEQUENCE_STEP:
             if (p) p->PumpRenderSequenceStep();
-            return 0;
-        case WM_RENDER_SEQUENCE_CAPTURE:
-            if (p) p->PumpRenderSequenceCompositedCapture();
             return 0;
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();

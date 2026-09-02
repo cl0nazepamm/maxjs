@@ -373,7 +373,7 @@ const restartRestoredResult = await manager.mount('restart-restored-params', (ct
     return {};
 }, {
     source: 'inline',
-    entry: 'inlines/restart-restored-params.js',
+    entry: 'scripts/restart-restored-params.js',
     paramValues: {
         speed: 2.75,
         numericLabel: '007',

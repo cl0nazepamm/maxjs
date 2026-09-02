@@ -18,7 +18,7 @@ max.js runs Three.js code against scene data synced from 3ds Max. Treat 3ds Max 
 - Read authored Max data through `ctx.maxScene` / node adapters.
 - Add JS-owned runtime objects through `ctx.js`.
 - Move authored synced objects only through `node.transform.*`; fastsync will overwrite raw `.position` / `.quaternion` edits.
-- Prefer scene-local files: `inlines/*.js` for auto-discovered layers, or `project.maxjs.json` for explicit project layers.
+- Prefer scene-local files: `scripts/*.js` for auto-discovered layers, or `project.maxjs.json` for explicit project layers.
 
 ## Layer Entry Shape
 
@@ -93,7 +93,7 @@ Adapters represent synced Max objects.
 - Writable visibility: `node.visible = false` / `node.visible = true`, plus `node.hide()`, `node.show()`, and `node.resetVisibility()`.
 - Read surfaces: `node.raw` / `node.object` for the current `Object3D`, `node.matrix`, `node.matrixWorld`, `node.base`, and `node.snapshot()`.
 - Three-style world reads: `getWorldPosition(target)`, `getWorldQuaternion(target)`, `getWorldScale(target)`, `getWorldMatrix(target)`. Passing a target is safe; omitting it returns a new object.
-- Geometry sampling: `node.sampleSurface({ point, normal, rng })` returns `{ point, normal, barycentric, triangleIndex, mesh, meshHandle, meshName }`. Use `count` for multiple area-weighted samples.
+- Geometry sampling: `node.sampleSurface({ point, normal, rng })` returns `{ point, normal, barycentric, uv, triangleIndex, material, materialIndex, materialName, mesh, meshHandle, meshName }`. Use `count` for independent area-weighted samples; use `seed` instead of implicit randomness for snapshot-safe procedural placement. Add `normalMode: 'smooth'`, `materials`, or `areaSpace: 'world'` only when needed. Skinned/morph/GPU-deformed world-area and smooth-normal sampling are outside v1.
 - Anchors: `node.createAnchor(options)`.
 - Runtime clone: `node.clone(options)` mirrors `ctx.js.cloneFromMax(node, options)` and returns a runtime-owned `Object3D`.
 - Path-scoped runtime property overrides: `node.overrides.setProperty(property, value, options)`, `node.overrides.clearProperty(property, options)`, and `node.overrides.hasProperty(property)`.
@@ -116,12 +116,15 @@ Use orientation helpers before gameplay/rig work. max.js runtime is Three.js Y-u
 - `ctx.js.setSnapshotId(obj, id)` so snapshot export can target stable objects
 - `ctx.js.cloneFromMax(handleOrNameOrAdapter, options)` creates a runtime-owned clone from a synced Max mesh and registers it under the layer root for cleanup/snapshot export.
 - `ctx.js.cloneManyFromMax(nodes, optionsOrFn)` clones a list of adapters/handles/names.
+- `ctx.js.instanceFromMax(node, { capacity, geometry, materials, snapshotId })` creates a fixed-capacity layer-owned `THREE.InstancedMesh`. `geometry`/`materials` are `follow` (default) or `clone`; neither mode duplicates resources per instance. `materials: 'clone'` is intentionally rejected for NodeMaterial/TSL sources in v1 because Three.js only shallow-clones their node graphs.
 - `ctx.js.traverse(cb)` / `ctx.js.traverseScene(cb)` traverse the layer's own group / the whole scene.
 
 After changing runtime object ownership, cleanup, clone placement, or layer teardown, run:
 
 ```powershell
 node tools/runtime-layer-lifecycle-smoke.mjs
+node tools/layer-mesh-reuse-smoke.mjs
+node tools/layer-surface-sampling-smoke.mjs
 ```
 
 Clone placement options are intentionally direct:
@@ -143,6 +146,83 @@ const cans = ctx.maxScene.under('Items_Grp', { meshOnly: true });
 const sample = ctx.maxScene.findOne('Shelf_Surface')?.sampleSurface();
 if (sample) ctx.js.cloneFromMax(cans[0], { at: sample, align: 'visualCenter' });
 ```
+
+## Procedural Mesh Reuse and Modular Kits
+
+Use `ctx.js.instanceFromMax()` for one static source mesh. Capacity is fixed and
+capped at 100,000 per batch to reject accidental runaway allocations,
+placement is world-space by default (centimeters, Y-up), `add()` returns a dense
+index or `-1`, and `removeAt()` swap-removes the last index. Call `flush()` after
+a mutation batch. Negative-determinant matrices and three.js Deform, skinned,
+batched, or morph-target sources are rejected in v1. A custom `parent` must be
+inside the current layer's JS or overlay root. Passing no transform preserves an
+authored matrix exactly, including shear; pass a full `Matrix4` when later
+placements must preserve shear too.
+
+```js
+const blocks = ctx.js.instanceFromMax('Block_A', {
+    capacity: 1000,
+    geometry: 'follow',
+    materials: 'follow',
+    snapshotId: 'blocks',
+});
+blocks.addMany(transforms); // flushes once by default
+```
+
+Follow mode preserves the exact authoritative Multi/Sub/TSL resource identity
+and adopts source replacements before layer update. Never mutate a followed
+`raw.geometry` or `raw.material`. Classic materials can use
+`{ geometry: 'clone', materials: 'clone' }` for one isolated resource set per
+batch, and `refresh()` to recapture it. TSL/NodeMaterial sources must keep
+`materials: 'follow'` in v1; clone mode fails early instead of sharing a mutable
+node graph accidentally.
+
+`sampleSurface({ count })` likewise accepts an integer up to 100,000. Split
+larger procedural work into deterministic chunks instead of blocking a frame.
+
+Use `ctx.kits.capture()` when a hierarchy contains several module meshes and
+socket helpers. Prefer stable Max User Defined Properties over names:
+
+```text
+module = wall
+socket = east
+socketFor = wall
+```
+
+```js
+const kit = ctx.kits.capture('KIT_Building');
+const walls = kit.module('wall').createInstances({
+    capacity: 512,
+    snapshotId: 'walls',
+});
+const corners = kit.module('corner').createInstances({
+    capacity: 128,
+    snapshotId: 'corners',
+});
+
+const wall = walls.add({ at: [0, 0, 0] });
+corners.addAtSocket('west', walls.getSocketMatrixAt(wall, 'east'));
+walls.flush();
+corners.flush();
+```
+
+`kit.module(id)` / `getPart(id)` returns a frozen module record with
+`createInstances()`, `instantiate()`, `sockets`, and `getSocket()`. The kit also
+has `instantiate()` for one hierarchy copy and `createInstances()` for repeating
+the whole multi-part prefab. Explicit module IDs must be unique. Whole-kit
+socket IDs are module-qualified (`wall:east`); module batches use local IDs
+(`east`). Socket alignment is `targetWorld * inverse(socketLocal)`. Whole-kit
+`batches` are read-only views so their dense indices cannot be structurally
+desynchronized. One-off `instantiate()` paths are classic-material-only in v1;
+use `createInstances()` for exact followed TSL materials. `kitBatch.raw` is the
+explicit advanced Three.js escape hatch; traversing it and mutating child
+InstancedMesh state bypasses the safe alignment API.
+
+Generated InstancedMesh counts/matrices serialize through `runtimeScene` with
+no M3 schema extension. Exact TSL parity depends on successful layer-sidecar
+replay on a node-material-capable backend (WebGPU or TSL_GL); the baked emergency
+runtime tree intentionally converts NodeMaterial types to classic materials.
+Never describe the baked tree alone as exact TSL fallback.
 
 ## Moving Synced Objects
 
@@ -184,7 +264,7 @@ This is the preferred API for light cookies/gobos, runtime-only texture slots, a
 
 ```js
 const spot = ctx.maxScene.findOne('TJS_Spot');
-const texture = ctx.js.own(new THREE.TextureLoader().load('./inlines/cookie.png'));
+const texture = ctx.js.own(new THREE.TextureLoader().load('./scripts/cookie.png'));
 texture.colorSpace = THREE.SRGBColorSpace;
 
 spot.overrides.setProperty('map', texture, {
@@ -220,7 +300,6 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 - `ctx.bus`: shared event bus, auto-unsubscribed on dispose. Max-driven events: `max:selection` `{ selected, added, removed }` (handle arrays), and `max:time:play` / `max:time:pause` / `max:time:seek` (timeline snapshot `{ seconds, frame, fps, playing }`).
 - `ctx.anim`: Max authored-animation playback — `list()` (`{ id, name, duration, time, playing, speed, loop }`), `play(id)`, `pause(id)`, `stop(id)`, `setTime(id, seconds)`, `setSpeed(id, factor)`, `setLoop(id, mode)`, `seekAll(seconds)`, `isPlaying(id)`. Empty list / no-op false when no animations are loaded.
 - `ctx.audio`: Max audio origins + layer SFX — `list()`, `play(handle)`, `stop(handle)`, `setVolume(handle, v)` (holds until Max re-syncs that origin), `muted`, and `playOneShot(url, { volume, position, refDistance, loop })` → `{ stop(), active }`. Positional when `position` (Vector3 or `[x,y,z]` world) is given; one-shots are silenced automatically on layer dispose. Audio requires a prior user gesture (browser autoplay policy) — one-shots fired before that are dropped.
-- `ctx.webapp.create(spec)`: mounts a WebApp Animator HTML overlay layer owned by this layer.
 - `ctx.services`: shared service registry between layers.
 - `ctx.runtime`: runtime metadata and helpers; includes `ctx.runtime.gltf`.
 - `ctx.spectral`: authored spectral material overrides. `setNirAlbedo(selector, value)` assigns scalar NIR reflectance without requiring a TSL material and returns a disposable live handle.
@@ -345,7 +424,7 @@ Rules and behavior:
 - Returned handle: `fx.params`, `fx.uniform(name)`, `fx.matched` (handles), `fx.active`, `fx.dispose()` (restores the original material nodes). Disposal is automatic on layer dispose/hot reload.
 - Deformation binds per material: meshes sharing one Max material deform together. Assign a unique material in Max to isolate one object.
 - Geometry stays at rest on the CPU — `ctx.maxScene.raycast` and `sampleSurface` read undeformed positions.
-- TSL nodes must follow the three.js `0.184` chaining rules (see TSL Material Snippets below).
+- TSL nodes must follow the three.js `0.185.0` chaining rules (see TSL Material Snippets below).
 - The three.js Deform modifier flag is NOT required for `ctx.deform.attach`. Use the flag as the authoring marker (`n => n.jsmod` / `listJsmodNodes()`); it IS mandatory for `ctx.deform.simulate` and any other buffer-writing deformation because it stops fastsync geometry rebuilds from stomping the buffers.
 
 ### `ctx.deform.simulate` — Stateful Compute Simulation
@@ -440,7 +519,7 @@ material.alphaTestNode = ...;
 material.positionNode = ...; // vertex displacement
 ```
 
-TSL in this repo is Three.js `0.184`. Use method chaining, not JS infix operators:
+TSL in this repo is Three.js `0.185.0`. Use method chaining, not JS infix operators:
 
 ```js
 const t = TSL.time.mul(params.strength);
@@ -490,5 +569,5 @@ Before shipping runtime code:
 - Does it read through `ctx.maxScene` and write through `ctx.js` or `node.transform`?
 - Are all runtime objects tracked/owned for cleanup and snapshot export?
 - Are TSL parameters declared with stable `// @param` names?
-- Are TSL nodes valid for Three.js `0.184`?
+- Are TSL nodes valid for Three.js `0.185.0`?
 - Do TSL defaults and physical params match **max.js cm unit scale** (not meter-based Three.js example values)?

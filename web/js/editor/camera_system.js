@@ -20,6 +20,7 @@ function createCameraSystem(deps = {}) {
         const selSceneCamera = document.getElementById('selSceneCamera');
         let knownSceneCameras = [];
         let layerHostFrame = null;
+        let viewportCameraSeeded = false;
 
         function updateSceneCameraList(cameras, lockedHandle) {
             knownSceneCameras = cameras || [];
@@ -54,16 +55,17 @@ function createCameraSystem(deps = {}) {
             el.disabled = layerOwned;
             el.title = layerOwned
                 ? `Camera owned by runtime layer — ${layerMode} mode overrides viewer lock`
-                : deps.camLock ? 'Camera lock on — orbit disabled' : 'Camera lock off — orbit enabled';
+                : deps.camLock ? 'Camera lock on — navigation disabled' : 'Camera lock off — orbit/pan enabled';
             el.setAttribute('aria-pressed', deps.camLock ? 'true' : 'false');
             el.setAttribute('aria-label', layerOwned
                 ? 'Camera controlled by runtime layer'
-                : deps.camLock ? 'Camera lock on' : 'Camera lock off');
+                : deps.camLock ? 'Camera lock on' : 'Camera lock off — orbit and pan');
         }
 
         function syncCameraControlAvailability() {
             if (!deps.controls || deps.xrRuntime?.active) return false;
             const layerMode = deps.layerManager?.cameraMode ?? 'viewport';
+            if (layerMode === 'viewport') deps.controls.enableZoom = false;
             const enabled = layerMode === 'script'
                 ? deps.layerManager?.cameraControlsMode === 'viewer'
                 : layerMode === 'physical'
@@ -181,7 +183,16 @@ function createCameraSystem(deps = {}) {
             const layerCameraMode = deps.layerManager?.cameraMode ?? 'viewport';
             if (deps.xrRuntime?.active) return;
             if (layerCameraMode === 'script') return;
-            if (!deps.renderToImageActive && !deps.camLock && layerCameraMode !== 'physical') return;
+            // A persisted unlocked viewport still needs one authored Max camera
+            // packet for its initial pose. After that seed, unlocked navigation
+            // is fully local and later Max camera packets are ignored.
+            const seedUnlockedViewport = layerCameraMode === 'viewport'
+                && !deps.camLock
+                && !viewportCameraSeeded;
+            if (!deps.renderToImageActive
+                && !deps.camLock
+                && layerCameraMode !== 'physical'
+                && !seedUnlockedViewport) return;
             if (!deps.isFiniteArray(cam?.pos, 3) || !deps.isFiniteArray(cam?.tgt, 3) || !deps.isFiniteArray(cam?.up, 3)) {
                 return;
             }
@@ -216,6 +227,7 @@ function createCameraSystem(deps = {}) {
             }
             deps.controls.target.copy(deps.cameraTargetWorld);
             syncOrbitNavigationFeel();
+            if (layerCameraMode === 'viewport') viewportCameraSeeded = true;
 
             // Forward Physical Camera DOF to post-fx when available
             deps.physicalCameraDofActive = !!cam.dofEnabled;
@@ -343,28 +355,6 @@ function createCameraSystem(deps = {}) {
             deps.controls.update();
         }
 
-        function fitCamera() {
-            deps.scene.updateMatrixWorld(true);
-            const box = computeVisibleSceneBounds(new THREE.Box3());
-            if (box.isEmpty()) return;
-            const center = box.getCenter(new THREE.Vector3());
-            const size = box.getSize(new THREE.Vector3());
-            const maxDim = Math.max(size.x, size.y, size.z);
-            deps.controls.target.copy(center);
-            if (deps.camera.isPerspectiveCamera) {
-                const verticalFov = THREE.MathUtils.degToRad(deps.camera.fov || 60);
-                const fitDistance = maxDim / Math.max(0.2, 2 * Math.tan(verticalFov * 0.5));
-                deps.camera.position.copy(center).addScaledVector(deps.cameraDefaultDirection, fitDistance * 1.15);
-            } else {
-                deps.camera.position.copy(center).addScaledVector(deps.cameraDefaultDirection, Math.max(maxDim, 1) * 1.15);
-            }
-            deps.camera.near = Math.max(deps.DEFAULT_CAMERA_NEAR, maxDim * 0.001);
-            deps.camera.far = Math.max(1000, maxDim * 100);
-            deps.applyCameraClipOverrides(deps.camera);
-            syncOrbitNavigationFeel();
-            deps.controls.update();
-        }
-
         function syncOrbitNavigationFeel() {
             const distance = Math.max(0.01, deps.camera.position.distanceTo(deps.controls.target));
             const box = computeVisibleSceneBounds(new THREE.Box3());
@@ -395,7 +385,6 @@ function createCameraSystem(deps = {}) {
             computeVisibleSceneBounds,
             serializeCurrentCameraState,
             applyStandaloneCameraState,
-            fitCamera,
             syncOrbitNavigationFeel,
             getKnownSceneCameras,
         };

@@ -34,6 +34,17 @@ export default {
         traaPass.maxVelocityLength = state.traa.maxVelocityLength;
         ctx.applyNodeResolutionScale(traaPass);
         ctx.pushNode(traaPass);
+        ctx.setActivePass('traa', traaPass);
         return vec4(traaPass.rgb, ctx.beautyAlpha);
+    },
+    update(ctx) {
+        const pass = ctx.getActivePass('traa');
+        if (!pass) return;
+        const t = ctx.state.traa;
+        pass.useSubpixelCorrection = t.useSubpixelCorrection;
+        pass.depthThreshold = t.depthThreshold;
+        pass.edgeDepthDiff = t.edgeDepthDiff;
+        pass.maxVelocityLength = t.maxVelocityLength;
+        ctx.applyNodeResolutionScale(pass);
     },
 };

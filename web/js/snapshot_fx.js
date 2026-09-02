@@ -43,11 +43,20 @@ export async function createSnapshotFx({
 
     const descriptors = await loadEffects(descriptorIds);
 
+    const descriptorDefaults = new Map();
     const state = {};
     for (const descriptor of descriptors) {
-        state[descriptor.id] = cloneEffectDefaults(descriptor.defaults);
+        const defaults = cloneEffectDefaults(descriptor.defaults);
+        descriptorDefaults.set(descriptor.id, defaults);
+        state[descriptor.id] = cloneEffectDefaults(defaults);
     }
-    state.powershot = { enabled: false, mode: 'digital', preset: 'powershot', freezeNoise: false };
+    const powerShotDefaults = Object.freeze({
+        enabled: false,
+        mode: 'digital',
+        preset: 'powershot',
+        freezeNoise: false,
+    });
+    state.powershot = { ...powerShotDefaults };
 
     let mainLight = null;
     let envVisible = environmentVisible !== false;
@@ -130,6 +139,7 @@ export async function createSnapshotFx({
 
     let pipelineReady = false;
     let restored = false;
+    let disposed = false;
     let lastWidth = 0;
     let lastHeight = 0;
     let lastPixelRatio = 1;
@@ -171,6 +181,23 @@ export async function createSnapshotFx({
         return core.anyEffectActive() || !!powerShotFinal?.isActive();
     }
 
+    function topologySignature() {
+        const topology = descriptors.map((descriptor) => {
+            const effectState = state[descriptor.id] ?? {};
+            const keys = new Set(['enabled', ...(descriptor.topologyKeys ?? [])]);
+            for (const [key, value] of Object.entries(effectState)) {
+                if (typeof value === 'boolean' || typeof value === 'string') keys.add(key);
+            }
+            return [descriptor.id, [...keys].sort().map((key) => [key, effectState[key]])];
+        });
+        topology.push(['powershot', [
+            ['enabled', state.powershot?.enabled === true],
+            ['mode', String(state.powershot?.mode ?? 'digital')],
+            ['preset', String(state.powershot?.preset ?? 'powershot')],
+        ]]);
+        return JSON.stringify(topology);
+    }
+
     // The editor clears the CSS colorGrading filter while PowerShot is active
     // (PowerShot grades its own output). applySnapshotCoreLook may have set
     // the filter from fx.colorGrading before we got here.
@@ -203,6 +230,13 @@ export async function createSnapshotFx({
         }
     }
 
+    function refreshOutputSize() {
+        if (!pipelineReady) return;
+        core.refreshResolutionScales();
+        core.postProcessing.needsUpdate = true;
+        snapshotRendererSize();
+    }
+
     // Shader Lab enable() resolves asynchronously (esm.sh fetch) and retro /
     // PS1 wiggle yield to it — same listener contract as the editor facade.
     if (typeof window !== 'undefined' && wantsShaderLab) {
@@ -221,17 +255,22 @@ export async function createSnapshotFx({
          * @param extras  { shaderLab } — snapshotUi.shaderLab ({config, enabled, passes})
          */
         restoreState(fx = {}, extras = {}) {
+            const previousTopology = topologySignature();
             for (const descriptor of descriptors) {
                 const source = fx?.[descriptor.id];
-                if (!source || typeof source !== 'object') continue;
-                state[descriptor.id] = { ...state[descriptor.id], ...source };
+                const incoming = source && typeof source === 'object' ? source : {};
+                state[descriptor.id] = {
+                    ...cloneEffectDefaults(descriptorDefaults.get(descriptor.id)),
+                    ...incoming,
+                };
                 for (const [key, value] of Object.entries(state[descriptor.id])) {
                     if (Array.isArray(value)) state[descriptor.id][key] = [...value];
                 }
             }
-            if (fx?.powershot && typeof fx.powershot === 'object') {
-                state.powershot = { ...state.powershot, ...fx.powershot };
-            }
+            state.powershot = {
+                ...powerShotDefaults,
+                ...(fx?.powershot && typeof fx.powershot === 'object' ? fx.powershot : {}),
+            };
             if (powerShotFinal?.hasPipeline()) powerShotFinal.syncPipeline();
 
             const shaderLabState = extras?.shaderLab;
@@ -241,12 +280,20 @@ export async function createSnapshotFx({
                     shaderLabFx.enable(shaderLabState).catch((error) => {
                         console.warn('[snapshot_fx] Shader Lab enable failed (offline?); continuing without it', error);
                     });
+                } else if (shaderLabState.enabled === false && shaderLabFx.isEnabled()) {
+                    shaderLabFx.disable();
                 }
             }
 
+            const shouldRebuild = !restored || previousTopology !== topologySignature();
             restored = true;
             findMainLight();
-            rebuild();
+            if (shouldRebuild) rebuild();
+            else {
+                core.syncSharedSceneEffects();
+                if (pipelineReady) core.updatePerFrame();
+                syncCanvasFilterForPowerShot();
+            }
         },
 
         /** Editor's environmentVisible flag (HDRI shown as backdrop). */
@@ -314,7 +361,7 @@ export async function createSnapshotFx({
             const numeric = Number(scale);
             if (!Number.isFinite(numeric)) return resolutionScale;
             resolutionScale = THREE.MathUtils.clamp(numeric, 0.25, 1.0);
-            if (restored) rebuild();
+            if (restored) refreshOutputSize();
             return resolutionScale;
         },
 
@@ -336,7 +383,7 @@ export async function createSnapshotFx({
 
         render() {
             if (pipelineReady && rendererSizeChanged()) {
-                rebuild();
+                refreshOutputSize();
             }
             core.updateFrameTimers();
             syncCanvasFilterForPowerShot();
@@ -386,6 +433,7 @@ export async function createSnapshotFx({
             // without bound (the viewer has never leaked here because
             // maxjs_fx.js already does it this way; see
             // syncRendererResizeState, which carries the same reasoning).
+            core.refreshResolutionScales();
             core.postProcessing.needsUpdate = true;
             // Recording the new size HERE is half the fix, not bookkeeping:
             // render() below runs the same rendererSizeChanged() check and
@@ -397,6 +445,8 @@ export async function createSnapshotFx({
         },
 
         dispose() {
+            if (disposed) return;
+            disposed = true;
             pipelineReady = false;
             core.teardownPipeline();
             powerShotFinal?.dispose?.();

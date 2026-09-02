@@ -85,8 +85,6 @@ function createRendererCore(deps = {}) {
                 applyFrameElementStyle(deps.blobOverlayCvs, rect);
             }
             deps.compositionOverlay?.resize(rect);
-            deps.css3dOverlay.setSize(rect.width, rect.height);
-            deps.css3dOverlay.setViewportRect(rect);
             if (resizePostFx) {
                 deps.maxjsFx.resize();
                 deps.webglBasicFx.resize?.();
@@ -121,8 +119,6 @@ function createRendererCore(deps = {}) {
             deps.maxjsFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
             deps.webglBasicFx.setResolutionScale?.(getEffectivePostFxResolutionScale());
             updateCameraProjectionForViewportRect();
-            deps.css3dOverlay.setSize(rect.width, rect.height);
-            deps.css3dOverlay.setViewportRect(rect);
             if (resizePostFx) {
                 deps.maxjsFx.resize();
                 deps.webglBasicFx.resize?.();

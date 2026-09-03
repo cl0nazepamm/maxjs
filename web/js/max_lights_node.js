@@ -122,6 +122,10 @@ function maskContributes(lightIdNode, maskLoNode, maskHiNode) {
     return or(not(isLinked), maskHit);
 }
 
+function materialIgnoresLightLinks(builder) {
+    return builder?.material?.userData?.maxjsIgnoreLightLinks === true;
+}
+
 function createMaskNodes(maskDefaults) {
     const ready = userData(LIGHT_MASK_READY_KEY, 'uint')
         .setGroup(objectGroup)
@@ -137,6 +141,83 @@ function writeIds(target, lights, maxCount) {
     for (let i = 0; i < count; i++) {
         const id = lights[i]?.userData?.maxjsLightId;
         target[i] = Number.isInteger(id) && id >= 0 && id < 64 ? id : UNLINKED_ID;
+    }
+}
+
+// VolumeNodeMaterial ignores direct-light nodes whose backing light does not
+// expose a `distance` member. Three's r185 point/spot batch nodes use a
+// synthetic `{ light: {} }`, so installing DynamicLightsNode globally makes
+// those finite lights disappear from volumetric scattering. The value is only
+// a type marker here; attenuation still comes from each batch's cutoff array.
+const FINITE_DISTANCE_LIGHT_NODE = Object.freeze({
+    light: Object.freeze({ distance: 0 }),
+    shadowNode: null,
+});
+
+// ── Unlinked point / spot ───────────────────────────────
+// These are otherwise verbatim r185 data nodes. Supplying the finite-light
+// marker preserves the stock batched path for regular materials and restores
+// VolumeNodeMaterial compatibility.
+class FinitePointLightDataNode extends PointLightDataNode {
+    setup(builder) {
+        const surfacePosition = builder.context.positionView || positionView;
+        const { lightingModel, reflectedLight } = builder.context;
+        const dynDiffuse = vec3(0).toVar('maxjsStockPointDiffuse');
+        const dynSpecular = vec3(0).toVar('maxjsStockPointSpecular');
+        Loop(this.countNode, ({ i }) => {
+            const positionAndCutoff = this.positionsAndCutoffNode.element(i);
+            const lightViewPosition = positionAndCutoff.xyz;
+            const cutoffDistance = positionAndCutoff.w;
+            const decayExponent = this.decaysNode.element(i).x;
+            const lightVector = lightViewPosition.sub(surfacePosition).toVar();
+            const lightDirection = lightVector.normalize().toVar();
+            const lightDistance = lightVector.length();
+            const attenuation = getDistanceAttenuation({ lightDistance, cutoffDistance, decayExponent });
+            const lightColor = this.colorsNode.element(i).mul(attenuation).toVar();
+            lightingModel.direct({
+                lightDirection,
+                lightColor,
+                lightNode: FINITE_DISTANCE_LIGHT_NODE,
+                reflectedLight: { directDiffuse: dynDiffuse, directSpecular: dynSpecular },
+            }, builder);
+        });
+        reflectedLight.directDiffuse.addAssign(dynDiffuse);
+        reflectedLight.directSpecular.addAssign(dynSpecular);
+    }
+}
+
+class FiniteSpotLightDataNode extends SpotLightDataNode {
+    setup(builder) {
+        const surfacePosition = builder.context.positionView || positionView;
+        const { lightingModel, reflectedLight } = builder.context;
+        const dynDiffuse = vec3(0).toVar('maxjsStockSpotDiffuse');
+        const dynSpecular = vec3(0).toVar('maxjsStockSpotSpecular');
+        Loop(this.countNode, ({ i }) => {
+            const positionAndCutoff = this.positionsAndCutoffNode.element(i);
+            const lightViewPosition = positionAndCutoff.xyz;
+            const cutoffDistance = positionAndCutoff.w;
+            const directionAndDecay = this.directionsAndDecayNode.element(i);
+            const spotDirection = directionAndDecay.xyz;
+            const decayExponent = directionAndDecay.w;
+            const cone = this.conesNode.element(i);
+            const coneCos = cone.x;
+            const penumbraCos = cone.y;
+            const lightVector = lightViewPosition.sub(surfacePosition).toVar();
+            const lightDirection = lightVector.normalize().toVar();
+            const lightDistance = lightVector.length();
+            const angleCos = lightDirection.dot(spotDirection);
+            const spotAttenuation = smoothstep(coneCos, penumbraCos, angleCos);
+            const distanceAttenuation = getDistanceAttenuation({ lightDistance, cutoffDistance, decayExponent });
+            const lightColor = this.colorsNode.element(i).mul(spotAttenuation).mul(distanceAttenuation).toVar();
+            lightingModel.direct({
+                lightDirection,
+                lightColor,
+                lightNode: FINITE_DISTANCE_LIGHT_NODE,
+                reflectedLight: { directDiffuse: dynDiffuse, directSpecular: dynSpecular },
+            }, builder);
+        });
+        reflectedLight.directDiffuse.addAssign(dynDiffuse);
+        reflectedLight.directSpecular.addAssign(dynSpecular);
     }
 }
 
@@ -193,9 +274,9 @@ class MaskedPointLightDataNode extends PointLightDataNode {
         const { lightingModel, reflectedLight } = builder.context;
         const dynDiffuse = vec3(0).toVar('maxjsPointDiffuse');
         const dynSpecular = vec3(0).toVar('maxjsPointSpecular');
+        const ignoreLightLinks = materialIgnoresLightLinks(builder);
         Loop(this.countNode, ({ i }) => {
-            const lightId = this.idsNode.element(i);
-            If(maskContributes(lightId, loNode, hiNode), () => {
+            const applyLight = () => {
                 const positionAndCutoff = this.positionsAndCutoffNode.element(i);
                 const lightViewPosition = positionAndCutoff.xyz;
                 const cutoffDistance = positionAndCutoff.w;
@@ -208,10 +289,12 @@ class MaskedPointLightDataNode extends PointLightDataNode {
                 lightingModel.direct({
                     lightDirection,
                     lightColor,
-                    lightNode: { light: {}, shadowNode: null },
+                    lightNode: FINITE_DISTANCE_LIGHT_NODE,
                     reflectedLight: { directDiffuse: dynDiffuse, directSpecular: dynSpecular },
                 }, builder);
-            });
+            };
+            if (ignoreLightLinks) applyLight();
+            else If(maskContributes(this.idsNode.element(i), loNode, hiNode), applyLight);
         });
         reflectedLight.directDiffuse.addAssign(dynDiffuse);
         reflectedLight.directSpecular.addAssign(dynSpecular);
@@ -236,9 +319,9 @@ class MaskedSpotLightDataNode extends SpotLightDataNode {
         const { lightingModel, reflectedLight } = builder.context;
         const dynDiffuse = vec3(0).toVar('maxjsSpotDiffuse');
         const dynSpecular = vec3(0).toVar('maxjsSpotSpecular');
+        const ignoreLightLinks = materialIgnoresLightLinks(builder);
         Loop(this.countNode, ({ i }) => {
-            const lightId = this.idsNode.element(i);
-            If(maskContributes(lightId, loNode, hiNode), () => {
+            const applyLight = () => {
                 const positionAndCutoff = this.positionsAndCutoffNode.element(i);
                 const lightViewPosition = positionAndCutoff.xyz;
                 const cutoffDistance = positionAndCutoff.w;
@@ -258,10 +341,12 @@ class MaskedSpotLightDataNode extends SpotLightDataNode {
                 lightingModel.direct({
                     lightDirection,
                     lightColor,
-                    lightNode: { light: {}, shadowNode: null },
+                    lightNode: FINITE_DISTANCE_LIGHT_NODE,
                     reflectedLight: { directDiffuse: dynDiffuse, directSpecular: dynSpecular },
                 }, builder);
-            });
+            };
+            if (ignoreLightLinks) applyLight();
+            else If(maskContributes(this.idsNode.element(i), loNode, hiNode), applyLight);
         });
         reflectedLight.directDiffuse.addAssign(dynDiffuse);
         reflectedLight.directSpecular.addAssign(dynSpecular);
@@ -314,8 +399,8 @@ const MASKED_DATA_CLASSES = {
 const STOCK_DATA_CLASSES = {
     AmbientLight: AmbientLightDataNode,
     DirectionalLight: DirectionalLightDataNode,
-    PointLight: PointLightDataNode,
-    SpotLight: SpotLightDataNode,
+    PointLight: FinitePointLightDataNode,
+    SpotLight: FiniteSpotLightDataNode,
     HemisphereLight: HemisphereLightDataNode,
 };
 
@@ -669,7 +754,9 @@ export default class MaxLightsNode extends DynamicLightsNode {
     // already shadow-scaled color by the per-mesh mask so the same userData masks
     // apply uniformly across every light type.
     setupDirectLight(builder, lightNode, lightData) {
-        const factor = maskFactorForLight(lightNode?.light, this._maskDefaults);
+        const factor = materialIgnoresLightLinks(builder)
+            ? null
+            : maskFactorForLight(lightNode?.light, this._maskDefaults);
         super.setupDirectLight(
             builder,
             lightNode,
@@ -678,7 +765,9 @@ export default class MaxLightsNode extends DynamicLightsNode {
     }
 
     setupDirectRectAreaLight(builder, lightNode, lightData) {
-        const factor = maskFactorForLight(lightNode?.light, this._maskDefaults);
+        const factor = materialIgnoresLightLinks(builder)
+            ? null
+            : maskFactorForLight(lightNode?.light, this._maskDefaults);
         super.setupDirectRectAreaLight(
             builder,
             lightNode,

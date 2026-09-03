@@ -20,6 +20,9 @@ function volState(ctx) {
             mesh: null,
             noiseTexture: null,
             lightsEnabled: [],
+            sceneBoundsCenter: new THREE.Vector3(),
+            sceneBoundsRadius: 250,
+            cameraPosition: new THREE.Vector3(),
             densityU: uniform(0.5),
             intensityU: uniform(1.0),
             denoiseU: uniform(0.6),
@@ -50,6 +53,47 @@ function getOrCreateVolNoise(v) {
     return tex;
 }
 
+function refreshVolumetricSceneBounds(ctx, v) {
+    const box = new THREE.Box3();
+    ctx.scene.traverse(obj => {
+        if (
+            obj.isMesh
+            && obj !== v.mesh
+            && !obj.userData?.volumetricBoundsBypass
+            && obj.visible
+            && obj.geometry
+        ) {
+            const pos = obj.geometry.getAttribute?.('position');
+            if (pos && pos.count > 0) box.expandByObject(obj);
+        }
+    });
+
+    if (box.isEmpty()) {
+        v.sceneBoundsCenter.set(0, 0, 0);
+        v.sceneBoundsRadius = 250;
+        return;
+    }
+
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    v.sceneBoundsCenter.copy(sphere.center);
+    v.sceneBoundsRadius = Math.max(sphere.radius, 0.5);
+}
+
+function syncVolumetricBounds(ctx) {
+    const v = volState(ctx);
+    if (!v.mesh || !ctx.camera) return;
+
+    // Keep the camera inside a uniform enclosure while still containing the
+    // visible scene. The old scene-AABB box exposed its rectangular boundary
+    // whenever the camera sat outside or near one of its faces.
+    ctx.camera.getWorldPosition(v.cameraPosition);
+    const enclosingRadius = v.cameraPosition.distanceTo(v.sceneBoundsCenter) + v.sceneBoundsRadius;
+    const diameter = Math.max(enclosingRadius * 2.1, 1);
+    v.mesh.position.copy(v.cameraPosition);
+    v.mesh.scale.setScalar(diameter);
+    v.mesh.updateMatrixWorld();
+}
+
 function ensureVolumetricMesh(ctx) {
     const v = volState(ctx);
     const noiseTex = getOrCreateVolNoise(v);
@@ -58,6 +102,9 @@ function ensureVolumetricMesh(ctx) {
     if (!v.mesh) {
         const volMat = new THREE.VolumeNodeMaterial();
         volMat.steps = ctx.state.volumetric.steps;
+        // Volumetric scattering is a global atmosphere pass, not a surface.
+        // Per-object include/exclude light masks must not gate its lights.
+        volMat.userData.maxjsIgnoreLightLinks = true;
         // Volumetric light should respond only to explicit scene lights.
         // Letting scene.environment drive this material makes HDRI/env slot
         // changes wash out or override the intended volumetric contribution.
@@ -85,34 +132,8 @@ function ensureVolumetricMesh(ctx) {
         v.mesh.material.steps = ctx.state.volumetric.steps;
     }
 
-    // Size to scene bounds
-    const box = new THREE.Box3();
-    ctx.scene.traverse(obj => {
-        if (
-            obj.isMesh
-            && obj !== v.mesh
-            && !obj.userData?.volumetricBoundsBypass
-            && obj.visible
-            && obj.geometry
-        ) {
-            const pos = obj.geometry.getAttribute?.('position');
-            if (pos && pos.count > 0) box.expandByObject(obj);
-        }
-    });
-    if (!box.isEmpty()) {
-        const center = box.getCenter(new THREE.Vector3());
-        const sz = box.getSize(new THREE.Vector3());
-        const pad = 2.0;
-        v.mesh.position.copy(center);
-        v.mesh.scale.set(
-            Math.max(sz.x * pad, 1),
-            Math.max(sz.y * pad, 1),
-            Math.max(sz.z * pad, 1)
-        );
-    } else {
-        v.mesh.position.set(0, 0, 0);
-        v.mesh.scale.set(500, 500, 500);
-    }
+    refreshVolumetricSceneBounds(ctx, v);
+    syncVolumetricBounds(ctx);
     v.mesh.visible = true;
 
     syncVolumetricLightLayers(ctx);
@@ -204,6 +225,7 @@ export default {
         }
     },
     update(ctx) {
+        syncVolumetricBounds(ctx);
         syncVolumetricLightLayers(ctx);
     },
     deactivate(ctx) {

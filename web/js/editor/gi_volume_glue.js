@@ -30,6 +30,7 @@ function createGiVolumeGlue(deps = {}) {
             enabled: deps.isStudioMode && window.MAXJS_SPEEDBALL_GI !== false,
             intensity: 10,
             divisions: 16,
+            autoPadding: 1,
             rays: 64,
             cascades: 1,
             continuous: true,
@@ -55,6 +56,7 @@ function createGiVolumeGlue(deps = {}) {
         const SPEEDBALL_GI_NUMERIC_CONTROLS = Object.freeze([
             { key: 'intensity', label: 'Intensity', min: 0, max: 32, step: 0.05, digits: 1 },
             { key: 'divisions', label: 'Divisions', min: 2, max: 32, step: 1, digits: 0 },
+            { key: 'autoPadding', label: 'Auto Padding', hint: 'Automatic field safety margin: 0 = tight bounds, 1 = current margin, 2 = double. Rebuilds the field; custom probe volumes are unchanged.', min: 0, max: 4, step: 0.05, digits: 2, unit: 'x' },
             { key: 'rays', label: 'Rays / Probe', min: 32, max: 256, step: 16, digits: 0 },
             { key: 'hysteresis', label: 'Hysteresis', min: 0.5, max: 0.99, step: 0.01, digits: 2 },
             { key: 'normalBias', label: 'Normal Bias', min: 0, max: 4, step: 0.05, digits: 2 },
@@ -120,7 +122,7 @@ function createGiVolumeGlue(deps = {}) {
             if (!control) return String(value);
             const n = Number(value);
             if (!Number.isFinite(n)) return String(SPEEDBALL_GI_DEFAULTS[key]);
-            return control.digits === 0 ? String(Math.round(n)) : n.toFixed(control.digits);
+            return (control.digits === 0 ? String(Math.round(n)) : n.toFixed(control.digits)) + (control.unit || '');
         }
         function normalizeSpeedballGiSettings(input = {}, base = SPEEDBALL_GI_DEFAULTS) {
             const out = { ...base };
@@ -145,6 +147,7 @@ function createGiVolumeGlue(deps = {}) {
             if (!field) return;
             field.setIntensity?.(speedballGiSettings.intensity);
             field.setDivisions?.(speedballGiSettings.divisions);
+            field.setAutoPadding?.(speedballGiSettings.autoPadding);
             field.setRays?.(speedballGiSettings.rays);
             field.setCascades?.(speedballGiSettings.cascades);
             field.setContinuous?.(speedballGiSettings.continuous);
@@ -1077,6 +1080,7 @@ function createGiVolumeGlue(deps = {}) {
                     jitterMode: speedballGiSettings.jitterMode,
                     reflectionQuality: speedballGiSettings.reflectionQuality,
                     divisions: speedballGiSettings.divisions,
+                    autoPadding: speedballGiSettings.autoPadding,
                     roughReflections: speedballGiSettings.roughReflections,
                     reflectionIntensity: speedballGiSettings.reflectionIntensity,
                     onRebuilt: markLightProbeMaterialsDirty,
@@ -1159,6 +1163,8 @@ function createGiVolumeGlue(deps = {}) {
                     setReflectionIntensity: (v) => setSpeedballGiSetting('reflectionIntensity', v),
                     setIntensity: (v) => setSpeedballGiSetting('intensity', v),
                     setDivisions: (v) => setSpeedballGiSetting('divisions', v),
+                    setAutoPadding: (v) => setSpeedballGiSetting('autoPadding', v),
+                    getAutoPadding: () => speedballGiSettings.autoPadding,
                     setRays: (v) => setSpeedballGiSetting('rays', v),
                     setCascades: (v) => setSpeedballGiSetting('cascades', v),
                     setContinuous: (v) => setSpeedballGiSetting('continuous', v),

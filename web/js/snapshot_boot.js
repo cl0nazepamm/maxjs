@@ -637,6 +637,7 @@ const SNAPSHOT_SPEEDBALL_GI_DEFAULTS = Object.freeze({
     enabled: false,
     intensity: 10,
     divisions: 16,
+    autoPadding: 1,
     rays: 64,
     cascades: 1,
     continuous: true,
@@ -674,6 +675,7 @@ function normalizeSnapshotSpeedballGiState(snapshotUi) {
         enabled: source.enabled === true,
         intensity: numOrFallback(source.intensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.intensity, 0, 32),
         divisions: Math.round(numOrFallback(source.divisions, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.divisions, 2, 32)),
+        autoPadding: numOrFallback(source.autoPadding, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.autoPadding, 0, 4),
         rays: Math.round(numOrFallback(source.rays, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.rays, 32, 256) / 16) * 16,
         cascades: Math.round(Number(source.cascades)) === 2 ? 2 : 1,
         continuous: source.continuous !== false,
@@ -752,6 +754,7 @@ function markSnapshotSpeedballGiMaterialsDirty(scene) {
 function applySnapshotSpeedballGiSettings(field, settings) {
     field.setIntensity?.(settings.intensity);
     field.setDivisions?.(settings.divisions);
+    field.setAutoPadding?.(settings.autoPadding);
     field.setRays?.(settings.rays);
     field.setCascades?.(settings.cascades);
     field.setContinuous?.(settings.continuous);
@@ -801,6 +804,7 @@ async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
             jitterMode: settings.jitterMode,
             reflectionQuality: settings.reflectionQuality,
             divisions: settings.divisions,
+            autoPadding: settings.autoPadding,
             roughReflections: settings.roughReflections,
             reflectionIntensity: settings.reflectionIntensity,
             onRebuilt: () => markSnapshotSpeedballGiMaterialsDirty(scene),

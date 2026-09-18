@@ -1567,6 +1567,7 @@ function createPostFxGlue(deps = {}) {
                             const max = control.maxFor?.(giSettings) ?? control.max;
                             input.max = String(max);
                             input.disabled = !gi || max <= control.min
+                                || (control.key === 'autoPadding' && gi?.getSettings?.().volumes?.length > 0)
                                 || (control.key === 'smoothness' && giSettings.filter === 0)
                                 || (control.key === 'reflectionIntensity' && !giSettings.roughReflections);
                             if (canSyncGiInput(input)) input.value = String(value);
@@ -1607,7 +1608,7 @@ function createPostFxGlue(deps = {}) {
                     syncGiPanel();
                 };
                 const SPEEDBALL_GI_RANGE_DEFAULTS = Object.freeze({
-                    intensity: 10, divisions: 16, rays: 64, hysteresis: 0.9,
+                    intensity: 10, divisions: 16, autoPadding: 1, rays: 64, hysteresis: 0.9,
                     normalBias: 1.75, radianceClamp: 8, depthSharpness: 40,
                     cheby: 0.5, classify: 0, filter: 1, smoothness: 1, detail: 1,
                     reflectionIntensity: 1.0,

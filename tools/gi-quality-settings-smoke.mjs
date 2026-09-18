@@ -9,7 +9,9 @@ const windowStub = {};
 let saves = 0;
 const calls = [];
 let normalDetail;
+let autoPadding;
 const field = {
+    setAutoPadding: value => { autoPadding = value; },
     setNormalDetail: value => { normalDetail = value; },
     setJitterMode: value => calls.push(['mode', value]),
     setHysteresis: value => calls.push(['history', value]),
@@ -82,3 +84,17 @@ assert.equal(glue.getSpeedballGiSettings().snapAmount, 0.05, 'partial hysteresis
 apply(field, { ...restored, detail: 0.75 });
 assert.equal(normalDetail, 0.75, 'snapshot uses the same detail API');
 console.log('GI slider regression passed: real detail API, dynamic snap range, snapshot migration');
+
+assert.equal(glue.normalizeSpeedballGiSettings({}).autoPadding, 1);
+assert.equal(normalize({ speedballGi: {} }).autoPadding, 1);
+for (const [input, expected] of [[0, 0], [0.5, 0.5], [2, 2], [-1, 0], [9, 4]]) {
+    glue.setSpeedballGiSetting('autoPadding', input);
+    assert.equal(autoPadding, expected);
+    const state = JSON.parse(JSON.stringify(glue.serializeSpeedballGiState()));
+    const snapshot = normalize({ speedballGi: state });
+    assert.equal(snapshot.autoPadding, expected);
+    apply(field, snapshot);
+    assert.equal(autoPadding, expected);
+}
+assert.equal(glue.formatSpeedballGiValue('autoPadding', 1), '1.00x');
+console.log('Auto padding settings passed: bounds, legacy default, field API and snapshot round trip');

@@ -41,6 +41,7 @@ let _emissiveScaled = null;
 let _LIGHT_STRIDE = 16;
 import { buildTraversal, T_MAX, RAY_EPS, PI } from './spectral_traverse.js';
 import { octEncodeNode, octDecodeNode } from './gi_oct.js';
+import { createProbeBudgetController } from './gi_budget.js';
 import { disposeComputeNodes, disposeStorageAttribute, disposeStorageAttributes } from './webgpu_cleanup.js';
 
 // namespace injected into the octahedral node builders (gi_oct.js).
@@ -111,8 +112,8 @@ const STORAGE_BINDING_FALLBACK = 128 * 1024 * 1024; // WebGPU baseline maxStorag
 const RAYS_PER_TICK = 98_304;       // MAX per-tick trace budget (÷ rays/probe → probes/tick).
                                     // ≈1.5k probes at 64 rays — covers the whole Sponza/city
                                     // union every tick; huge grids fall back to round-robin.
-                                    // AUTO-THROTTLED down when the frame cadence slips (see
-                                    // tick()) so the solve never drags the browser below 60.
+                                    // Adaptive reductions are retained only when they improve
+                                    // presentation cadence; frame caps must not starve GI.
 const RAYS_PER_TICK_MIN = 2_048;    // responsiveness floor (32 probes @64). Weak GPUs must
                                     // be allowed below the old 16k floor instead of pinning
                                     // the viewer near 12 fps forever.
@@ -161,9 +162,7 @@ const DEFORM_CHECK_INTERVAL = 12;  // ticks between DEFORM checks (same-topology
 // during motion is visually lossless; it resumes and converges once the view rests.
 const GI_IDLE_MS = 200;            // ms of camera/sync quiet before GI work resumes
 const REBUILD_BACKOFF_TICKS = 45;  // ticks to wait after a failed/empty rebuild before retrying
-const TICK_OVERLOAD_MS = 100;      // outside the normal EMA window; require repeated misses
 const TICK_PAUSE_MS = 1000;        // tab/debugger/host gaps are pauses, not solve pressure
-const TICK_OVERLOAD_STRIKES = 2;   // ignore one unrelated stall; back off if it repeats
 const PROBE_COMPUTE_KEYS = [
     'traceKernel', 'emitterVisKernel', 'blendKernel', 'glossyKernel', 'uploadKernel', 'lightGridKernel',
     'clearAtlasKernel', 'clearGlossyAtlasKernel', 'clearEmitterVisKernel', 'classifyKernel', 'uploadStateKernel',
@@ -213,23 +212,6 @@ export function probeBudgetAfterInteraction(
     const resume = Math.max(min, Math.floor(Number(resumeBudget) || min));
     const current = Math.max(min, Math.floor(Number(currentBudget) || min));
     return Math.min(current, resume);
-}
-
-// One accepted solve interval represents real pressure from the work submitted by
-// the previous accepted tick. Shrink immediately on a cadence miss instead of
-// waiting for an EMA tail; the controller's cooldown keeps the budget from
-// bouncing straight back up. Kept pure for source-only smoke coverage.
-export function probeBudgetAfterCadenceMiss(
-    currentBudget,
-    minBudget = RAYS_PER_TICK_MIN,
-    shrinkFactor = 0.5,
-) {
-    const min = Math.max(1, Math.floor(Number(minBudget) || 1));
-    const current = Math.max(min, Math.floor(Number(currentBudget) || min));
-    const factor = Number.isFinite(shrinkFactor)
-        ? Math.min(0.95, Math.max(0.05, shrinkFactor))
-        : 0.5;
-    return Math.max(min, Math.floor(current * factor));
 }
 
 export function hysteresisExponentForInterval(updateDtMs, normalize = true) {
@@ -622,14 +604,15 @@ export class GiProbeNode extends LightingNode {
     // toVar/addAssign proper statement sequencing (the raw fragment expression context
     // does not — see _sampleCascade). The single-grid path intentionally stays on the
     // unrolled pure-expression gather: it is the shipped default, byte-identical.
-    _sampleCascadeLooped(P, Nvis, Ndir, c) {
+    _sampleCascadeLooped(P, Nvis, Ndir, c, dualDetail = false) {
+        // setup() supplies the coarse-biased receiver. Fine visibility/interpolation
+        // must use its own cell-scaled bias, not the larger coarse-grid offset.
+        if (c > 0) P = P.add(Nvis.mul(this.normalBiasNode[c].sub(this.normalBiasNode[0])).mul(this.sampleBiasScaleNode));
         return Fn(() => {
             const res = this.resNode[c];
             const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
-            // Probe interpolation is a spatial lookup and must use the actual surface
-            // position. P carries the outward normal bias exclusively for visibility;
-            // letting it drive gridF makes the selected cage move when normal bias moves.
-            const gridF = reflectionP.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
+            // Match the single-grid diffuse gather: P is this sampler's receiver position.
+            const gridF = P.sub(this.gridMinNode[c]).div(cell.max(vec3(1e-6)));
             const baseF = gridF.floor().clamp(vec3(0.0), res.sub(2.0).max(vec3(0.0)));
             const frac = gridF.sub(baseF).clamp(0.0, 1.0);
             const Nn = Nvis.normalize();
@@ -647,7 +630,7 @@ export class GiProbeNode extends LightingNode {
                 const wy = mix(float(1.0).sub(frac.y), frac.y, dy);
                 const wz = mix(float(1.0).sub(frac.z), frac.z, dz);
                 const wTri = wx.mul(wy).mul(wz).add(1e-4);
-                const { e, w } = this._tapEW(c, P, Nn, octN, null, px, py, pz, wTri, true);
+                const { e, w } = this._tapEW(c, P, Nn, octN, dualDetail ? octEncodeNode(Nn, TSL) : null, px, py, pz, wTri, true);
                 acc.addAssign(e.mul(w));
                 wsum.addAssign(w);
             });
@@ -660,6 +643,9 @@ export class GiProbeNode extends LightingNode {
     // the depth atlas for parallax and fetch one or both roughness lobes. Intensity 0
     // dynamically skips those taps, while roughReflections:false emits none of this path.
     _sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, c, dualDetail = false) {
+        // setup() supplies the coarse-biased receiver. Fine visibility/interpolation
+        // must use its own cell-scaled bias, not the larger coarse-grid offset.
+        if (c > 0) P = P.add(Nvis.mul(this.normalBiasNode[c].sub(this.normalBiasNode[0])).mul(this.sampleBiasScaleNode));
         return Fn(() => {
             const res = this.resNode[c];
             const cell = this.gridSizeNode[c].div(res.sub(1.0).max(vec3(1.0)));
@@ -793,12 +779,12 @@ export class GiProbeNode extends LightingNode {
             const E = vec3(0.0).toVar();
             const S = vec4(0.0).toVar();
             If(wFine.lessThan(float(1.0)), () => {
-                const coarse = this._sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, 0);
+                const coarse = this._sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, 0, dualDetail);
                 E.assign(coarse.get('irradiance'));
                 S.assign(coarse.get('roughRadiance'));
             });
             If(wFine.greaterThan(float(0.0)), () => {
-                const fine = this._sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, 1);
+                const fine = this._sampleCombinedCascadeLooped(P, reflectionP, Nvis, Ndir, Rdir, reflectionWeight, roughLobeMix, 1, dualDetail);
                 E.assign(mix(E, fine.get('irradiance'), wFine));
                 S.assign(mix(S, fine.get('roughRadiance'), wFine));
             });
@@ -815,7 +801,7 @@ export class GiProbeNode extends LightingNode {
     // these NON-UNIFORM branches use explicit LOD-0 fetches (see _tapEW). cascades==1 →
     // E0 exactly. The cascaded path uses the LOOPED gather (_sampleCascadeLooped) so the
     // tap bodies fit WebKit's 8192-byte pipeline-variable budget; normal-detail dual
-    // fetch stays single-grid only (kept minimal while the looped path proves out).
+    // fetch is enabled only for materials with a stable tangent-space normal map.
     //
     // COMPILE-TIME cascade selection (invariants #5/#6): a TSL fragment cannot reference a
     // null StorageTexture, and the material RECOMPILES whenever _structGen changes (which
@@ -838,10 +824,10 @@ export class GiProbeNode extends LightingNode {
             const wFine = wIn.mul(gate).toVar();
             const E = vec3(0.0).toVar();
             If(wFine.lessThan(float(1.0)), () => {
-                E.assign(this._sampleCascadeLooped(P, Nvis, Ndir, 0)); // coarse: valid over full bounds
+                E.assign(this._sampleCascadeLooped(P, Nvis, Ndir, 0, dualDetail)); // coarse: valid over full bounds
             });
             If(wFine.greaterThan(float(0.0)), () => {
-                E.assign(mix(E, this._sampleCascadeLooped(P, Nvis, Ndir, 1), wFine));
+                E.assign(mix(E, this._sampleCascadeLooped(P, Nvis, Ndir, 1, dualDetail), wFine));
             });
             return E;
         })();
@@ -867,7 +853,9 @@ export class GiProbeNode extends LightingNode {
         //   sliders, no per-frame cost. See docs/gi_receiver_normal_flicker.md.
         const objectDerivedNormal = normalize(modelNormalMatrix.mul(normalLocal).toVarying('v_speedballObjectNormal'));
         const viewDerivedNormal = normalize(mix(normalWorldGeometry, normalWorld, this.sampleNormalMixNode));
-        const stableNormal = normalize(mix(viewDerivedNormal, objectDerivedNormal, this.sampleObjectNormalNode));
+        // Materialize the receiver normal before either cascade branch. Three's
+        // shared normalView setup must run even when the coarse branch is skipped.
+        const stableNormal = normalize(mix(viewDerivedNormal, objectDerivedNormal, this.sampleObjectNormalNode)).toVar();
         // KNOWN EDGE: the gate reads builder.geometry, so if one material instance is
         // shared between a mesh WITH tangents and one WITHOUT, whichever geometry builds
         // the shader decides the path for that pairing. Fails SAFE (worst case = less GI
@@ -1107,9 +1095,9 @@ export function createProbeField({
     // makeCascade); frameCounter is shared because Monte Carlo advances one basis
     // from C0 and both cascades read the same U.frameJitter.
     let rebuildBackoff = 0;   // ticks remaining before retrying after a failed/empty rebuild (A7)
-    // ── auto-throttle (the hard rule: never lag the browser). The per-tick ray budget
-    // adapts to the observed tick cadence: halve when frames slip, creep back up when
-    // they're comfortably fast. Measures GPU pressure on THIS machine — no tuning knob.
+    // Presentation cadence is not a GPU timer. Test budget changes over windows
+    // and restore coverage when a cut does not improve throughput.
+    const budgetController = createProbeBudgetController();
     let tickBudgetRays = RAYS_PER_TICK;
     // Experimentation knob (setRayBudget): the per-tick trace budget TARGET the
     // auto-throttle recovers toward and the kernel build sizes its scratch from.
@@ -1126,11 +1114,8 @@ export function createProbeField({
     let jitterMode = normalizeJitterMode(initialJitterMode);
     let lastTickAt = 0;
     let tickDtEma = 0;
-    // Temporal cadence must survive auto-throttle's deliberate tickDtEma resets.
-    // Otherwise every budget adjustment injects a one-frame 60 Hz history jump.
+    // Temporal cadence stays independent of budget decisions.
     let hysteresisTickDtEma = 0;
-    let budgetCooldown = 0;   // ticks to hold after a shrink before growing again (damps sawtooth)
-    let cadenceOverloadStreak = 0;
     let inFlight = false;
     let disposed = false;
 
@@ -1140,7 +1125,7 @@ export function createProbeField({
     function resetFramePacing() {
         lastTickAt = 0;
         tickDtEma = 0;
-        cadenceOverloadStreak = 0;
+        budgetController.reset();
     }
     let frameCounter = 0;
     let emitterVisSeedCounter = 0;   // advances with the active ray-sampling epoch
@@ -2960,7 +2945,7 @@ export function createProbeField({
     }
 
     // DETAIL-DRIVEN C1 placement: a cheap CPU triangle-centroid density histogram over the
-    // SHARED built soup. Run INSIDE the idle-gated rebuild (never during motion), alongside
+    // world-space traced instances. Run INSIDE the idle-gated rebuild (never during motion), alongside
     // the ~200ms MeshBVH build → cannot hitch. Deterministic geometry → stable box across
     // rebuilds → same-dim reuse keeps working. Returns {min, size} for C1, or null (fallback
     // to cascades=1 placement) on a flat/degenerate histogram or an all-scene cluster.
@@ -2971,17 +2956,16 @@ export function createProbeField({
         const min = box0.min;
         const size = new THREE.Vector3(); box0.getSize(size);
         const inv = [G / Math.max(1e-6, size.x), G / Math.max(1e-6, size.y), G / Math.max(1e-6, size.z)];
-        const vd = built.vertexData, ti = built.triIndex, S = 8; // VERTEX_DATA_STRIDE, pos at 0-2
-        const triCount = built.triCount;
-        for (let t = 0; t < triCount; t++) {             // one linear pass: centroid binning
-            let cx = 0, cy = 0, cz = 0;
-            for (let k = 0; k < 3; k++) { const v = ti[t * 3 + k] * S; cx += vd[v]; cy += vd[v + 1]; cz += vd[v + 2]; }
-            cx /= 3; cy /= 3; cz /= 3;
+        const addCentroid = (cx, cy, cz) => {
             const gx = THREE.MathUtils.clamp((cx - min.x) * inv[0] | 0, 0, G - 1);
             const gy = THREE.MathUtils.clamp((cy - min.y) * inv[1] | 0, 0, G - 1);
             const gz = THREE.MathUtils.clamp((cz - min.z) * inv[2] | 0, 0, G - 1);
             hist[(gz * G + gy) * G + gx]++;
-        }
+        };
+        // The pooled BLAS vertices are LOCAL, not a world-space triangle soup.
+        // Binning them directly collapses instances around their modelling pivots
+        // and can place C1 under the floor instead of around the scene's detail.
+        built.forEachWorldTriangleCentroid(addCentroid);
         // Peak bin, then union the AABB (in bin coords) of all bins ≥ threshold·peak.
         let peak = 0;
         for (let i = 0; i < hist.length; i++) if (hist[i] > peak) peak = hist[i];
@@ -3349,7 +3333,10 @@ export function createProbeField({
         box.getSize(C0.gridSize);
         C0.gridMin.copy(box.min);
         if (!hasVolumes) {
-            const pad = C0.gridSize.clone().multiplyScalar(0.06);
+            // Keep auto-fitted receivers inside a safe border: 20% per side,
+            // at least one unpadded grid cell even on thin/flat scene bounds.
+            const cellMargin = Math.max(1e-4, Math.max(C0.gridSize.x, C0.gridSize.y, C0.gridSize.z) / Math.max(1, targetLongAxis - 1));
+            const pad = C0.gridSize.clone().multiplyScalar(0.20).max(new THREE.Vector3(cellMargin, cellMargin, cellMargin));
             C0.gridMin.sub(pad); C0.gridSize.add(pad.clone().multiplyScalar(2));
         }
         const resOverride = (hasVolumes && manualVolumes.length === 1 && manualVolumes[0].res) ? manualVolumes[0].res : null;
@@ -3495,7 +3482,7 @@ export function createProbeField({
             tickBudgetRays = probeBudgetAfterInteraction(tickBudgetRays);
             tickDtEma = 0;
             lastTickAt = 0;
-            budgetCooldown = Math.max(budgetCooldown, 30);
+            budgetController.reset();
         }
         // Default: fully idle-gated (moving → return). Continuous mode: keep the bounded GPU
         // SOLVE running while moving, but STILL hold every synchronous/compiling step — the
@@ -3579,39 +3566,14 @@ export function createProbeField({
         const tNow = _nowMs();
         if (lastTickAt > 0) {
             const dt = tNow - lastTickAt;
-            if (dt > 0 && dt < TICK_OVERLOAD_MS) {
-                cadenceOverloadStreak = 0;
+            if (dt > 0 && dt < TICK_PAUSE_MS) {
                 hysteresisTickDtEma = hysteresisTickDtEma > 0 ? hysteresisTickDtEma * 0.8 + dt * 0.2 : dt;
                 tickDtEma = tickDtEma > 0 ? tickDtEma * 0.8 + dt * 0.2 : dt;
-                if (budgetCooldown > 0) budgetCooldown--;
-                if (tickDtEma > 18.5 && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
-                    tickDtEma = 0;        // re-measure only the budget controller at the new cap
-                    budgetCooldown = 120; // hold ~2 s before growing again — a render-bound
-                                          // scene that misses 60 fps at ANY budget otherwise
-                                          // saw-tooths between floor and max
-                } else if (budgetCooldown === 0 && tickDtEma < 17.2 && tickBudgetRays < rayBudgetCeiling) {
-                    tickBudgetRays = Math.min(rayBudgetCeiling, tickBudgetRays + 1024);
-                }
-            } else if (dt >= TICK_OVERLOAD_MS && dt < TICK_PAUSE_MS) {
-                // computeAsync submits without waiting for GPU completion, so this is
-                // presentation cadence rather than a direct solve timer. One long gap
-                // may be unrelated; repeated accepted gaps still mean the browser is
-                // not making progress and must make the bounded GI workload back off.
-                tickDtEma = 0;
-                cadenceOverloadStreak = Math.min(
-                    TICK_OVERLOAD_STRIKES,
-                    cadenceOverloadStreak + 1,
-                );
-                if (cadenceOverloadStreak >= TICK_OVERLOAD_STRIKES && tickBudgetRays > RAYS_PER_TICK_MIN) {
-                    tickBudgetRays = probeBudgetAfterCadenceMiss(tickBudgetRays);
-                    budgetCooldown = 120;
-                }
             } else {
                 tickDtEma = 0;
                 hysteresisTickDtEma = 0;
-                cadenceOverloadStreak = 0;
             }
+            tickBudgetRays = budgetController.update(dt, tickBudgetRays, rayBudgetCeiling, RAYS_PER_TICK_MIN);
         }
         lastTickAt = tNow;
 
@@ -4803,8 +4765,6 @@ export function createProbeField({
             sharedLightBuffer: !!casc[0].gpu && !!casc[1].gpu
                 && casc[0].gpu.buffers.lights === casc[1].gpu.buffers.lights,
             hysteresisTickDtEma,
-            budgetCooldown,
-            cadenceOverloadStreak,
             checkCounter,
             geoStable,
             lastRefitCount,

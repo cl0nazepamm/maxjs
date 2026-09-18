@@ -33,6 +33,8 @@ function createGiVolumeGlue(deps = {}) {
             rays: 64,
             cascades: 1,
             continuous: true,
+            jitterMode: 'gated',
+            reflectionQuality: 'off',
             hysteresis: 0.9,
             hysteresisNormalize: true,
             normalBias: 1.75,
@@ -60,13 +62,13 @@ function createGiVolumeGlue(deps = {}) {
             { key: 'depthSharpness', label: 'Depth Sharpness', min: 1, max: 200, step: 1, digits: 0 },
             { key: 'cheby', label: 'Chebyshev', min: 0, max: 1, step: 0.05, digits: 2 },
             { key: 'classify', label: 'Solid Classify', min: 0, max: 1, step: 0.05, digits: 2 },
-            { key: 'filter', label: 'Filter', min: 0, max: 1, step: 0.05, digits: 2 },
-            { key: 'smoothness', label: 'Smoothness', min: 0, max: 1, step: 0.05, digits: 2 },
-            { key: 'detail', label: 'Detail', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'filter', label: 'GI Filter', hint: 'Blend raw and filtered diffuse probe lighting. Does not filter reflections.', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'smoothness', label: 'Filter Softness', hint: 'Blend across brightness differences within each probe. Fixed filter size; requires GI Filter above zero.', min: 0, max: 1, step: 0.05, digits: 2 },
+            { key: 'detail', label: 'Normal Map Detail', hint: 'Normal-map influence on diffuse GI. Requires a normal map and mesh tangents; plain materials are unchanged.', min: 0, max: 1, step: 0.05, digits: 2 },
             { key: 'reflectionIntensity', label: 'Reflection Intensity', min: 0, max: 1, step: 0.05, digits: 2 },
-            { key: 'changeThreshold', label: 'Change Threshold', min: 0.5, max: 8, step: 0.05, digits: 2 },
-            { key: 'snapAmount', label: 'Snap Amount', min: 0, max: 0.9, step: 0.01, digits: 2 },
-            { key: 'fireflyClamp', label: 'Firefly Clamp', min: 1, max: 20, step: 0.5, digits: 1 },
+            { key: 'changeThreshold', label: 'Change Sensitivity Threshold', hint: 'Lower detects smaller lighting changes and updates diffuse GI faster. Settled lighting is unchanged.', min: 0.5, max: 8, step: 0.05, digits: 2 },
+            { key: 'snapAmount', label: 'Change Response Boost', hint: 'Reduce diffuse history after a detected change. Maximum follows Hysteresis; zero range means no boost is available.', min: 0, max: 0.9, maxFor: settings => Math.max(0, Math.round((settings.hysteresis - 0.55) * 100) / 100), step: 0.01, digits: 2 },
+            { key: 'fireflyClamp', label: 'Firefly Tolerance', hint: 'Lower suppresses unusually large diffuse lighting updates more strongly. Higher allows more outliers; reflections use separate history.', min: 1, max: 20, step: 0.5, digits: 1 },
         ]);
         let speedballGiSettings = { ...SPEEDBALL_GI_DEFAULTS };
         let giVolumeSyncToken = '';
@@ -128,9 +130,15 @@ function createGiVolumeGlue(deps = {}) {
             if ('enabled' in input) out.enabled = input.enabled === true;
             if ('continuous' in input) out.continuous = input.continuous === true;
             if ('hysteresisNormalize' in input) out.hysteresisNormalize = input.hysteresisNormalize === true;
-            if ('roughReflections' in input) out.roughReflections = input.roughReflections === true;
+            if (input.jitterMode === 'gated' || input.jitterMode === 'montecarlo') out.jitterMode = input.jitterMode;
+            // Named tiers win; old saved scenes and boolean callers retain their exact look.
+            if (['off', 'rough', 'high', 'ultra'].includes(input.reflectionQuality)) out.reflectionQuality = input.reflectionQuality;
+            else if ('roughReflections' in input) out.reflectionQuality = input.roughReflections === true ? 'ultra' : 'off';
+            out.roughReflections = out.reflectionQuality !== 'off';
             if ('showProbes' in input) out.showProbes = input.showProbes === true;
             if ('cascades' in input) out.cascades = Math.round(Number(input.cascades)) === 2 ? 2 : 1;
+            const snap = SPEEDBALL_GI_NUMERIC_CONTROLS.find(c => c.key === 'snapAmount');
+            out.snapAmount = Math.min(out.snapAmount, snap.maxFor(out));
             return out;
         }
         function applySpeedballGiTuning(field = deps.speedballGi?.field) {
@@ -140,6 +148,8 @@ function createGiVolumeGlue(deps = {}) {
             field.setRays?.(speedballGiSettings.rays);
             field.setCascades?.(speedballGiSettings.cascades);
             field.setContinuous?.(speedballGiSettings.continuous);
+            field.setJitterMode?.(speedballGiSettings.jitterMode);
+            // Preserve the authored history weight when switching sampling patterns.
             field.setHysteresis?.(speedballGiSettings.hysteresis);
             field.setHysteresisNormalization?.(speedballGiSettings.hysteresisNormalize);
             field.setNormalBias?.(speedballGiSettings.normalBias);
@@ -149,7 +159,7 @@ function createGiVolumeGlue(deps = {}) {
             field.setClassifyStrength?.(speedballGiSettings.classify);
             field.setFilterStrength?.(speedballGiSettings.filter);
             field.setSmoothness?.(speedballGiSettings.smoothness);
-            field.setDetailStrength?.(speedballGiSettings.detail);
+            field.setNormalDetail?.(speedballGiSettings.detail);
             field.setReflectionIntensity?.(speedballGiSettings.reflectionIntensity);
             field.setChangeThreshold?.(speedballGiSettings.changeThreshold);
             field.setSnapAmount?.(speedballGiSettings.snapAmount);
@@ -163,12 +173,11 @@ function createGiVolumeGlue(deps = {}) {
         }
         function applySpeedballGiState(input = {}, { persist = false } = {}) {
             const togglesEnabled = Object.prototype.hasOwnProperty.call(input, 'enabled');
-            const togglesReflections = Object.prototype.hasOwnProperty.call(input, 'roughReflections')
-                && (input.roughReflections === true) !== speedballGiSettings.roughReflections;
+            const previousReflectionQuality = speedballGiSettings.reflectionQuality;
             const togglesProbes = Object.prototype.hasOwnProperty.call(input, 'showProbes');
             speedballGiSettings = normalizeSpeedballGiSettings(input, speedballGiSettings);
             const gi = window.maxjsSpeedballGI;
-            if (togglesReflections && gi?.setRoughReflections) gi.setRoughReflections(speedballGiSettings.roughReflections);
+            if (previousReflectionQuality !== speedballGiSettings.reflectionQuality && gi?.setReflectionQuality) gi.setReflectionQuality(speedballGiSettings.reflectionQuality);
             else applySpeedballGiTuning();
             if (togglesProbes && speedballGiSettings.showProbes !== probeHelpersVisible) setProbeHelpersVisible(speedballGiSettings.showProbes);
             if (gi && togglesEnabled) {
@@ -1065,6 +1074,8 @@ function createGiVolumeGlue(deps = {}) {
                     autoDetectChanges: false,
                     intensity: speedballGiSettings.intensity,
                     hysteresis: speedballGiSettings.hysteresis,
+                    jitterMode: speedballGiSettings.jitterMode,
+                    reflectionQuality: speedballGiSettings.reflectionQuality,
                     divisions: speedballGiSettings.divisions,
                     roughReflections: speedballGiSettings.roughReflections,
                     reflectionIntensity: speedballGiSettings.reflectionIntensity,
@@ -1120,14 +1131,21 @@ function createGiVolumeGlue(deps = {}) {
                         markLightProbeMaterialsDirty(); // one-shot: drop the probe node from the lights graph this frame
                         window.__maxjsSyncGiPanel?.();
                     },
-                    setRoughReflections(enabled) {
-                        const next = enabled === true;
-                        const current = speedballField?.hasRoughReflections?.() === true;
-                        speedballGiSettings.roughReflections = next;
-                        if (next === current) return false;
+                    setReflectionQuality(quality) {
+                        if (!['off', 'rough', 'high', 'ultra'].includes(quality)) return false;
+                        speedballGiSettings.reflectionQuality = quality;
+                        speedballGiSettings.roughReflections = quality !== 'off';
+                        if (speedballField?.getReflectionQuality?.() === quality) {
+                            applySpeedballGiTuning(speedballField);
+                            return false;
+                        }
                         replaceSpeedballField();
                         window.__maxjsSyncGiPanel?.();
                         return true;
+                    },
+                    getReflectionQuality: () => speedballGiSettings.reflectionQuality,
+                    setRoughReflections(enabled) {
+                        return this.setReflectionQuality(enabled === true ? 'ultra' : 'off');
                     },
                     hasRoughReflections: () => speedballField?.hasRoughReflections?.() === true,
                     setSky(input, { intensity = speedballSkyIntensity } = {}) {
@@ -1144,6 +1162,8 @@ function createGiVolumeGlue(deps = {}) {
                     setRays: (v) => setSpeedballGiSetting('rays', v),
                     setCascades: (v) => setSpeedballGiSetting('cascades', v),
                     setContinuous: (v) => setSpeedballGiSetting('continuous', v),
+                    setJitterMode: (v) => setSpeedballGiSetting('jitterMode', v),
+                    getJitterMode: () => speedballGiSettings.jitterMode,
                     setHysteresis: (v) => setSpeedballGiSetting('hysteresis', v),
                     setHysteresisNormalize: (v) => setSpeedballGiSetting('hysteresisNormalize', v),
                     setNormalBias: (v) => setSpeedballGiSetting('normalBias', v),

@@ -1017,9 +1017,25 @@ function createPostFxGlue(deps = {}) {
                         <div class="fx-grid">
                             ${deps.SPEEDBALL_GI_NUMERIC_CONTROLS.map(control => `
                             <label class="fx-control" for="fx-gi-${control.key}">
-                                <div class="fx-control-head"><span>${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${deps.formatSpeedballGiValue(control.key)}</span></div>
-                                <input class="fx-range" id="fx-gi-${control.key}" type="range" min="${control.min}" max="${control.max}" step="${control.step}" value="${deps.getSpeedballGiSettings()[control.key]}">
+                                <div class="fx-control-head"><span title="${control.hint || ''}">${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${deps.formatSpeedballGiValue(control.key)}</span></div>
+                                <input class="fx-range" id="fx-gi-${control.key}" title="${control.hint || ''}" type="range" min="${control.min}" max="${control.maxFor?.(deps.getSpeedballGiSettings()) ?? control.max}" step="${control.step}" value="${deps.getSpeedballGiSettings()[control.key]}">
                             </label>`).join('')}
+                            <label class="fx-control" for="fx-gi-jitter-mode" title="Gated Basis holds ray directions steady. Brute force resamples every solve; hysteresis still controls temporal smoothing.">
+                                <div class="fx-control-head"><span>Sampling</span></div>
+                                <select id="fx-gi-jitter-mode" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
+                                    <option value="gated">Gated Basis</option>
+                                    <option value="montecarlo">Brute force (Monte Carlo)</option>
+                                </select>
+                            </label>
+                            <label class="fx-control" for="fx-gi-reflection-quality" title="Changes the reflection caches and rebuilds the GI field. Higher tiers use more GPU memory and work.">
+                                <div class="fx-control-head"><span>Reflection quality</span></div>
+                                <select id="fx-gi-reflection-quality" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
+                                    <option value="off">Off</option>
+                                    <option value="rough">Rough</option>
+                                    <option value="high">High</option>
+                                    <option value="ultra">Ultra</option>
+                                </select>
+                            </label>
                             <label class="fx-control" for="fx-gi-cascades">
                                 <div class="fx-control-head"><span>Cascades</span></div>
                                 <select id="fx-gi-cascades" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
@@ -1028,7 +1044,6 @@ function createPostFxGlue(deps = {}) {
                                 </select>
                             </label>
                             <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${deps.getSpeedballGiSettings().continuous ? 'checked' : ''}></label>
-                            <label class="fx-check" for="fx-gi-reflections" title="Structural Speedball path: enabling allocates and runs the rough/glossy DDGI reflection caches; disabling removes that GPU cost."><span>Rough reflections (GPU cost)</span><input id="fx-gi-reflections" type="checkbox" ${deps.getSpeedballGiSettings().roughReflections ? 'checked' : ''}></label>
                             <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${deps.getSpeedballGiSettings().hysteresisNormalize ? 'checked' : ''}></label>
                             <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${deps.getSpeedballGiSettings().showProbes ? 'checked' : ''}></label>
                         </div>
@@ -1529,7 +1544,8 @@ function createPostFxGlue(deps = {}) {
                 const giReset = document.getElementById('fx-gi-reset');
                 const giCascades = document.getElementById('fx-gi-cascades');
                 const giContinuous = document.getElementById('fx-gi-continuous');
-                const giReflections = document.getElementById('fx-gi-reflections');
+                const giJitterMode = document.getElementById('fx-gi-jitter-mode');
+                const giReflectionQuality = document.getElementById('fx-gi-reflection-quality');
                 const giHystNorm = document.getElementById('fx-gi-hyst-norm');
                 const giShowProbes = document.getElementById('fx-gi-show-probes');
                 const canSyncGiInput = (input) => !!input && document.activeElement !== input;
@@ -1548,7 +1564,11 @@ function createPostFxGlue(deps = {}) {
                         const val = document.getElementById(`fx-gi-${control.key}-val`);
                         const value = giSettings[control.key];
                         if (input) {
-                            input.disabled = !gi || (control.key === 'reflectionIntensity' && !giSettings.roughReflections);
+                            const max = control.maxFor?.(giSettings) ?? control.max;
+                            input.max = String(max);
+                            input.disabled = !gi || max <= control.min
+                                || (control.key === 'smoothness' && giSettings.filter === 0)
+                                || (control.key === 'reflectionIntensity' && !giSettings.roughReflections);
                             if (canSyncGiInput(input)) input.value = String(value);
                         }
                         if (val) val.textContent = deps.formatSpeedballGiValue(control.key, value);
@@ -1561,9 +1581,13 @@ function createPostFxGlue(deps = {}) {
                         giContinuous.disabled = !gi;
                         if (canSyncGiInput(giContinuous)) giContinuous.checked = !!giSettings.continuous;
                     }
-                    if (giReflections) {
-                        giReflections.disabled = !gi;
-                        if (canSyncGiInput(giReflections)) giReflections.checked = !!giSettings.roughReflections;
+                    if (giJitterMode) {
+                        giJitterMode.disabled = !gi;
+                        if (canSyncGiInput(giJitterMode)) giJitterMode.value = giSettings.jitterMode;
+                    }
+                    if (giReflectionQuality) {
+                        giReflectionQuality.disabled = !gi;
+                        if (canSyncGiInput(giReflectionQuality)) giReflectionQuality.value = giSettings.reflectionQuality;
                     }
                     if (giHystNorm) {
                         giHystNorm.disabled = !gi;
@@ -1613,7 +1637,8 @@ function createPostFxGlue(deps = {}) {
                 }
                 if (giCascades) giCascades.onchange = () => deps.setSpeedballGiSetting('cascades', giCascades.value, { persist: true });
                 if (giContinuous) giContinuous.onchange = () => deps.setSpeedballGiSetting('continuous', giContinuous.checked, { persist: true });
-                if (giReflections) giReflections.onchange = () => deps.setSpeedballGiSetting('roughReflections', giReflections.checked, { persist: true });
+                if (giJitterMode) giJitterMode.onchange = () => deps.setSpeedballGiSetting('jitterMode', giJitterMode.value, { persist: true });
+                if (giReflectionQuality) giReflectionQuality.onchange = () => deps.setSpeedballGiSetting('reflectionQuality', giReflectionQuality.value, { persist: true });
                 if (giHystNorm) giHystNorm.onchange = () => deps.setSpeedballGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
                 if (giShowProbes) giShowProbes.onchange = () => deps.setSpeedballGiSetting('showProbes', giShowProbes.checked, { persist: true });
                 syncGiPanel();

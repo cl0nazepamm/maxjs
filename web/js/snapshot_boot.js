@@ -640,6 +640,8 @@ const SNAPSHOT_SPEEDBALL_GI_DEFAULTS = Object.freeze({
     rays: 64,
     cascades: 1,
     continuous: true,
+    jitterMode: 'gated',
+    reflectionQuality: 'off',
     hysteresis: 0.9,
     hysteresisNormalize: true,
     normalBias: 1.75,
@@ -667,6 +669,7 @@ function numOrFallback(value, fallback, min = -Infinity, max = Infinity) {
 function normalizeSnapshotSpeedballGiState(snapshotUi) {
     const source = snapshotUi?.speedballGi;
     if (!source || typeof source !== 'object') return null;
+    const hysteresis = numOrFallback(source.hysteresis, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.hysteresis, 0, 0.99);
     return {
         enabled: source.enabled === true,
         intensity: numOrFallback(source.intensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.intensity, 0, 32),
@@ -674,7 +677,10 @@ function normalizeSnapshotSpeedballGiState(snapshotUi) {
         rays: Math.round(numOrFallback(source.rays, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.rays, 32, 256) / 16) * 16,
         cascades: Math.round(Number(source.cascades)) === 2 ? 2 : 1,
         continuous: source.continuous !== false,
-        hysteresis: numOrFallback(source.hysteresis, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.hysteresis, 0, 0.99),
+        jitterMode: source.jitterMode === 'montecarlo' ? 'montecarlo' : 'gated',
+        reflectionQuality: ['off', 'rough', 'high', 'ultra'].includes(source.reflectionQuality)
+            ? source.reflectionQuality : (source.roughReflections === true ? 'ultra' : 'off'),
+        hysteresis,
         // Absent in pre-normalization exports — default ON to match the field.
         hysteresisNormalize: source.hysteresisNormalize !== false,
         normalBias: numOrFallback(source.normalBias, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.normalBias, 0, 8),
@@ -688,7 +694,7 @@ function normalizeSnapshotSpeedballGiState(snapshotUi) {
         roughReflections: source.roughReflections === true,
         reflectionIntensity: numOrFallback(source.reflectionIntensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.reflectionIntensity, 0, 1),
         changeThreshold: numOrFallback(source.changeThreshold, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.changeThreshold, 0.5, 8),
-        snapAmount: numOrFallback(source.snapAmount, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.snapAmount, 0, 0.9),
+        snapAmount: Math.min(numOrFallback(source.snapAmount, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.snapAmount, 0, 0.9), Math.max(0, Math.round((hysteresis - 0.55) * 100) / 100)),
         fireflyClamp: numOrFallback(source.fireflyClamp, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.fireflyClamp, 1, 20),
         volumes: Array.isArray(source.volumes) ? source.volumes : [],
     };
@@ -749,6 +755,7 @@ function applySnapshotSpeedballGiSettings(field, settings) {
     field.setRays?.(settings.rays);
     field.setCascades?.(settings.cascades);
     field.setContinuous?.(settings.continuous);
+    field.setJitterMode?.(settings.jitterMode);
     field.setHysteresis?.(settings.hysteresis);
     field.setHysteresisNormalization?.(settings.hysteresisNormalize);
     field.setNormalBias?.(settings.normalBias);
@@ -791,6 +798,8 @@ async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
             scene,
             intensity: settings.intensity,
             hysteresis: settings.hysteresis,
+            jitterMode: settings.jitterMode,
+            reflectionQuality: settings.reflectionQuality,
             divisions: settings.divisions,
             roughReflections: settings.roughReflections,
             reflectionIntensity: settings.reflectionIntensity,

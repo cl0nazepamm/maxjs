@@ -780,7 +780,8 @@ function applySnapshotSpeedballGiSettings(field, settings) {
 async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
     const settings = normalizeSnapshotSpeedballGiState(snapshotUi);
     if (!settings?.enabled) return null;
-    if (renderer?.backend?.isWebGPUBackend !== true || !renderer?.lighting?.createNode) return null;
+    const backend = renderer?.backend;
+    if (!(backend?.isWebGPUBackend || backend?.isWebGLBackend) || !renderer?.lighting?.createNode) return null;
     try {
         // Live max.js always compiles through MaxLightsNode. Snapshot parity must
         // use that same lighting graph even when the portable Studio block has no
@@ -790,7 +791,7 @@ async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
         if (renderer.lighting.createNode?.maxjsAdaptiveLighting !== true) {
             const { installMaxLightsRenderer } = await import('./max_lights_node.js');
             if (!installMaxLightsRenderer(renderer)) {
-                console.warn('[snapshot_boot] Speedball GI needs the max.js WebGPU lighting graph');
+                console.warn('[snapshot_boot] Speedball GI needs the max.js node lighting graph');
                 return null;
             }
         }
@@ -2458,6 +2459,8 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         // options apply live, so site-side motion (zoom focus pulls) can drive
         // them per frame without touching the pipeline.
         postFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx ?? null,
+        // Runtime games use the existing field for material/transform change packets.
+        speedballGi: optionalModules.speedballGi?.field ?? null,
         animationSystem, maxTimeline,
         resize,
         applyDelta: async (newBuffer) => {

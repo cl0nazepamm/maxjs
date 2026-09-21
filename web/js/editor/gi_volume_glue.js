@@ -102,7 +102,8 @@ function createGiVolumeGlue(deps = {}) {
         let speedballLightingImmediate = false;
 
         const isAdvancedWebGpuLighting = deps.isStudioMode && deps.renderer.backend?.isWebGPUBackend === true;
-        const isWebGpuBackend = deps.renderer.backend?.isWebGPUBackend === true;
+        const isSpeedballBackend = deps.renderer.backend?.isWebGPUBackend === true
+            || deps.renderer.backend?.isWebGLBackend === true;
 
         function getSpeedballGiSettings() {
             return speedballGiSettings;
@@ -1039,7 +1040,7 @@ function createGiVolumeGlue(deps = {}) {
         // frame — the field self-gates on idle and auto-throttles its own ray
         // budget. The probe node only injects into context.irradiance while
         // active, so a disabled field changes nothing.
-        if (isWebGpuBackend && deps.isStudioMode) {
+        if (isSpeedballBackend && deps.isStudioMode) {
             try {
                 let speedballOn = speedballGiSettings.enabled === true;
                 let speedballField = null;
@@ -1111,7 +1112,7 @@ function createGiVolumeGlue(deps = {}) {
                     get field() { return speedballField; },
                     isOn: () => speedballOn && speedballField?.isSupported?.() === true,
                     enable({ applySettings = true } = {}) {
-                        if (!speedballField?.isSupported?.()) { console.warn('Speedball GI needs the WebGPU backend'); return false; }
+                        if (!speedballField?.isSupported?.()) { console.warn('Speedball GI needs WebGPU or WebGL2 with floating-point render targets'); return false; }
                         speedballOn = true;
                         speedballGiSettings.enabled = true;
                         if (deps.giVolume) { deps.giVolume.setEnabled(false); deps.giVolume.setIntensity(0); }

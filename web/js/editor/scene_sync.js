@@ -1914,6 +1914,7 @@ function createSceneSync(deps = {}) {
                     m.attenuationDistance = material.attenuationDistance;
                 }
                 if (assignGatedScalar(m, 'anisotropy', material?.anisotropy)) materialNeedsUpdate = true;
+                if (assignGatedScalar(m, 'retroreflectivity', material?.retroreflectivity)) materialNeedsUpdate = true;
                 deps.rememberMaterialEmissiveBase(m);
                 deps.applyMaterialSelectionState(m, !!mesh.userData.maxjsSelected);
                 if (m.transparent !== nextTransparent) {

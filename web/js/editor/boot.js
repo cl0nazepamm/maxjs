@@ -1,4 +1,5 @@
         import * as THREE from 'three';
+        import { installHdriDiffuseSplit } from '../environment_lighting.js';
         import * as THREE_STD from 'three-std';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
@@ -47,95 +48,8 @@
             return materialIntensity * sceneIntensity;
         });
 
-        function patchEnvironmentNodeDiffuseSplit() {
-            const EnvironmentNode = THREE.EnvironmentNode;
-            const tsl = THREE.TSL || {};
-            if (!EnvironmentNode?.prototype || EnvironmentNode.prototype.maxjsHdriDiffuseSplitPatched) return;
-
-            const {
-                isolate,
-                roughness,
-                clearcoatRoughness,
-                cameraWorldMatrix,
-                normalView,
-                clearcoatNormalView,
-                normalWorld,
-                positionViewDirection,
-                float,
-                pow4,
-                bentNormalView,
-                pmremTexture,
-            } = tsl;
-            if (!isolate || !roughness || !cameraWorldMatrix || !normalView || !normalWorld || !positionViewDirection || !float || !pow4 || !pmremTexture) {
-                return;
-            }
-
-            const originalSetup = EnvironmentNode.prototype.setup;
-            const createRadianceContext = (roughnessNode, normalViewNode) => {
-                let reflectVec = null;
-                return {
-                    getUV: () => {
-                        if (reflectVec === null) {
-                            reflectVec = positionViewDirection.negate().reflect(normalViewNode);
-                            reflectVec = pow4(roughnessNode).mix(reflectVec, normalViewNode).normalize();
-                            reflectVec = reflectVec.transformDirection(cameraWorldMatrix);
-                        }
-                        return reflectVec;
-                    },
-                    getTextureLevel: () => roughnessNode,
-                };
-            };
-            const createIrradianceContext = (normalWorldNode) => ({
-                getUV: () => normalWorldNode,
-                getTextureLevel: () => float(1.0),
-            });
-
-            EnvironmentNode.prototype.setup = function setupMaxjsEnvironmentNode(builder) {
-                try {
-                    const { material } = builder;
-                    let envNode = this.envNode;
-
-                    if (envNode.isTextureNode || envNode.isMaterialReferenceNode) {
-                        const value = envNode.isTextureNode ? envNode.value : material[envNode.property];
-                        const cache = this._getPMREMNodeCache(builder.renderer);
-                        let cacheEnvNode = cache.get(value);
-                        if (cacheEnvNode === undefined) {
-                            cacheEnvNode = pmremTexture(value);
-                            cache.set(value, cacheEnvNode);
-                        }
-                        envNode = cacheEnvNode;
-                    }
-
-                    const useAnisotropy = material.useAnisotropy === true || material.anisotropy > 0;
-                    const radianceNormalView = useAnisotropy ? bentNormalView : normalView;
-
-                    const radiance = envNode.context(createRadianceContext(roughness, radianceNormalView)).mul(materialEnvIntensity);
-                    const irradiance = envNode.context(createIrradianceContext(normalWorld)).mul(Math.PI).mul(materialEnvIntensity);
-
-                    builder.context.radiance.addAssign(isolate(radiance));
-
-                    const isNativeWebGPU = builder.renderer?.backend?.isWebGPUBackend === true;
-                    const isolatedIrradiance = isolate(irradiance);
-                    builder.context.iblIrradiance.addAssign(
-                        isNativeWebGPU ? isolatedIrradiance.mul(maxjsHdriDiffuseIntensity) : isolatedIrradiance
-                    );
-
-                    const clearcoatRadiance = builder.context.lightingModel.clearcoatRadiance;
-                    if (clearcoatRadiance && clearcoatRoughness && clearcoatNormalView) {
-                        const clearcoatRadianceContext = envNode
-                            .context(createRadianceContext(clearcoatRoughness, clearcoatNormalView))
-                            .mul(materialEnvIntensity);
-                        clearcoatRadiance.addAssign(isolate(clearcoatRadianceContext));
-                    }
-                } catch (error) {
-                    return originalSetup.call(this, builder);
-                }
-            };
-
-            Object.defineProperty(EnvironmentNode.prototype, 'maxjsHdriDiffuseSplitPatched', { value: true });
-        }
-
-        patchEnvironmentNodeDiffuseSplit();
+        // Preserve upstream r186 retroreflection while applying max.js HDRI policy.
+        installHdriDiffuseSplit(maxjsHdriDiffuseIntensity);
         import { maxTimeline } from '../maxjs_timeline.js';
         import { createHostBridge } from './host_bridge.js';
         import { createEditorContext } from './context.js';

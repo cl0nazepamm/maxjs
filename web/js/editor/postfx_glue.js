@@ -131,8 +131,6 @@ function createPostFxGlue(deps = {}) {
                     { key: 'radius', label: 'Radius', min: 0.05, max: 2, step: 0.01 },
                     { key: 'thickness', label: 'Thickness', min: 0.01, max: 2, step: 0.01 },
                     { key: 'scale', label: 'Intensity', min: 0, max: 4, step: 0.05 },
-                    { key: 'distanceExponent', label: 'Dist Exp', min: 1, max: 2, step: 0.01 },
-                    { key: 'distanceFallOff', label: 'Falloff', min: 0.01, max: 1, step: 0.01 },
                     { key: 'samples', label: 'Samples', min: 4, max: 32, step: 1, integer: true },
                     { key: 'resolutionScale', label: 'Resolution', min: 0.25, max: 1, step: 0.05 },
                 ],
@@ -641,7 +639,7 @@ function createPostFxGlue(deps = {}) {
         const POSTFX_SECTION_DEFAULTS = Object.freeze({
             ssgi: { radius: 8, thickness: 1.5, aoIntensity: 1.0, giIntensity: 1.5, expFactor: 1.5, sliceCount: 2, stepCount: 8, temporal: false },
             ssr: { quality: 0.45, blurQuality: 2, maxDistance: 0.5, opacity: 0.9, thickness: 0.015, resolutionScale: 1.0 },
-            gtao: { samples: 16, distanceExponent: 1.0, distanceFallOff: 1.0, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
+            gtao: { samples: 16, radius: 0.5, scale: 2.0, thickness: 1.0, resolutionScale: 1.0 },
             bloom: { strength: 0.4, radius: 0.2, threshold: 0.75, resolutionScale: 0.5 },
             toonOutline: { thickness: 0.003, alpha: 1.0 },
             motionBlur: { amount: 1.0, samples: 16 },

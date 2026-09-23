@@ -2267,6 +2267,12 @@ struct EnvData {
     float skyAzimuth    = 180.0f;
     float skyExposure   = 0.5f;
     bool  skyShowSunDisc = true;
+    bool  skySunShadows = false;
+    float skyCloudCoverage = 0.00000f;
+    float skyCloudDensity = 0.40000f;
+    float skyCloudScale = 0.00020f;
+    float skyCloudElevation = 0.50000f;
+    float skySunShadowDistance = 10000.00000f;
 };
 
 // Generic: find a named float/int/string in any paramblock of a map
@@ -2370,6 +2376,12 @@ static void GetEnvironment(EnvData& env) {
             env.skyAzimuth   = pb->GetFloat(psky_azimuth);
             env.skyExposure  = pb->GetFloat(psky_exposure);
             env.skyShowSunDisc = pb->GetInt(psky_show_sun_disc) != 0;
+            env.skySunShadows = pb->GetInt(psky_sun_shadows) != 0;
+            env.skyCloudCoverage = pb->GetFloat(psky_cloud_coverage, GetCOREInterface()->GetTime());
+            env.skyCloudDensity = pb->GetFloat(psky_cloud_density, GetCOREInterface()->GetTime());
+            env.skyCloudScale = pb->GetFloat(psky_cloud_scale, GetCOREInterface()->GetTime());
+            env.skyCloudElevation = pb->GetFloat(psky_cloud_elevation, GetCOREInterface()->GetTime());
+            env.skySunShadowDistance = pb->GetFloat(psky_sun_shadow_distance, GetCOREInterface()->GetTime());
         }
         return;
     }
@@ -2408,6 +2420,12 @@ static void WriteEnvJson(std::wostringstream& ss, const EnvData& env,
         ss << L",\"azimuth\":" << env.skyAzimuth;
         ss << L",\"exposure\":" << env.skyExposure;
         ss << L",\"showSunDisc\":" << (env.skyShowSunDisc ? L"true" : L"false");
+        ss << L",\"sunShadows\":" << (env.skySunShadows ? L"true" : L"false");
+        ss << L",\"cloudCoverage\":" << env.skyCloudCoverage;
+        ss << L",\"cloudDensity\":" << env.skyCloudDensity;
+        ss << L",\"cloudScale\":" << env.skyCloudScale;
+        ss << L",\"cloudElevation\":" << env.skyCloudElevation;
+        ss << L",\"sunShadowDistance\":" << env.skySunShadowDistance;
         ss << L'}';
     } else if (hasHdriUrl) {
         ss << L",\"type\":\"hdri\"";

@@ -1716,7 +1716,7 @@ function applySnapshotMaterialScalar(mesh, payload, materialIndex = null) {
         'aoMapIntensity', 'clearcoat', 'clearcoatRoughness', 'sheen',
         'sheenRoughness', 'iridescence', 'iridescenceIOR', 'transmission',
         'thickness', 'reflectivity', 'specularIntensity', 'ior', 'dispersion',
-        'attenuationDistance', 'anisotropy', 'alphaTest',
+        'attenuationDistance', 'anisotropy', 'retroreflectivity', 'alphaTest',
     ];
     const booleanKeys = ['depthWrite', 'depthTest'];
 

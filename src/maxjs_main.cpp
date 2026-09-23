@@ -742,6 +742,7 @@ public:
         float dispersion = 0.0f;
         float attenuationDistance = 0.0f;
         float anisotropy = 0.0f;
+        float retroreflectivity = 0.0f;
         float specularIntensity = 1.0f;
         float sheen = 0.0f;
         float sheenRoughness = 1.0f;

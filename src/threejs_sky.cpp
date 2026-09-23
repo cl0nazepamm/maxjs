@@ -145,6 +145,41 @@ static ParamBlockDesc2 skyPBDesc(
         p_range, 0.0f, 200000.0f,
         p_end,
 
+    psky_cloud_coverage, _T("cloudCoverage"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 0.00000f,
+        p_range, 0.00000f, 1.00000f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SKY_CLOUD_COVERAGE_EDIT, IDC_SKY_CLOUD_COVERAGE_SPIN, 0.01000f,
+        p_end,
+
+    psky_cloud_density, _T("cloudDensity"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 0.40000f,
+        p_range, 0.00000f, 1.00000f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SKY_CLOUD_DENSITY_EDIT, IDC_SKY_CLOUD_DENSITY_SPIN, 0.01000f,
+        p_end,
+
+    psky_cloud_scale, _T("cloudScale"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 0.00020f,
+        p_range, 0.00001f, 0.01000f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SKY_CLOUD_SCALE_EDIT, IDC_SKY_CLOUD_SCALE_SPIN, 0.00001f,
+        p_end,
+
+    psky_cloud_elevation, _T("cloudElevation"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 0.50000f,
+        p_range, 0.00000f, 1.00000f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SKY_CLOUD_ELEVATION_EDIT, IDC_SKY_CLOUD_ELEVATION_SPIN, 0.01000f,
+        p_end,
+
+    psky_sun_shadow_distance, _T("sunShadowDistance"), TYPE_FLOAT, P_ANIMATABLE, 0,
+        p_default, 10000.00000f,
+        p_range, 1.00000f, 1000000.00000f,
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_SKY_SUN_SHADOW_DISTANCE_EDIT, IDC_SKY_SUN_SHADOW_DISTANCE_SPIN, 100.00000f,
+        p_end,
+
+    psky_sun_shadows, _T("sunShadows"), TYPE_BOOL, 0, 0,
+        p_default, FALSE,
+        p_ui, TYPE_SINGLECHEKBOX, IDC_SKY_SUN_SHADOWS,
+        p_end,
+
     p_end  // end of param block
 );
 

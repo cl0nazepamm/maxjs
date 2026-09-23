@@ -884,8 +884,6 @@ export function createMaxJSFxController({
             assignFinite(state.gtao, 'radius', options.radius);
             assignFinite(state.gtao, 'thickness', options.thickness);
             rebuild = assignFinite(state.gtao, 'samples', options.samples) || rebuild;
-            rebuild = assignFinite(state.gtao, 'distanceExponent', options.distanceExponent) || rebuild;
-            rebuild = assignFinite(state.gtao, 'distanceFallOff', options.distanceFallOff) || rebuild;
             rebuild = assignFinite(state.gtao, 'scale', options.scale) || rebuild;
             rebuild = assignFinite(state.gtao, 'resolutionScale', options.resolutionScale) || rebuild;
             if (rebuild) rebuildPipeline();

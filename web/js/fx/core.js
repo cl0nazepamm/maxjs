@@ -384,7 +384,6 @@ export function createFxCore({
         try {
             const quadMat = previous?._quadMesh?.material;
             if (quadMat) {
-                disposeResource(quadMat, new Set());
                 quadMat.fragmentNode = null;
             }
         } catch {}
@@ -405,17 +404,18 @@ export function createFxCore({
         retirePostPipeline({ recreate: true });
     }
 
-    // Deep-dispose a post-FX node. PassNode owns render targets and temporal
-    // previous-frame texture clones; RTTNode from convertToTexture owns its
-    // render target plus a private quad material. Three's base Node.dispose()
-    // only dispatches an event, so walk the private ownership fields too.
+    // r186 PassNode/RTTNode dispose their targets and RTT quad material.
+    // PassNode still omits detached temporal textures. Reap only those;
+    // do not double-dispose resources now owned by upstream dispose().
     function disposeNodeDeep(node, seen) {
         if (!node) return;
         try {
-            disposeResource(node.renderTarget, seen);
             disposeResourceMap(node._previousTextures, seen);
-            disposeResourceMap(node._textures, seen);
-            disposeResource(node._quadMesh?.material, seen);
+            const attachments = new Set(node.renderTarget?.textures || []);
+            if (node.renderTarget?.depthTexture) attachments.add(node.renderTarget.depthTexture);
+            for (const texture of Object.values(node._textures || {})) {
+                if (!attachments.has(texture)) disposeResource(texture, seen);
+            }
             disposeResource(node, seen);
 
             node.scene = null;

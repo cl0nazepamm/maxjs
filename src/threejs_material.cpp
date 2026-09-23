@@ -763,6 +763,11 @@ ClassDesc2* GetThreeJSTSLMtlDesc() { return &threeJSTSLMtlDesc; }
         p_end
 
 #define THREEJS_PHYSICAL_PARAM_ITEMS \
+    pb_phys_retroreflectivity, _T("physicalRetroreflectivity"), TYPE_FLOAT, P_ANIMATABLE, 0, \
+        p_default, 0.0f, \
+        p_range, 0.0f, 1.0f, \
+        p_ui, TYPE_SPINNER, EDITTYPE_FLOAT, IDC_PHYS_RETRO_EDIT, IDC_PHYS_RETRO_SPIN, 0.01f, \
+        p_end, \
     pb_phys_specular_color, _T("physicalSpecularColor"), TYPE_RGBA, P_ANIMATABLE, 0, \
         p_default, Color(1.0f, 1.0f, 1.0f), \
         p_ui, TYPE_COLORSWATCH, IDC_PHYS_SPEC_COLOR, \

@@ -1,5 +1,6 @@
 // sky.js - procedural sky environment and sky-derived probe state.
 import * as THREE from 'three';
+import { SKY_DETAIL_DEFAULTS, normalizeSkyDetails, applySkyDetails, createSkySun } from '../sky_parameters.js';
 import * as THREE_STD from 'three-std';
 import { uniform, vec4 } from 'three/tsl';
 import { SkyMesh } from 'three/addons/objects/SkyMesh.js';
@@ -48,6 +49,7 @@ function createSky(deps = {}) {
         const skyGiSunDirectionScratch = new THREE.Vector3();
         const SPECTRAL_GI_SKY_INTENSITY = 2.0;
         const SKY_DEFAULTS = Object.freeze({
+            ...SKY_DETAIL_DEFAULTS,
             turbidity: 10,
             rayleigh: 3,
             mieCoefficient: 0.005,
@@ -300,6 +302,7 @@ function createSky(deps = {}) {
             params.azimuth = skyNumber(params.azimuth, SKY_DEFAULTS.azimuth);
             params.exposure = skyNumber(params.exposure, SKY_DEFAULTS.exposure);
             params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
+            normalizeSkyDetails(params);
             return params;
         }
 
@@ -468,16 +471,16 @@ function createSky(deps = {}) {
                     u.rayleigh.value = params.rayleigh;
                     u.mieCoefficient.value = params.mieCoefficient;
                     u.mieDirectionalG.value = params.mieDirectionalG;
-                    u.up.value.set(0, 1, 0);
                     u.sunPosition.value.copy(sunDir);
                 } else {
                     skyMesh.turbidity.value = params.turbidity;
                     skyMesh.rayleigh.value = params.rayleigh;
                     skyMesh.mieCoefficient.value = params.mieCoefficient;
                     skyMesh.mieDirectionalG.value = params.mieDirectionalG;
-                    skyMesh.upUniform.value.set(0, 1, 0);
                     skyMesh.sunPosition.value.copy(sunDir);
                 }
+
+                applySkyDetails(skyMesh, params);
 
                 // The Post FX tonemapper/exposure stays authoritative for the
                 // frame; sky exposure scales only the dome + probe sky inputs.
@@ -498,8 +501,13 @@ function createSky(deps = {}) {
                 deps.scene.backgroundRotation.set(0, 0, 0);
 
                 // Sun DirectionalLight along sun direction
+                if (skySunLight && !!skySunLight.isSunLight !== params.sunShadows) {
+                    skySunLight.removeFromParent();
+                    skySunLight.dispose();
+                    skySunLight = null;
+                }
                 if (!skySunLight) {
-                    skySunLight = new THREE.DirectionalLight(0xffffff, 2.0);
+                    skySunLight = createSkySun(deps.renderer, params);
                     skySunLight.name = '__maxjs_sky_sun__';
                     skySunLight.userData.volumetricBypass = true;
                 }
@@ -509,6 +517,7 @@ function createSky(deps = {}) {
                 skySunLight.color.setRGB(1.0, warmth, warmth * 0.85);
                 skySunLight.intensity = 1.0 + sunStrength * 3.0;
                 skySunLight.position.copy(sunDir).multiplyScalar(200);
+                skySunLight.shadow.camera.far = params.sunShadowDistance;
 
                 // Sky fill HemisphereLight
                 if (!skyFillLight) {

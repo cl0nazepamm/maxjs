@@ -7,6 +7,7 @@
 // runtime-only material sources.
 
 import * as THREE from 'three';
+import { normalizeMaxMaterialXInputs } from './materialx_compat.js';
 import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
 import {
@@ -551,6 +552,7 @@ function applyPhysicalScalarParams(params, md, { supportsReflectivityAlias = tru
         params.attenuationDistance = Number(md.attenuationDistance);
     }
     setNumber(params, 'anisotropy', md?.anisotropy);
+    setNumber(params, 'retroreflectivity', md?.retroreflectivity);
     if ((md?.transmission ?? 0) > 0) params.transparent = true;
     if (md?.specularIntensity != null && Number(md.specularIntensity) < 0.001) {
         params.envMapIntensity = 0;
@@ -920,6 +922,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         const parser = new DOMParser();
         const doc = parser.parseFromString(source, 'application/xml');
         if (doc.querySelector('parsererror')) return source;
+
+        normalizeMaxMaterialXInputs(doc);
 
         const hasNamedChild = (node, name) => Array.from(node.children).some(child => child.getAttribute('name') === name);
         const appendElement = (node, tagName, attrs) => {

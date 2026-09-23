@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const THREE = require('../web/vendor/three-r185/build/three.cjs');
+const THREE = require('../web/vendor/three-r186/build/three.cjs');
 const { createLayerManager } = await import(new URL('../web/js/layer_manager.js', import.meta.url).href);
 
 function positionOf(matrix) {
@@ -422,7 +422,7 @@ assert.equal(kitInstance.raw, null, 'retired one-off kit handles do not expose s
 // Use the real r185 WebGPU node-material class as a focused resource-policy
 // check. The CJS fixture above intentionally stays classic so ObjectLoader can
 // validate the baked emergency runtimeScene tree.
-const THREE_WEBGPU = await import(new URL('../web/vendor/three-r185/build/three.webgpu.js', import.meta.url).href);
+const THREE_WEBGPU = await import(new URL('../web/vendor/three-r186/build/three.webgpu.js', import.meta.url).href);
 const tslScene = new THREE_WEBGPU.Scene();
 const tslRoot = new THREE_WEBGPU.Group();
 const tslMaterial = new THREE_WEBGPU.MeshStandardNodeMaterial({ color: 0x44aaff });

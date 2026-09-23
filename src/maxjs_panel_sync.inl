@@ -5159,6 +5159,7 @@
         structurePbr.thickness = 0.0f;
         structurePbr.iridescence = 0.0f;
         structurePbr.anisotropy = 0.0f;
+        structurePbr.retroreflectivity = 0.0f;
 
         state.structureHash = HashMaterialPBRState(structurePbr);
         MaxJSPBR slowScalarPbr = pbr;
@@ -6023,6 +6024,8 @@
             WriteFloatValue(ss, pbr.attenuationDistance, 0.0f);
             ss << L",\"anisotropy\":";
             WriteFloatValue(ss, pbr.anisotropy, 0.0f);
+            ss << L",\"retroreflectivity\":";
+            WriteFloatValue(ss, pbr.retroreflectivity, 0.0f);
         }
         if (pbr.materialModel == L"MeshSSSNodeMaterial") {
             ss << L",\"sssColor\":[";

@@ -89,6 +89,7 @@
         out.dispersion = pbr.dispersion;
         out.attenuationDistance = pbr.attenuationDistance;
         out.anisotropy = pbr.anisotropy;
+        out.retroreflectivity = pbr.retroreflectivity;
         out.specularIntensity = pbr.physicalSpecularIntensity;
         out.sheen = pbr.sheen;
         out.sheenRoughness = pbr.sheenRoughness;
@@ -593,6 +594,7 @@
         SnapshotAnimationTrackDef dispersionTrack = makeNumberTrack(L"dispersion");
         SnapshotAnimationTrackDef attenuationDistanceTrack = makeNumberTrack(L"attenuationDistance");
         SnapshotAnimationTrackDef anisotropyTrack = makeNumberTrack(L"anisotropy");
+        SnapshotAnimationTrackDef retroreflectivityTrack = makeNumberTrack(L"retroreflectivity");
         SnapshotAnimationTrackDef specularIntensityTrack = makeNumberTrack(L"specularIntensity");
         SnapshotAnimationTrackDef sheenTrack = makeNumberTrack(L"sheen");
         SnapshotAnimationTrackDef sheenRoughnessTrack = makeNumberTrack(L"sheenRoughness");
@@ -619,6 +621,7 @@
         bool dispersionChanged = false;
         bool attenuationDistanceChanged = false;
         bool anisotropyChanged = false;
+        bool retroreflectivityChanged = false;
         bool specularIntensityChanged = false;
         bool sheenChanged = false;
         bool sheenRoughnessChanged = false;
@@ -650,6 +653,7 @@
             AppendNumberTrackSample(dispersionTrack, second, sample.dispersion);
             AppendNumberTrackSample(attenuationDistanceTrack, second, sample.attenuationDistance);
             AppendNumberTrackSample(anisotropyTrack, second, sample.anisotropy);
+            AppendNumberTrackSample(retroreflectivityTrack, second, sample.retroreflectivity);
             AppendNumberTrackSample(specularIntensityTrack, second, sample.specularIntensity);
             AppendNumberTrackSample(sheenTrack, second, sample.sheen);
             AppendNumberTrackSample(sheenRoughnessTrack, second, sample.sheenRoughness);
@@ -678,6 +682,7 @@
             dispersionChanged = dispersionChanged || !NearlyEqualFloat(sample.dispersion, prev.dispersion);
             attenuationDistanceChanged = attenuationDistanceChanged || !NearlyEqualFloat(sample.attenuationDistance, prev.attenuationDistance);
             anisotropyChanged = anisotropyChanged || !NearlyEqualFloat(sample.anisotropy, prev.anisotropy);
+            retroreflectivityChanged = retroreflectivityChanged || !NearlyEqualFloat(sample.retroreflectivity, prev.retroreflectivity);
             specularIntensityChanged = specularIntensityChanged || !NearlyEqualFloat(sample.specularIntensity, prev.specularIntensity);
             sheenChanged = sheenChanged || !NearlyEqualFloat(sample.sheen, prev.sheen);
             sheenRoughnessChanged = sheenRoughnessChanged || !NearlyEqualFloat(sample.sheenRoughness, prev.sheenRoughness);
@@ -705,6 +710,7 @@
         if (dispersionChanged) outTracks.push_back(std::move(dispersionTrack));
         if (attenuationDistanceChanged) outTracks.push_back(std::move(attenuationDistanceTrack));
         if (anisotropyChanged) outTracks.push_back(std::move(anisotropyTrack));
+        if (retroreflectivityChanged) outTracks.push_back(std::move(retroreflectivityTrack));
         if (specularIntensityChanged) outTracks.push_back(std::move(specularIntensityTrack));
         if (sheenChanged) outTracks.push_back(std::move(sheenTrack));
         if (sheenRoughnessChanged) outTracks.push_back(std::move(sheenRoughnessTrack));

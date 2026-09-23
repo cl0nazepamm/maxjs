@@ -27,6 +27,13 @@ enum ThreeJSSkyParamIDs {
     psky_reserved_legacy_4,
     // Retired geospatial-sky slot (was planetAltitude).
     psky_reserved_legacy_altitude,
+    // r186 additions; never reuse retired scene parameter IDs.
+    psky_cloud_coverage,
+    psky_cloud_density,
+    psky_cloud_scale,
+    psky_cloud_elevation,
+    psky_sun_shadow_distance,
+    psky_sun_shadows,
 };
 
 bool IsThreeJSSkyClassID(const Class_ID& cid);

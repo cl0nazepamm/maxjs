@@ -95,6 +95,12 @@ Unsupported assignments fall back to the object wire color. TSL and MaterialX co
 
 Environment support includes HDRI, authored Three.js sky, camera clipping, and sky/sun linking.
 
+Three.js **r186** adds a **Retroreflection / Strength** control to the physical
+material and **Clouds** plus optional **Cascaded shadows** to the Sky map. These
+settings sync live and export with snapshots. Clouds are static for consistent
+playback; the existing sky lighting approximation remains. See
+[migration and patch notes](web/THREE_MIGRATION.md).
+
 ## PostFX
 
 WebGPU and TSL_GL use the unified max.js PostFX controller. WGL2 uses `webgl_basicfx.js`, a smaller compatibility stack.

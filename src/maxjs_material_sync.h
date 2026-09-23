@@ -270,6 +270,7 @@ struct MaxJSPBR {
     float attenuationColor[3] = {1.0f, 1.0f, 1.0f};
     float attenuationDistance = 0.0f;
     float anisotropy = 0.0f;
+    float retroreflectivity = 0.0f;
     float specular[3] = {0.0666667f, 0.0666667f, 0.0666667f};
     float shininess = 30.0f;
     float reflectivity = 0.5f;
@@ -1445,6 +1446,7 @@ static void ExtractThreeJSMtl(Mtl* mtl, TimeValue t, MaxJSPBR& d) {
         d.attenuationColor[0] = attenuationColor.r; d.attenuationColor[1] = attenuationColor.g; d.attenuationColor[2] = attenuationColor.b;
         d.attenuationDistance = pb->GetFloat(pb_phys_attenuation_distance, t);
         d.anisotropy = pb->GetFloat(pb_phys_anisotropy, t);
+        d.retroreflectivity = pb->GetFloat(pb_phys_retroreflectivity, t);
     }
     if (cid == THREEJS_ADV_MTL_CLASS_ID && d.materialModel == L"MeshSSSNodeMaterial") {
         Color sss = pb->GetColor(pb_sss_color, t);

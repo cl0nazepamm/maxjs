@@ -4,6 +4,8 @@
 // handled by project scripts and should not be replaced by default sky data.
 
 import * as THREE from 'three';
+import * as THREE_STD from 'three-std';
+import { SKY_DETAIL_DEFAULTS, normalizeSkyDetails, applySkyDetails, createSkySun } from './sky_parameters.js';
 
 import { copyMaxComponentsToWorld } from './max_basis.js';
 
@@ -11,6 +13,7 @@ let legacySkyModulePromise = null;
 let nodeSkyModulePromise = null;
 
 const SKY_FALLBACKS = Object.freeze({
+    ...SKY_DETAIL_DEFAULTS,
     turbidity: 10,
     rayleigh: 3,
     mieCoefficient: 0.005,
@@ -94,9 +97,14 @@ export function createSky({ scene, renderer } = {}) {
         scene.add(mesh);
     }
 
-    function ensureLights() {
+    function ensureLights(params) {
+        if (sun && !!sun.isSunLight !== params.sunShadows) {
+            sun.removeFromParent();
+            sun.dispose();
+            sun = null;
+        }
         if (!sun) {
-            sun = new THREE.DirectionalLight(0xffffff, 2.0);
+            sun = createSkySun(renderer, params);
             sun.name = '__maxjs_sky_sun__';
             sun.userData.volumetricBypass = true;
             sun.visible = visible;
@@ -141,7 +149,8 @@ export function createSky({ scene, renderer } = {}) {
     }
 
     function getPMREMGenerator() {
-        pmremGenerator ??= new THREE.PMREMGenerator(renderer);
+        const PMREM = useLegacySky ? THREE_STD.PMREMGenerator : THREE.PMREMGenerator;
+        pmremGenerator ??= new PMREM(renderer);
         return pmremGenerator;
     }
 
@@ -360,12 +369,13 @@ export function createSky({ scene, renderer } = {}) {
         params.azimuth = numberOr(params.azimuth, SKY_FALLBACKS.azimuth);
         params.exposure = numberOr(params.exposure, SKY_FALLBACKS.exposure);
         params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
+        normalizeSkyDetails(params);
 
         const sig = JSON.stringify(params);
         if (sig === lastSig) return { params, changed: false };
 
         await ensureMesh();
-        ensureLights();
+        ensureLights(params);
 
         const elevRad = THREE.MathUtils.degToRad(params.elevation);
         const azimRad = THREE.MathUtils.degToRad(params.azimuth);
@@ -388,16 +398,16 @@ export function createSky({ scene, renderer } = {}) {
             u.rayleigh.value = params.rayleigh;
             u.mieCoefficient.value = params.mieCoefficient;
             u.mieDirectionalG.value = params.mieDirectionalG;
-            u.up.value.set(0, 1, 0);
             u.sunPosition.value.copy(sunDir);
         } else {
             mesh.turbidity.value = params.turbidity;
             mesh.rayleigh.value = params.rayleigh;
             mesh.mieCoefficient.value = params.mieCoefficient;
             mesh.mieDirectionalG.value = params.mieDirectionalG;
-            mesh.upUniform.value.set(0, 1, 0);
             mesh.sunPosition.value.copy(sunDir);
         }
+        applySkyDetails(mesh, params);
+        sun.shadow.camera.far = params.sunShadowDistance;
         renderer.toneMappingExposure = params.exposure;
         scene.background = new THREE.Color(0x353535);
         updateSkyEnvironment(params, sunDir);
@@ -417,7 +427,7 @@ export function createSky({ scene, renderer } = {}) {
 
     function dispose() {
         try { mesh?.parent?.remove(mesh); } catch {}
-        try { sun?.parent?.remove(sun); } catch {}
+        try { sun?.parent?.remove(sun); sun?.dispose(); } catch {}
         try { fill?.parent?.remove(fill); } catch {}
         removeLightProbe();
         disposeSkyEnvironment();

@@ -132,7 +132,7 @@ BEGIN
     LTEXT           "Model: MeshStandardMaterial", IDC_MTL_MODEL_LABEL, 8, 318, 132, 8
 END
 
-IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 578
+IDD_THREEJS_ADV_MTL DIALOG 0, 0, 170, 610
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -303,6 +303,12 @@ BEGIN
     CONTROL         "",  IDC_ALPHA_TEST_EDIT,"CustEdit", WS_TABSTOP, 52,548, 28, 10
     CONTROL         "",  IDC_ALPHA_TEST_SPIN,"SpinnerControl",0, 82,548, 11, 10
     LTEXT           "Model: MeshPhysicalMaterial / MeshSSSNodeMaterial", IDC_MTL_MODEL_LABEL, 8, 562, 154, 8
+
+    GROUPBOX        "Retroreflection", -1, 2, 578, 166, 28
+    LTEXT           "Strength", -1, 8, 591, 36, 8
+    CONTROL         "", IDC_PHYS_RETRO_EDIT, "CustEdit", WS_TABSTOP, 50, 589, 30, 10
+    CONTROL         "", IDC_PHYS_RETRO_SPIN, "SpinnerControl", 0, 80, 589, 11, 10
+
 END
 
 IDD_THREEJS_SSS_MTL DIALOG 0, 0, 170, 406

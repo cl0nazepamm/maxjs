@@ -6,7 +6,7 @@ BEGIN
     IDS_THREEJS_SKY_PARAMS "three.js Sky"
 END
 
-IDD_THREEJS_SKY DIALOG 0, 0, 217, 126
+IDD_THREEJS_SKY DIALOG 0, 0, 217, 216
 STYLE DS_SETFONT | WS_CHILD | WS_VISIBLE
 FONT 8, "Segoe UI"
 BEGIN
@@ -40,6 +40,23 @@ BEGIN
     GROUPBOX        "Display", -1, 2, 92, 213, 20
     CONTROL         "Sun disc", IDC_SKY_SHOW_SUN_DISC, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 100, 52, 10
 
-    GROUPBOX        "", -1, 2, 112, 213, 12
-    LTEXT           "Assign to Environment Map slot for live sky.", -1, 8, 117, 200, 8
+    GROUPBOX        "Clouds", -1, 2, 114, 213, 56
+    LTEXT           "Coverage", -1, 8, 126, 44, 8
+    CONTROL         "", IDC_SKY_CLOUD_COVERAGE_EDIT, "CustEdit", WS_TABSTOP, 60, 124, 40, 10
+    CONTROL         "", IDC_SKY_CLOUD_COVERAGE_SPIN, "SpinnerControl", 0, 100, 124, 11, 10
+    LTEXT           "Density", -1, 120, 126, 44, 8
+    CONTROL         "", IDC_SKY_CLOUD_DENSITY_EDIT, "CustEdit", WS_TABSTOP, 152, 124, 40, 10
+    CONTROL         "", IDC_SKY_CLOUD_DENSITY_SPIN, "SpinnerControl", 0, 192, 124, 11, 10
+    LTEXT           "Scale", -1, 8, 146, 44, 8
+    CONTROL         "", IDC_SKY_CLOUD_SCALE_EDIT, "CustEdit", WS_TABSTOP, 60, 144, 40, 10
+    CONTROL         "", IDC_SKY_CLOUD_SCALE_SPIN, "SpinnerControl", 0, 100, 144, 11, 10
+    LTEXT           "Elevation", -1, 120, 146, 44, 8
+    CONTROL         "", IDC_SKY_CLOUD_ELEVATION_EDIT, "CustEdit", WS_TABSTOP, 152, 144, 40, 10
+    CONTROL         "", IDC_SKY_CLOUD_ELEVATION_SPIN, "SpinnerControl", 0, 192, 144, 11, 10
+    GROUPBOX        "Sun Shadows", -1, 2, 172, 213, 28
+    CONTROL         "Cascaded shadows", IDC_SKY_SUN_SHADOWS, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 8, 184, 82, 10
+    LTEXT           "Distance", -1, 110, 184, 34, 8
+    CONTROL         "", IDC_SKY_SUN_SHADOW_DISTANCE_EDIT, "CustEdit", WS_TABSTOP, 152, 182, 40, 10
+    CONTROL         "", IDC_SKY_SUN_SHADOW_DISTANCE_SPIN, "SpinnerControl", 0, 192, 182, 11, 10
+    LTEXT           "Assign to Environment Map slot for live sky.", -1, 8, 206, 200, 8
 END

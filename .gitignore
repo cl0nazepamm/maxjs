@@ -43,3 +43,10 @@ examples/
 skills/
 package.json
 package-lock.json
+
+# Pinned browser runtime (the generic build/examples rules above also match vendor).
+!web/vendor/three-r186/build/
+!web/vendor/three-r186/build/**
+!web/vendor/three-r186/examples/
+!web/vendor/three-r186/examples/**
+!web/vendor/three-r186/package.json

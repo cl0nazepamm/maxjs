@@ -774,6 +774,7 @@ function createMaterials(deps = {}) {
                             params.attenuationDistance = md.attenuationDistance;
                         }
                         if (md.anisotropy != null) params.anisotropy = md.anisotropy;
+                        if (md.retroreflectivity != null) params.retroreflectivity = md.retroreflectivity;
                         if ((md.transmission ?? 0) > 0) params.transparent = true;
                     }
 

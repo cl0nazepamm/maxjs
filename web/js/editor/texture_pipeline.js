@@ -1,5 +1,6 @@
 // texture_pipeline.js - bitmap, video, TSL, MaterialX, bake, and HTML texture loading.
 import * as THREE from 'three';
+import { normalizeMaxMaterialXInputs } from '../materialx_compat.js';
 import * as THREE_STD from 'three-std';
 import { MaterialXLoader } from 'three/addons/loaders/MaterialXLoader.js';
 import { createTSLCompiler, makeBakeNodeToTexture } from '../tsl_materials.js';
@@ -171,6 +172,8 @@ async function createTexturePipeline(deps = {}) {
             const parser = new DOMParser();
             const doc = parser.parseFromString(source, 'application/xml');
             if (doc.querySelector('parsererror')) return source;
+
+            normalizeMaxMaterialXInputs(doc);
 
             const hasNamedChild = (node, name) => Array.from(node.children).some(child => child.getAttribute('name') === name);
             const appendElement = (node, tagName, attrs) => {

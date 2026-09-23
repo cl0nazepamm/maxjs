@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 
 const require = createRequire(import.meta.url);
-const THREE = require('../web/vendor/three-r185/build/three.cjs');
+const THREE = require('../web/vendor/three-r186/build/three.cjs');
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const WEB_ROOT = join(ROOT, 'web');

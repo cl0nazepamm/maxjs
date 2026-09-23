@@ -11,8 +11,6 @@ export default {
     defaults: {
         enabled: false,
         samples: 16,
-        distanceExponent: 1.0,
-        distanceFallOff: 1.0,
         radius: 0.5,
         scale: 2.0,
         thickness: 1.0,
@@ -23,8 +21,6 @@ export default {
         const { state, derived } = ctx;
         const aoPass = ao(ctx.prePass.depth, ctx.prePass.normal, ctx.camera);
         aoPass.samples.value = state.gtao.samples;
-        aoPass.distanceExponent.value = state.gtao.distanceExponent;
-        aoPass.distanceFallOff.value = state.gtao.distanceFallOff;
         aoPass.radius.value = derived.effectiveGTAORadius;
         aoPass.scale.value = state.gtao.scale;
         aoPass.thickness.value = derived.effectiveGTAOThickness;
@@ -41,8 +37,6 @@ export default {
         if (!aoPass) return;
         const {state, derived} = ctx;
         aoPass.samples.value = state.gtao.samples;
-        aoPass.distanceExponent.value = state.gtao.distanceExponent;
-        aoPass.distanceFallOff.value = state.gtao.distanceFallOff;
         aoPass.radius.value = derived.effectiveGTAORadius;
         aoPass.scale.value = state.gtao.scale;
         aoPass.thickness.value = derived.effectiveGTAOThickness;

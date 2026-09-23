@@ -31,7 +31,7 @@ export default {
         if (!supportsSsgi(ctx)) {
             if (!warnedUnsupported) {
                 warnedUnsupported = true;
-                console.warn('[max.js] SSGI disabled: WebGPU device lacks rg11b10ufloat-renderable support required by three r185 SSGINode.');
+                console.warn('[max.js] SSGI disabled: WebGPU device lacks rg11b10ufloat-renderable support required by three r186 SSGINode.');
             }
             return ctx.beauty;
         }

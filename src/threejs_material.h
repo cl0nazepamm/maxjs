@@ -109,6 +109,8 @@ enum ThreeJSParamIDs {
     pb_combine,
     // Alpha cutoff (appended for scene compatibility).
     pb_alpha_test,
+    // r186 physical lobe; append to preserve saved parameter IDs.
+    pb_phys_retroreflectivity,
 };
 
 enum ThreeJSUtilityModel {

@@ -100,7 +100,7 @@ export function ensureGeometryUv0ForMaterial(geometry, material) {
 // snapshot player make the identical decision — this is a parity rule, not a
 // per-host detail.
 export const PROGRAM_GATED_MATERIAL_SCALARS = Object.freeze([
-    'sheen', 'clearcoat', 'iridescence', 'anisotropy', 'transmission', 'dispersion',
+    'sheen', 'clearcoat', 'iridescence', 'anisotropy', 'transmission', 'dispersion', 'retroreflectivity',
 ]);
 
 const PROGRAM_GATED_MATERIAL_SCALAR_SET = new Set(PROGRAM_GATED_MATERIAL_SCALARS);
@@ -232,7 +232,8 @@ export function shouldRouteBlackSpecularToLambert(requestedModelName, md) {
         && finiteNumberOr(md?.sheen, 0) <= 1.0e-4
         && finiteNumberOr(md?.iridescence, 0) <= 1.0e-4
         && finiteNumberOr(md?.transmission, 0) <= 1.0e-4
-        && finiteNumberOr(md?.anisotropy, 0) <= 1.0e-4;
+        && finiteNumberOr(md?.anisotropy, 0) <= 1.0e-4
+        && finiteNumberOr(md?.retroreflectivity, 0) <= 1.0e-4;
 }
 
 export function classifyRuntimeMaterial(md, THREE_NS = THREE) {

@@ -8,13 +8,13 @@ import { fileURLToPath } from 'node:url';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const volumetric = readFileSync(join(root, 'web/js/fx/effects/volumetric.js'), 'utf8');
 const maxLights = readFileSync(join(root, 'web/js/max_lights_node.js'), 'utf8');
-const vendoredThree = readFileSync(join(root, 'web/vendor/three-r185/build/three.webgpu.js'), 'utf8');
+const vendoredThree = readFileSync(join(root, 'web/vendor/three-r186/build/three.webgpu.js'), 'utf8');
 const pointBatch = readFileSync(
-    join(root, 'web/vendor/three-r185/examples/tsl/lighting/data/PointLightDataNode.js'),
+    join(root, 'web/vendor/three-r186/examples/tsl/lighting/data/PointLightDataNode.js'),
     'utf8',
 );
 const spotBatch = readFileSync(
-    join(root, 'web/vendor/three-r185/examples/tsl/lighting/data/SpotLightDataNode.js'),
+    join(root, 'web/vendor/three-r186/examples/tsl/lighting/data/SpotLightDataNode.js'),
     'utf8',
 );
 

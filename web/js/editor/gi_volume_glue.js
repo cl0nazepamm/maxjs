@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import * as THREE_STD from 'three-std';
 import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
-import { LightProbeGrid } from 'three/addons/lighting/LightProbeGrid.js';
+import { LightProbeGridWebGL } from 'three/addons/lighting/LightProbeGridWebGL.js';
 import { createIrradianceVolume, createProbeField as createSpeedballProbeField } from 'speedball-gi';
 
 function createGiVolumeGlue(deps = {}) {
@@ -300,7 +300,7 @@ function createGiVolumeGlue(deps = {}) {
 
         function supportsWebGLLightProbeGrid() {
             return !deps.isPathTracingMode
-                && typeof LightProbeGrid === 'function'
+                && typeof LightProbeGridWebGL === 'function'
                 && deps.renderer?.isWebGLRenderer === true;
         }
 
@@ -445,7 +445,7 @@ function createGiVolumeGlue(deps = {}) {
             const center = bounds.getCenter(new THREE.Vector3());
             const size = bounds.getSize(new THREE.Vector3());
             const resolution = chooseLightProbeGridResolution(size);
-            const nextGrid = new LightProbeGrid(
+            const nextGrid = new LightProbeGridWebGL(
                 Math.max(size.x, 1),
                 Math.max(size.y, 1),
                 Math.max(size.z, 1),

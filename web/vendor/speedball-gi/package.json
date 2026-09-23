@@ -1,0 +1,83 @@
+{
+  "name": "speedball-gi",
+  "version": "0.8.0",
+  "description": "Real-time BVH-traced dynamic diffuse global illumination (DDGI) for three.js WebGPU and WebGL2 fallback, plus WebGPU spectral tracing and photon caustics.",
+  "type": "module",
+  "license": "MIT",
+  "author": "clone.software",
+  "main": "./js/index.js",
+  "module": "./js/index.js",
+  "exports": {
+    ".": "./js/index.js",
+    "./install": "./js/install.js",
+    "./spectral-scene": "./js/spectral_scene.js",
+    "./spectral-traverse": "./js/spectral_traverse.js",
+    "./spectral-tracer": "./js/spectral_tracer.js",
+    "./srgb-lut": "./js/srgb_lut.js",
+    "./caustics": "./js/caustic_engine.js",
+    "./package.json": "./package.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cl0nazepamm/speedball.git"
+  },
+  "homepage": "https://github.com/cl0nazepamm/speedball#readme",
+  "bugs": {
+    "url": "https://github.com/cl0nazepamm/speedball/issues"
+  },
+  "files": [
+    "docs/ADVANCED.md",
+    "docs/CHANGELOG.md",
+    "js/caustic_bvh.js",
+    "js/caustic_engine.js",
+    "js/gi_clustered_lights_node.js",
+    "js/gi_budget.js",
+    "js/gi_irradiance_volume.js",
+    "js/gi_lights_node.js",
+    "js/gi_oct.js",
+    "js/gi_probes.js",
+    "js/gi_refit.js",
+    "js/gi_webgl.js",
+    "js/index.js",
+    "js/install.js",
+    "js/spectral_kernel.js",
+    "js/spectral_scene.js",
+    "js/spectral_tracer.js",
+    "js/spectral_traverse.js",
+    "js/srgb_lut.js",
+    "js/webgpu_cleanup.js",
+    "LICENSE",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "three",
+    "threejs",
+    "webgpu",
+    "webgl2",
+    "tsl",
+    "global-illumination",
+    "gi",
+    "ddgi",
+    "probe",
+    "irradiance",
+    "bvh",
+    "real-time",
+    "path-tracing",
+    "spectral",
+    "caustics"
+  ],
+  "scripts": {
+    "check": "node scripts/check-package.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "prepack": "npm run check && npm test"
+  },
+  "devDependencies": {
+    "three": "0.186.0",
+    "three-mesh-bvh": "^0.9.14"
+  },
+  "peerDependencies": {
+    "three": ">=0.185.0 <0.187.0",
+    "three-mesh-bvh": ">=0.9.11 <0.10.0"
+  }
+}

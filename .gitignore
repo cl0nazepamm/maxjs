@@ -50,3 +50,4 @@ package-lock.json
 !web/vendor/three-r186/examples/
 !web/vendor/three-r186/examples/**
 !web/vendor/three-r186/package.json
+!web/vendor/speedball-gi/package.json

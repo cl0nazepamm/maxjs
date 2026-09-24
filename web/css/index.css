@@ -2297,3 +2297,49 @@ body.light-mode .pt-pause-toggle {
     background: rgba(245, 245, 247, 0.9);
     border-color: rgba(0, 0, 0, 0.14);
 }
+
+/* ── Scene load gate ────────────────────────────
+   Shown by js/editor/scene_load_gate.js while a big scene sync applies in
+   time slices and its render pipelines warm up. Scene rendering is suspended
+   underneath, so the scrim doubles as the "held" frame. */
+#sceneLoadGate {
+    position: absolute; inset: 0; z-index: 90;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(18, 18, 20, 0.55);
+    backdrop-filter: blur(6px);
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.18s ease;
+}
+#sceneLoadGate.active { opacity: 1; pointer-events: auto; cursor: progress; }
+.scene-load-card {
+    min-width: 280px; max-width: 60vw;
+    padding: 14px 18px 16px;
+    background: var(--rail-bg);
+    border: 1px solid var(--rail-border);
+    border-radius: 8px;
+    color: rgba(232, 232, 232, 0.92);
+    font: 12px/1.5 'Segoe UI', system-ui, sans-serif;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+}
+.scene-load-title { font-weight: 600; letter-spacing: 0.02em; margin-bottom: 2px; }
+.scene-load-phase { color: rgba(180, 180, 180, 0.85); margin-bottom: 10px; min-height: 1.5em; font-variant-numeric: tabular-nums; }
+.scene-load-bar { position: relative; height: 4px; overflow: hidden; border-radius: 2px; background: rgba(255, 255, 255, 0.08); }
+.scene-load-bar-fill { height: 100%; width: 0; background: var(--rail-accent); transition: width 0.12s linear; }
+.scene-load-bar.indeterminate .scene-load-bar-fill {
+    width: 35%;
+    animation: scene-load-slide 1.1s ease-in-out infinite;
+    transition: none;
+}
+@keyframes scene-load-slide {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(300%); }
+}
+body.light-mode #sceneLoadGate { background: rgba(200, 200, 200, 0.45); }
+body.light-mode .scene-load-card {
+    background: linear-gradient(180deg, #d4d4d4 0%, #c6c6c6 100%);
+    border-color: rgba(0, 0, 0, 0.12);
+    color: #222;
+}
+body.light-mode .scene-load-phase { color: #555; }
+body.light-mode .scene-load-bar { background: rgba(0, 0, 0, 0.1); }
+body.light-mode .scene-load-bar-fill { background: #444; }

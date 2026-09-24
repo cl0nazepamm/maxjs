@@ -22,6 +22,8 @@
         import { createPathTracingGlue } from './pathtracing_glue.js';
         import { createRenderCapture } from './render_capture.js';
         import { createRenderLoop } from './render_loop.js';
+        import { createSceneLoadGate } from './scene_load_gate.js';
+        import { createLongTaskMonitor } from '../long_task_monitor.js';
         import { createPanelsMisc } from './panels_misc.js';
         import { createLights } from './lights.js';
         import { createEnvironment } from './environment.js';
@@ -374,6 +376,23 @@
         // solve until the view rests (camera quiet, not playing, delta-sync settled), so
         // a freeze can never land during interaction. Updated in the render loop.
         let speedballGiLastInteractionMs = 0;
+
+        // Scene load gate + long-task attribution (scene_load_gate.js,
+        // long_task_monitor.js). Big scene syncs apply in time slices behind
+        // the gate's overlay and warm their render pipelines before the first
+        // frame. The gate ends after that frame renders; stamping Speedball
+        // interaction there keeps its structural rebuild inside its own rest
+        // window instead of landing on the first frames the user sees.
+        const longTaskMonitor = createLongTaskMonitor({ isLogEnabled: () => debugMode });
+        longTaskMonitor.start();
+        window.maxjsLongTasks = longTaskMonitor; // console handle
+        const sceneLoadGate = createSceneLoadGate({
+            onEnd: ({ reason, elapsedMs }) => {
+                speedballGiLastInteractionMs = performance.now();
+                maxjsDebugLog(`max.js scene load: ${reason} after ${Math.round(elapsedMs)} ms`);
+            },
+        });
+        window.maxjsSceneLoadGate = sceneLoadGate; // console handle
 
         let controls = new OrbitControls(camera, renderer.domElement);
         controls.enableDamping = true;
@@ -1742,6 +1761,12 @@
             get audioSystem() { return audioSystem; },
             get gltfSystem() { return gltfSystem; },
             get animationSystem() { return animationSystem; },
+            get camera() { return camera; },
+            get sceneLoadGate() { return sceneLoadGate; },
+            get longTaskMonitor() { return longTaskMonitor; },
+            reportBridgeError: (...args) => reportBridgeError(...args),
+            maxjsDebugLog,
+            maxjsDebugWarn,
         });
         const {
             finalizeSceneNode,
@@ -2631,6 +2656,8 @@
             get scene() { return scene; },
             get camera() { return camera; },
             get maxjsFx() { return maxjsFx; },
+            get sceneLoadGate() { return sceneLoadGate; },
+            get longTaskMonitor() { return longTaskMonitor; },
             get renderToImageActive() { return renderToImageActive; },
             get pendingRenderToImage() { return pendingRenderToImage; },
             set pendingRenderToImage(value) { pendingRenderToImage = value; },

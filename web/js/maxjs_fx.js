@@ -957,6 +957,14 @@ export function createMaxJSFxController({
             }
         },
         /**
+         * Live post-FX scene pass, or null until the pipeline has been built.
+         * The scene load gate compiles render pipelines against its render
+         * target + MRT so compileAsync warms the variants the real frame uses.
+         */
+        getScenePass() {
+            return core.ctx?.scenePass ?? null;
+        },
+        /**
          * Call when the scene's mesh list / material assignment changes
          * (mesh added, removed, or material swapped). Cheap: just refreshes the
          * toon-cache and post-pass hide list. Does NOT rebuild the pipeline graph.

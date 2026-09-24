@@ -23,6 +23,12 @@ import {
 } from '../material_contract.js';
 import { ensureMaxOwned, markOwned, OWNER_MAX } from '../layer_ownership.js';
 import { createInstanceBuckets } from '../instance_buckets.js';
+import {
+    SCENE_APPLY_SLICE_DEFAULTS,
+    createDeferredPacketQueue,
+    shouldTimeSliceSceneApply,
+    yieldToEventLoop,
+} from './scene_load_gate.js';
 
 function createSceneSync(deps = {}) {
         let gpuNormalsAnnounced = false;
@@ -66,13 +72,46 @@ function createSceneSync(deps = {}) {
             excludeNode: (nd) => lightLinkTargetHandles.has(String(nd.h)),
         });
         let lastFlattenSignature = '';
+        // Sliced full-scene applies (see handleBinaryScene). Node-level
+        // packets that arrive while one is in flight are queued and replayed
+        // after it lands, so they never target half-applied state only to be
+        // overwritten by the older scene payload. A newer scene_bin supersedes
+        // the in-flight apply through the generation counter.
+        let sceneApplyGeneration = 0;
+        let slicedSceneApplyInFlight = false;
+        const deferredPackets = createDeferredPacketQueue();
+        function deferWhileApplying(label, run) {
+            if (deferredPackets.defer(run, label)) return true;
+            run();
+            return false;
+        }
+        function setSyncPhase(name) {
+            deps.longTaskMonitor?.setPhase?.(name);
+        }
         // Host wiring: binary shared-buffer routes (zero-copy geometry) are
         // registered per payload type here; the window/webview event listeners
         // live in host_bridge.installHostWiring().
         deps.hostBridge.onSharedBuffer('delta_bin', (buf, meta) => {
-                        handleBinaryDelta(buf, meta);
+                        if (deferredPackets.deferring) {
+                            // The retained slot is reused by later frames —
+                            // copy before the handler returns.
+                            const copy = buf.slice(0);
+                            deferredPackets.defer(() => handleBinaryDelta(copy, meta), 'delta_bin');
+                            return;
+                        }
+                        setSyncPhase('sync:delta');
+                        try { handleBinaryDelta(buf, meta); } finally { setSyncPhase('idle'); }
         });
         deps.hostBridge.onSharedBuffer('geo_fast', (buf, meta) => {
+                        if (deferredPackets.deferring) {
+                            const copy = buf.slice(0);
+                            deferredPackets.defer(() => handleGeoFastBinary(copy, meta), 'geo_fast');
+                            return;
+                        }
+                        setSyncPhase('sync:geo_fast');
+                        try { handleGeoFastBinary(buf, meta); } finally { setSyncPhase('idle'); }
+        });
+        function handleGeoFastBinary(buf, meta) {
                         maxTimeline.noteSceneSync?.();
                         // Real-time vertex update — in-place when topology matches
                         const mesh = deps.nodeMap.get(meta.h);
@@ -240,7 +279,7 @@ function createSceneSync(deps = {}) {
                             }
                             }
                         }
-        });
+        }
         deps.hostBridge.onSharedBufferFallback((buf, meta) => {
                         handleBinaryScene(buf, meta);
         });
@@ -1011,7 +1050,8 @@ function createSceneSync(deps = {}) {
             });
         });
 
-        deps.bridge.on('geo_fast', msg => {
+        deps.bridge.on('geo_fast', msg => deferWhileApplying('geo_fast_json', () => handleGeoFastJson(msg)));
+        function handleGeoFastJson(msg) {
             maxTimeline.noteSceneSync?.();
             const mesh = deps.nodeMap.get(msg.h);
             if (!mesh) return;
@@ -1126,10 +1166,11 @@ function createSceneSync(deps = {}) {
             if (materialChanged) deps.markSpeedballMaterialsDirty(mesh);
             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             deps.schedulePathTracingLiveRebuild();
-        });
+        }
 
         // ── Transform Sync (+ material scalars, ~6fps) ──────
-        deps.bridge.on('xform', msg => {
+        deps.bridge.on('xform', msg => deferWhileApplying('xform', () => handleXformJson(msg)));
+        function handleXformJson(msg) {
             const applyStart = performance.now();
             let runtimeOverridesChanged = false;
             let visibilityChanged = false;
@@ -1220,11 +1261,143 @@ function createSceneSync(deps = {}) {
                 decodeMs: 0,
                 applyMs,
             });
-        });
+        }
 
         // ── Binary Scene Handler (SharedBuffer) ──────────────
+        // Small syncs apply synchronously inside the host event, exactly as
+        // before. A big sync (many fresh geometries, or a large buffer — a
+        // scene switch, the first load) copies the shared buffer once so the
+        // host event can return, then applies the node list in time slices
+        // behind the scene load gate, warms the render pipelines with
+        // compileAsync, and lets the render loop present the first frame
+        // before the overlay drops. See scene_load_gate.js.
         function handleBinaryScene(buffer, meta) {
             if (meta.type !== 'scene_bin') return;
+            const gate = deps.sceneLoadGate ?? null;
+            if (gate && shouldTimeSliceSceneApply(meta, buffer.byteLength)) {
+                // The shared buffer is only valid inside the host event; the
+                // sliced apply outlives it.
+                const owned = buffer.slice(0);
+                void runSlicedSceneApply(owned, meta, gate);
+                return;
+            }
+            setSyncPhase('scene:apply');
+            try {
+                // No slicer: applyBinaryScene never awaits, so this completes
+                // synchronously before the host releases the buffer.
+                void applyBinaryScene(buffer, meta, null);
+            } finally {
+                setSyncPhase('idle');
+            }
+        }
+
+        async function runSlicedSceneApply(buffer, meta, gate) {
+            const generation = ++sceneApplyGeneration;
+            const wasInFlight = slicedSceneApplyInFlight;
+            slicedSceneApplyInFlight = true;
+            if (!wasInFlight) deferredPackets.begin();
+            const nodeCount = Array.isArray(meta.nodes) ? meta.nodes.length : 0;
+            gate.begin({ label: 'Loading scene', total: nodeCount });
+            const slicer = {
+                generation,
+                budgetMs: SCENE_APPLY_SLICE_DEFAULTS.chunkBudgetMs,
+                chunkStart: performance.now(),
+                superseded: () => generation !== sceneApplyGeneration,
+                // Returns `true` synchronously while the chunk budget holds —
+                // NOT a promise: an `await` per node would hop the microtask
+                // queue at every node, letting a second scene_bin interleave
+                // with this apply and leave stragglers behind. Only a real
+                // yield returns a promise, resolving to false once superseded.
+                maybeYield(done, total) {
+                    if (performance.now() - this.chunkStart < this.budgetMs) return true;
+                    gate.progress(done, total);
+                    setSyncPhase('idle');
+                    return yieldToEventLoop().then(() => {
+                        setSyncPhase('scene:apply');
+                        this.chunkStart = performance.now();
+                        return !this.superseded();
+                    });
+                },
+            };
+            let outcome = 'error';
+            try {
+                setSyncPhase('scene:apply');
+                outcome = await applyBinaryScene(buffer, meta, slicer);
+                if (outcome === 'applied') {
+                    gate.setState('compile');
+                    setSyncPhase('scene:compile');
+                    await warmupScenePipelines();
+                    if (slicer.superseded()) outcome = 'superseded';
+                }
+            } catch (error) {
+                outcome = 'error';
+                deps.reportBridgeError?.('scene apply error', error);
+            } finally {
+                setSyncPhase('idle');
+            }
+            if (outcome === 'superseded') {
+                // The newer apply owns the gate and the deferred queue now.
+                return;
+            }
+            slicedSceneApplyInFlight = false;
+            const replayed = deferredPackets.flush((error, label) => {
+                deps.reportBridgeError?.(`deferred ${label} error`, error);
+            });
+            if (replayed > 0) deps.maxjsDebugLog?.(`max.js scene load: replayed ${replayed} deferred packet(s)`);
+            if (outcome === 'applied') {
+                // The render loop draws one frame behind the overlay, then ends
+                // the gate (render_loop.renderFrame).
+                gate.setState('firstFrame');
+            } else {
+                gate.end(outcome);
+            }
+        }
+
+        // Warm the WebGPU render pipelines the first frame would otherwise
+        // create synchronously (one createRenderPipeline per material variant,
+        // each a driver-side shader compile). compileAsync routes them through
+        // createRenderPipelineAsync. It compiles against the CURRENT render
+        // target + MRT, so target the post-FX scene pass when one exists;
+        // variants it cannot reach (shadow passes, a pass not built yet) still
+        // compile on the first frame — behind the overlay.
+        async function warmupScenePipelines() {
+            const renderer = deps.renderer;
+            const camera = deps.camera;
+            if (!renderer || typeof renderer.compileAsync !== 'function' || !camera) return false;
+            const scenePass = deps.maxjsFx?.getScenePass?.() ?? null;
+            const passTarget = scenePass?.renderTarget?.isRenderTarget ? scenePass.renderTarget : null;
+            const previousTarget = typeof renderer.getRenderTarget === 'function' ? renderer.getRenderTarget() : null;
+            const previousMRT = typeof renderer.getMRT === 'function' ? renderer.getMRT() : null;
+            let timer = 0;
+            try {
+                if (passTarget) {
+                    renderer.setRenderTarget(passTarget);
+                    if (typeof renderer.setMRT === 'function') renderer.setMRT(scenePass.getMRT?.() ?? null);
+                }
+                await Promise.race([
+                    renderer.compileAsync(deps.scene, camera),
+                    new Promise((resolve) => { timer = setTimeout(resolve, SCENE_APPLY_SLICE_DEFAULTS.compileTimeoutMs); }),
+                ]);
+                return true;
+            } catch (error) {
+                deps.maxjsDebugWarn?.('max.js scene load: pipeline warm-up failed, first frame compiles inline:', error);
+                return false;
+            } finally {
+                if (timer) clearTimeout(timer);
+                try {
+                    if (passTarget) {
+                        renderer.setRenderTarget(previousTarget);
+                        if (typeof renderer.setMRT === 'function') renderer.setMRT(previousMRT);
+                    }
+                } catch { /* renderer torn down mid-load */ }
+            }
+        }
+
+        // Applies one scene_bin payload. With `slicer` null the body never
+        // awaits and runs to completion synchronously inside the caller's
+        // event; with a slicer it yields between chunks and returns
+        // 'superseded' (without finalizing) when a newer apply took over.
+        async function applyBinaryScene(buffer, meta, slicer) {
             deps.resolveSnapshotMaterialRefs(meta);
             deps.setTransportMode('binary-scene');
             const applyStart = performance.now();
@@ -1255,7 +1428,16 @@ function createSceneSync(deps = {}) {
             // Geometry cache for instance sharing within this sync
             const geoByHandle = new Map();
 
-            for (const nd of meta.nodes) {
+            const nodes = meta.nodes;
+            const nodeTotal = nodes.length;
+            for (let nodeIndex = 0; nodeIndex < nodeTotal; nodeIndex++) {
+                const nd = nodes[nodeIndex];
+                // Time slice: only the sliced path, and only at a real chunk
+                // boundary, ever awaits here (see slicer.maybeYield).
+                if (slicer) {
+                    const keepGoing = slicer.maybeYield(nodeIndex, nodeTotal);
+                    if (keepGoing !== true && !(await keepGoing)) return 'superseded';
+                }
                 let mesh = deps.nodeMap.get(nd.h);
                 if (nd.helper === true) {
                     ensureTransformOnlyNode(nd, mesh);
@@ -1392,6 +1574,7 @@ function createSceneSync(deps = {}) {
                     deps.animationSystem?.invalidateTargets();
                 },
             });
+            return 'applied';
         }
 
         function handleBinaryDelta(buffer, meta) {
@@ -1646,6 +1829,8 @@ function createSceneSync(deps = {}) {
                 geom.computeBoundingBox();
                 geom.computeBoundingSphere();
             }
+            // Same Speedball BLAS cache key the binary path stamps.
+            if (!isLine) stampGeometryContentKey(geom);
             return geom;
         }
 
@@ -1829,8 +2014,6 @@ function createSceneSync(deps = {}) {
             const assignGatedScalar = assignGatedMaterialScalar;
 
             for (const m of mats) {
-            // Same Speedball BLAS cache key the binary path stamps.
-            if (!isLine) stampGeometryContentKey(geom);
                 if (!m) continue;
                 if (m.userData?.maxjsHTMLTextureOverride) continue;
                 let materialNeedsUpdate = false;

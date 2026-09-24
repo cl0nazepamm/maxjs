@@ -16,7 +16,16 @@ function createRenderLoop(deps = {}) {
 
         function renderFrame(frameTimeMs = performance.now()) {
             deps.flushMaterialDisposals();
+            // Scene load gate (scene_load_gate.js): while a sliced scene apply
+            // or its pipeline warm-up is in flight, present nothing — a
+            // half-applied scene must never reach the screen and no pipeline
+            // may compile early. In 'firstFrame' this frame renders behind the
+            // overlay and then ends the gate.
+            const sceneLoadGate = deps.sceneLoadGate ?? null;
+            if (sceneLoadGate?.isBlockingRender?.()) return;
+            const gateFirstFrame = sceneLoadGate?.isFirstFrame?.() === true;
             if (deps.renderToImageActive && !deps.pendingRenderToImage) return;
+            deps.longTaskMonitor?.setPhase?.(gateFirstFrame ? 'scene:first-frame' : 'render');
             const manualFpsCap = Number.isFinite(deps.performanceSettings.fpsCap) ? deps.performanceSettings.fpsCap : 0;
             if (!deps.renderer.xr?.isPresenting && manualFpsCap > 0) {
                 const minFrameMs = 1000 / manualFpsCap;
@@ -155,6 +164,7 @@ function createRenderLoop(deps = {}) {
             } finally {
                 deps.layerManager.afterRender?.(frameElapsed);
             }
+            if (gateFirstFrame) sceneLoadGate.end('rendered');
             // Idle GI: keep probe rebuilds out of camera/playback/sync churn.
             // Existing probes stay visible as history; after idle, the GPU solve
             // blends new C++/viewer data into the same volume.
@@ -270,6 +280,7 @@ function createRenderLoop(deps = {}) {
             if (perfHudActive) {
                 deps.perfHud.updateRender(performance.now() - renderStart, deps.renderer.info?.render, deps.renderer.info?.memory);
             }
+            deps.longTaskMonitor?.setPhase?.('idle');
         }
 
 

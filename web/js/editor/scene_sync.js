@@ -7,6 +7,7 @@ import {
     binInRange,
     buildSkinnedMeshFromNd as buildSkinnedMeshFromBinary,
     geometryFromNodeBinary,
+    stampGeometryContentKey,
     typedArrayCanStore,
     updateFloatGeometryAttribute,
     updateGeometryIndexAttribute,
@@ -1285,7 +1286,9 @@ function createSceneSync(deps = {}) {
                     const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
                     if (srcGeom) geom = deps.resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
                 } else if (nd.geo && !jsmodSkipGeo) {
-                    geom = geometryFromNodeBinary(nd, buffer);
+                    // contentKey: stamp the Speedball BLAS cache key so a
+                    // scene switch that brings this mesh back reuses its BVH.
+                    geom = geometryFromNodeBinary(nd, buffer, { contentKey: true });
                     if (!geom) continue;
                     setGeometryVertexColorAttributes(geom, nd.geo.vc, buffer);
                     // Add material groups for Multi/Sub
@@ -1826,6 +1829,8 @@ function createSceneSync(deps = {}) {
             const assignGatedScalar = assignGatedMaterialScalar;
 
             for (const m of mats) {
+            // Same Speedball BLAS cache key the binary path stamps.
+            if (!isLine) stampGeometryContentKey(geom);
                 if (!m) continue;
                 if (m.userData?.maxjsHTMLTextureOverride) continue;
                 let materialNeedsUpdate = false;

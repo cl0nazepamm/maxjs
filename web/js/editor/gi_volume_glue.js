@@ -3,7 +3,17 @@ import * as THREE from 'three';
 import * as THREE_STD from 'three-std';
 import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
 import { LightProbeGridWebGL } from 'three/addons/lighting/LightProbeGridWebGL.js';
-import { createIrradianceVolume, createProbeField as createSpeedballProbeField } from 'speedball-gi';
+import { createBlasCache, createIrradianceVolume, createProbeField as createSpeedballProbeField } from 'speedball-gi';
+
+// One Speedball BLAS cache for the whole viewer session. Fields are recreated
+// on structural GI setting changes and the synced scene is replaced on every
+// file switch; keeping the cache here (keyed by the content stamp scene_sync
+// puts on each geometry) means a mesh that comes back — same file reopened,
+// a shared asset in the next scene — reuses its traced BVH instead of
+// rebuilding it. Budgeted in unique triangles, LRU-evicted past the cap.
+// Created on first field construction, not at import time.
+const SPEEDBALL_BLAS_CACHE_TRIANGLES = 4_000_000;
+let speedballBlasCache = null;
 
 function createGiVolumeGlue(deps = {}) {
         // Speedball GI Probe Grid side-channel: handle -> { size:[l,w,h], div:[x,y,z], enabled }.
@@ -1085,6 +1095,11 @@ function createGiVolumeGlue(deps = {}) {
                     roughReflections: speedballGiSettings.roughReflections,
                     reflectionIntensity: speedballGiSettings.reflectionIntensity,
                     onRebuilt: markLightProbeMaterialsDirty,
+                    // Session-wide BLAS cache (see top of file) + off-thread
+                    // BVH builds so a structural rebuild after a scene switch
+                    // no longer blocks the render thread.
+                    blasCache: (speedballBlasCache ??= createBlasCache({ maxTriangles: SPEEDBALL_BLAS_CACHE_TRIANGLES })),
+                    blasWorkers: 'auto',
                 });
                 const replaceSpeedballField = () => {
                     const previousField = speedballField;

@@ -180,6 +180,107 @@ export function typedArrayCanStore(array, expectedLength) {
     }
 }
 
+// ── Stable geometry content key ────────────────────────────────────────────
+// Speedball GI keys its cross-rebuild BLAS cache on
+// `geometry.userData.speedballGeometryKey` when present. Stamping a CONTENT
+// hash there means a scene switch (or a reload of the same file) that brings
+// back byte-identical meshes reuses their traced BVHs instead of rebuilding
+// them, because the key no longer depends on the BufferGeometry object's
+// identity. The hash covers exactly what the BLAS consumes — position,
+// index, normal, uv — plus counts, so any content change changes the key.
+//
+// Ownership: the stamp is only valid while the arrays it hashed are the
+// arrays the geometry carries. Every in-place writer in this module clears it
+// (Speedball also folds attribute versions in as a second line of defence),
+// so a deforming mesh silently falls back to identity keying. Note that
+// three's BufferGeometry.copy() shares userData by reference, so a clone
+// carries the stamp and clearing it on either side clears both — the
+// conservative direction (a missed hit, never a wrong one).
+export const GEOMETRY_CONTENT_KEY = 'speedballGeometryKey';
+const GEOMETRY_CONTENT_KEY_ATTRIBUTES = ['position', 'normal', 'uv'];
+
+// Two independent 32-bit FNV-1a style lanes over the little-endian bytes,
+// walked as u32 words where the view is 4-byte aligned. Both lanes advance in
+// one pass so a 1M-vertex mesh costs one linear sweep, not two.
+function hashLanes(lanes, array) {
+    let h0 = lanes[0];
+    let h1 = lanes[1];
+    const byteLength = array.byteLength;
+    const wordCount = byteLength >>> 2;
+    let tailStart = array.byteOffset;
+    if (wordCount > 0 && (array.byteOffset & 3) === 0) {
+        const words = new Uint32Array(array.buffer, array.byteOffset, wordCount);
+        for (let i = 0; i < wordCount; i++) {
+            const w = words[i];
+            h0 = Math.imul(h0 ^ w, 0x01000193);
+            h1 = Math.imul(h1 ^ w, 0x0000019D);
+        }
+        tailStart += wordCount * 4;
+    }
+    const bytes = new Uint8Array(array.buffer, tailStart, array.byteOffset + byteLength - tailStart);
+    for (let i = 0; i < bytes.length; i++) {
+        h0 = Math.imul(h0 ^ bytes[i], 0x01000193);
+        h1 = Math.imul(h1 ^ bytes[i], 0x0000019D);
+    }
+    lanes[0] = h0 >>> 0;
+    lanes[1] = h1 >>> 0;
+}
+
+function hashScalar(lanes, value) {
+    lanes[0] = Math.imul(lanes[0] ^ (value >>> 0), 0x01000193) >>> 0;
+    lanes[1] = Math.imul(lanes[1] ^ (value >>> 0), 0x0000019D) >>> 0;
+}
+
+/**
+ * Returns a stable content key for `geometry`, or `null` when an attribute
+ * is not a plain typed-array BufferAttribute (interleaved or missing
+ * position data cannot be keyed cheaply and honestly).
+ */
+export function computeGeometryContentKey(geometry) {
+    const position = geometry?.getAttribute?.('position');
+    if (!position || position.isInterleavedBufferAttribute || !ArrayBuffer.isView(position.array)) return null;
+    const lanes = [0x811C9DC5, 0x9747B28C];
+    const index = geometry.getIndex();
+    if (index) {
+        if (index.isInterleavedBufferAttribute || !ArrayBuffer.isView(index.array)) return null;
+        hashScalar(lanes, 0x1D);
+        hashScalar(lanes, index.count);
+        hashScalar(lanes, index.array.BYTES_PER_ELEMENT);
+        hashLanes(lanes, index.array);
+    } else {
+        hashScalar(lanes, 0);
+    }
+    for (let a = 0; a < GEOMETRY_CONTENT_KEY_ATTRIBUTES.length; a++) {
+        const attr = geometry.getAttribute(GEOMETRY_CONTENT_KEY_ATTRIBUTES[a]);
+        if (!attr) { hashScalar(lanes, 0); continue; }
+        if (attr.isInterleavedBufferAttribute || !ArrayBuffer.isView(attr.array)) return null;
+        hashScalar(lanes, 0xA7 + a);
+        hashScalar(lanes, attr.count);
+        hashScalar(lanes, attr.itemSize);
+        hashScalar(lanes, attr.array.BYTES_PER_ELEMENT);
+        hashScalar(lanes, attr.normalized ? 1 : 0);
+        hashLanes(lanes, attr.array);
+    }
+    return `${lanes[0].toString(16).padStart(8, '0')}${lanes[1].toString(16).padStart(8, '0')}`;
+}
+
+/** Stamps (or clears, when it cannot be computed) the stable content key. */
+export function stampGeometryContentKey(geometry) {
+    if (!geometry) return null;
+    const key = computeGeometryContentKey(geometry);
+    geometry.userData ??= {};
+    if (key === null) delete geometry.userData[GEOMETRY_CONTENT_KEY];
+    else geometry.userData[GEOMETRY_CONTENT_KEY] = key;
+    return key;
+}
+
+/** Drops the stamp after an in-place write the hash did not see. */
+export function invalidateGeometryContentKey(geometry) {
+    if (geometry?.userData && GEOMETRY_CONTENT_KEY in geometry.userData) {
+        delete geometry.userData[GEOMETRY_CONTENT_KEY];
+    }
+}
+
 export function updateFloatGeometryAttribute(geometry, name, buffer, off, n, itemSize) {
     if (!Number.isSafeInteger(itemSize) || itemSize <= 0 ||
         !binInRange(buffer, off, n) || n % itemSize !== 0) {
@@ -189,6 +290,8 @@ export function updateFloatGeometryAttribute(geometry, name, buffer, off, n, ite
     const source = new Float32Array(buffer, off, n);
     const count = n / itemSize;
     const current = geometry.getAttribute(name);
+    // The stamp hashed the old contents; both branches below replace them.
+    if (GEOMETRY_CONTENT_KEY_ATTRIBUTES.includes(name)) invalidateGeometryContentKey(geometry);
     if (
         current
         && current.itemSize === itemSize
@@ -224,12 +327,14 @@ export function updateGeometryIndexAttribute(geometry, buffer, off, n, type = ''
             if (dst[i] !== source[i]) { changed = true; break; }
         }
         if (!changed) return 'unchanged';
+        invalidateGeometryContentKey(geometry);
         current.array.set(source);
         current.needsUpdate = true;
         return true;
     }
     const owned = indexArrayFromBinary(buffer, off, n, type, { copy: true, label: 'index' });
     if (!owned) return false;
+    invalidateGeometryContentKey(geometry);
     geometry.setIndex(new THREE.BufferAttribute(owned, 1));
     return true;
 }
@@ -242,7 +347,7 @@ export function updateGeometryIndexAttribute(geometry, buffer, off, n, type = ''
  * attribute updates, and skin attribute attachment — those have wider
  * dependencies that don't belong in a pure binary parser.
  */
-export function geometryFromNodeBinary(nd, buffer) {
+export function geometryFromNodeBinary(nd, buffer, { contentKey = false } = {}) {
     const geo = nd?.geo;
     if (!geo) return null;
     const primitiveSize = nd.spline ? 2 : 3;
@@ -313,6 +418,11 @@ export function geometryFromNodeBinary(nd, buffer) {
     } else if (!nd.spline) {
         out.computeVertexNormals();
     }
+
+    // Live viewer only: the stamp pays a linear hash so the NEXT load of the
+    // same mesh reuses its Speedball BLAS. Splines are never traced and a
+    // standalone snapshot never reloads, so neither pays for it.
+    if (contentKey && !nd.spline) stampGeometryContentKey(out);
 
     return out;
 }

@@ -11,11 +11,16 @@ import {
     captureRetainedDeltaFrame,
 } from '../web/js/protocol.js';
 import {
+    GEOMETRY_CONTENT_KEY,
     attachSkinAttributes,
     binInRange,
+    computeGeometryContentKey,
     geometryFromNodeBinary,
+    invalidateGeometryContentKey,
+    stampGeometryContentKey,
     typedArrayCanStore,
     updateFloatGeometryAttribute,
+    updateGeometryIndexAttribute,
 } from '../web/js/scene_binary.js';
 import { applySceneBin } from '../web/js/scene_applier.js';
 import { createInstanceBuckets } from '../web/js/instance_buckets.js';
@@ -300,11 +305,98 @@ function m3RangeSmoke() {
             skin: { wOff: 0, wN: 3, iOff: 0, iN: 3 },
         }, buffer);
         assert.equal(destination.getAttribute('skinWeight'), undefined);
+        geometryContentKeySmoke(descriptor, buffer);
     } finally {
         console.warn = originalWarn;
         geometry.dispose();
     }
     assert.ok(warnings.length >= 7);
+}
+
+// Speedball BLAS cache key: a content hash stamped on userData by the live
+// decode, stable across geometry objects with identical bytes, sensitive to
+// every array the BLAS consumes, and cleared by every in-place writer.
+function geometryContentKeySmoke(descriptor, buffer) {
+    const plain = geometryFromNodeBinary(descriptor, buffer);
+    assert.equal(plain.userData[GEOMETRY_CONTENT_KEY], undefined, 'snapshot decode does not pay for a stamp');
+    const a = geometryFromNodeBinary(descriptor, buffer, { contentKey: true });
+    const b = geometryFromNodeBinary(descriptor, buffer, { contentKey: true });
+    const key = a.userData[GEOMETRY_CONTENT_KEY];
+    assert.match(key, /^[0-9a-f]{16}$/, 'sixteen hex digits');
+    assert.equal(b.userData[GEOMETRY_CONTENT_KEY], key, 'identical bytes → identical key on a different object');
+    assert.notEqual(a.uuid, b.uuid);
+    assert.equal(computeGeometryContentKey(a), key, 'recompute is deterministic');
+    assert.equal(geometryFromNodeBinary({ ...descriptor, spline: true, geo: { ...descriptor.geo, iN: 2 } }, buffer, { contentKey: true })
+        ?.userData[GEOMETRY_CONTENT_KEY], undefined, 'splines are never stamped');
+
+    // Every consumed array participates.
+    const variants = [];
+    const moved = a.clone();
+    moved.attributes.position.array[0] += 0.5;
+    variants.push(['position', computeGeometryContentKey(moved)]);
+    const rewound = a.clone();
+    rewound.index.array[0] = 2; rewound.index.array[2] = 0;
+    variants.push(['index', computeGeometryContentKey(rewound)]);
+    const bent = a.clone();
+    bent.attributes.normal.array[0] += 0.5;
+    variants.push(['normal', computeGeometryContentKey(bent)]);
+    const mapped = a.clone();
+    mapped.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(6), 2));
+    variants.push(['uv', computeGeometryContentKey(mapped)]);
+    const seen = new Set([key]);
+    for (const [what, variant] of variants) {
+        assert.match(variant, /^[0-9a-f]{16}$/);
+        assert.ok(!seen.has(variant), `${what} change must change the key`);
+        seen.add(variant);
+    }
+    // Odd-length u16 index exercises the unaligned/tail byte path.
+    const u16 = a.clone();
+    u16.setIndex(new THREE.BufferAttribute(new Uint16Array([0, 1, 2]), 1));
+    assert.match(computeGeometryContentKey(u16), /^[0-9a-f]{16}$/);
+    assert.notEqual(computeGeometryContentKey(u16), key, 'index element width participates');
+    // Unkeyable geometry clears rather than lies.
+    const interleaved = a.clone();
+    const ib = new THREE.InterleavedBuffer(new Float32Array(9), 3);
+    interleaved.setAttribute('position', new THREE.InterleavedBufferAttribute(ib, 3, 0));
+    interleaved.userData[GEOMETRY_CONTENT_KEY] = 'stale';
+    assert.equal(stampGeometryContentKey(interleaved), null);
+    assert.equal(interleaved.userData[GEOMETRY_CONTENT_KEY], undefined, 'unkeyable stamp is cleared');
+
+    // In-place writers drop the stamp (positions, normals, uvs, index), a
+    // byte-identical index resend keeps it, and a clone carries its own copy.
+    const target = geometryFromNodeBinary(descriptor, buffer, { contentKey: true });
+    assert.equal(updateFloatGeometryAttribute(target, 'position', buffer, 0, 9, 3), true);
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], undefined, 'position write clears the stamp');
+    stampGeometryContentKey(target);
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], key);
+    assert.equal(updateGeometryIndexAttribute(target, buffer, 36, 3, 'u32'), 'unchanged');
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], key, 'unchanged index resend keeps the stamp');
+    const swapped = new ArrayBuffer(12);
+    new DataView(swapped).setInt32(0, 2, true);
+    new DataView(swapped).setInt32(4, 1, true);
+    new DataView(swapped).setInt32(8, 0, true);
+    assert.equal(updateGeometryIndexAttribute(target, swapped, 0, 3, 'u32'), true);
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], undefined, 'index rewrite clears the stamp');
+    stampGeometryContentKey(target);
+    assert.equal(updateFloatGeometryAttribute(target, 'normal', buffer, 0, 9, 3), true);
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], undefined, 'normal write clears the stamp');
+    stampGeometryContentKey(target);
+    assert.equal(updateFloatGeometryAttribute(target, 'uv', buffer, 0, 6, 2), true);
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], undefined, 'uv write (new attribute) clears the stamp');
+    stampGeometryContentKey(target);
+    assert.equal(updateFloatGeometryAttribute(target, 'color', buffer, 0, 9, 3), true);
+    assert.notEqual(target.userData[GEOMETRY_CONTENT_KEY], undefined, 'an attribute the BLAS ignores keeps the stamp');
+    // three's BufferGeometry.copy() shares userData BY REFERENCE, so a clone
+    // carries the stamp and invalidating either side clears both. That is the
+    // safe direction (a missed hit, never a wrong one) and the smoke pins it
+    // so an upstream change to copy() semantics is noticed here.
+    const copy = target.clone();
+    assert.equal(copy.userData, target.userData, 'three shares userData between a geometry and its clone');
+    assert.equal(copy.userData[GEOMETRY_CONTENT_KEY], target.userData[GEOMETRY_CONTENT_KEY], 'clone carries the stamp');
+    invalidateGeometryContentKey(copy);
+    assert.equal(target.userData[GEOMETRY_CONTENT_KEY], undefined, 'shared userData: clone invalidation clears the source too');
+    invalidateGeometryContentKey(null);
+    for (const g of [plain, a, b, moved, rewound, bent, mapped, u16, interleaved, target, copy]) g.dispose();
 }
 
 function m3AliasedRangeDiagnosticsSmoke() {

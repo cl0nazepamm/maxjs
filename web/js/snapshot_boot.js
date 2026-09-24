@@ -83,6 +83,7 @@ import {
 import { copyMaxArrayToWorld, copyMaxComponentsToWorld } from './max_basis.js';
 import { binInRange, geometryFromNodeBinary, typedArrayCanStore } from './scene_binary.js';
 import { sceneSpace } from './max_basis.js';
+import { beginAsyncPipelineMode, warmRenderPipelines } from './pipeline_warmup.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -2003,6 +2004,10 @@ async function createSnapshotNirSensingController({
     };
 }
 
+// Boot pipeline warm-up cap. Typical scenes settle in 1–4 s; the loading cover
+// stays up meanwhile, so the cap only bounds a pathological compile.
+const PIPELINE_WARMUP_MAX_MS = 10000;
+
 async function startRenderLoop({
     renderer,
     scene,
@@ -2022,7 +2027,7 @@ async function startRenderLoop({
         layerManager,
         speedballGi: optionalModules?.speedballGi,
     });
-    // Set the sensed band before compileAsync and the shadow warmup render.
+    // Set the sensed band before the shadow warmup render and pipeline warm-up.
     // Otherwise true IR lights are correctly black in RGB and the first
     // standalone frame compiles/renders as an unilluminated visible scene.
     nirSensing.sync();
@@ -2041,6 +2046,9 @@ async function startRenderLoop({
         // out to the cap instead of locking to the next-lower divisor; snap
         // forward after a stall so we never burst to catch up.
         nextFrameMs = (nowMs - nextFrameMs > minFrameMs ? nowMs : nextFrameMs) + minFrameMs;
+        renderFrame(nowMs);
+    };
+    const renderFrame = (nowMs) => {
         const dt = Math.min(0.25, Math.max(0, (nowMs - lastTimeMs) / 1000));
         lastTimeMs = nowMs;
         elapsed += dt;
@@ -2074,21 +2082,35 @@ async function startRenderLoop({
     // shared lights node with shadows (lights are already applied); the fx
     // pipeline's programs then inherit it.
     //
-    // Compile those pipelines ASYNC first: createRenderPipelineAsync runs on
-    // driver worker threads, where a synchronous first render of a heavy scene
-    // compiled everything in one GPU-process stall — long enough to freeze
-    // video/audio in OTHER tabs. Cap the wait: a heavy scene (30+ materials)
-    // can take >10s to fully compile — after the cap the remainder keeps
-    // compiling in the background while the scene starts.
-    if (typeof renderer.compileAsync === 'function') {
-        try {
-            await Promise.race([
-                renderer.compileAsync(scene, camera),
-                new Promise((resolve) => setTimeout(resolve, 3000)),
-            ]);
-        } catch (_) { /* fall through to the warmup render */ }
+    // Pipeline warm-up: a synchronous first render compiles every pipeline in
+    // one GPU-process stall — long enough to freeze video/audio in OTHER tabs.
+    // compileAsync() cannot prevent it: it only reaches the plain canvas
+    // context, never the scene-pass MRT, shadow and post-quad contexts real
+    // frames draw with. So the shadow warmup and the first real frames run in
+    // async pipeline mode (pipeline_warmup.js) behind a hidden canvas, until a
+    // few frames in a row need no new pipeline. Past the cap the remainder
+    // keeps compiling asynchronously and draws when ready.
+    //
+    // compileAsync() still runs first, for what it does reach: it builds node
+    // materials and uploads textures one object at a time, yielding between
+    // objects. Without it the first render did all of that in one main-thread
+    // task — 1.0–1.2 s on sunshine-factory (image decode) and plastic-botanic
+    // (node builds) vs ~150–600 ms with it.
+    const canvasStyle = renderer.domElement?.style ?? null;
+    const canvasVisibility = canvasStyle?.visibility ?? '';
+    if (canvasStyle) canvasStyle.visibility = 'hidden';
+    const shadowWarmup = beginAsyncPipelineMode(renderer);
+    try {
+        await renderer.compileAsync(scene, camera);
+        renderer.render(scene, camera);
+        await warmRenderPipelines(renderer, {
+            renderFrame: () => renderFrame(performance.now()),
+            maxMs: PIPELINE_WARMUP_MAX_MS,
+        });
+    } finally {
+        shadowWarmup?.end();
+        if (canvasStyle) canvasStyle.visibility = canvasVisibility;
     }
-    renderer.render(scene, camera);
     renderer.setAnimationLoop(loop);
     return () => {
         renderer.setAnimationLoop(null);
@@ -2463,6 +2485,9 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         speedballGi: optionalModules.speedballGi?.field ?? null,
         animationSystem, maxTimeline,
         resize,
+        // Re-run the async pipeline warm-up against the live loop (see
+        // pipeline_warmup.js) after a host changes the look behind a cover.
+        warmPipelines: (warmOptions = {}) => warmRenderPipelines(renderer, warmOptions),
         applyDelta: async (newBuffer) => {
             const result = await applyDelta(newBuffer, applierCtx);
             enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);

@@ -145,9 +145,25 @@ for (const consumer of [
 assert.match(snapshotFxSource, /getPowerShotOptions\(\)\s*\{\s*return state\.powershot;/,
     'snapshot PowerShot exposes its active imager state to the frame driver');
 const snapshotLoop = functionBody('async function startRenderLoop(');
+const firstCompile = snapshotLoop.indexOf('beginAsyncPipelineMode(renderer)');
 assert.ok(
-    snapshotLoop.indexOf('nirSensing.sync();') < snapshotLoop.indexOf('renderer.compileAsync'),
+    firstCompile > 0 && snapshotLoop.indexOf('nirSensing.sync();') < firstCompile,
     'snapshot applies NIR sensing before its first render compile',
+);
+// The shadow warmup and first frames compile through async pipeline mode
+// (pipeline_warmup.js), never a synchronous first render.
+assert.ok(
+    firstCompile < snapshotLoop.lastIndexOf('renderer.render(scene, camera);')
+        && snapshotLoop.indexOf('warmRenderPipelines(renderer') < snapshotLoop.indexOf('renderer.setAnimationLoop(loop);'),
+    'snapshot warms its first frames in async pipeline mode before the live loop',
+);
+// compileAsync() builds node materials and uploads textures object by object
+// with yields; without it the first render does it all in one ~1 s task.
+assert.ok(
+    firstCompile < snapshotLoop.indexOf('await renderer.compileAsync(scene, camera);')
+        && snapshotLoop.indexOf('await renderer.compileAsync(scene, camera);')
+            < snapshotLoop.lastIndexOf('renderer.render(scene, camera);'),
+    'snapshot precompiles with yields before its first render',
 );
 assert.match(snapshotLoop, /renderer\.setAnimationLoop\(null\);\s*nirSensing\.dispose\(\);/,
     'snapshot teardown resets module-shared NIR state');

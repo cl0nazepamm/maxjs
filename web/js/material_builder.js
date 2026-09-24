@@ -697,6 +697,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
     hdrLoader.setCrossOrigin?.('anonymous');
     exrLoader.setCrossOrigin?.('anonymous');
     const textureCache = new Map();
+    // One TSL material per Max material (see buildMaterial's TSL branch).
+    const sharedTSLMaterials = new Map();
     let disposed = false;
     let bakeOverrides = normalizeBakeState(bakeState);
     // Shared TSL compiler — the exact module the live viewer uses, so WebGPU
@@ -1473,6 +1475,16 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         return params;
     }
 
+    // Sharing key for a TSL material, or null when this node needs its own
+    // copy: a bake override (looked up by node name) modifies the material.
+    function tslMaterialShareKey(descriptor, context = {}) {
+        if (context.wantsLine) return null;
+        const kind = bakeOverrides.mode === 'beauty' ? 'beauty' : 'lightmap';
+        const nameSource = { name: descriptor?.name ?? 'material' };
+        if (getBakeTextureCandidates(context.nd, descriptor, nameSource, kind).length > 0) return null;
+        return JSON.stringify(materialIdentityValue(descriptor));
+    }
+
     function buildMaterial(md, context = {}) {
         const descriptor = md && typeof md === 'object' ? md : { color: [0.53, 0.53, 0.53] };
         const info = classifyRuntimeMaterial(descriptor, THREE);
@@ -1482,7 +1494,18 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
 
         // Real TSL node material — WebGPU snapshot target only. On WebGL,
         // nodeMaterialsAvailable is false so we fall through to the existing path.
+        //
+        // Each call compiles the TSL code into a node graph of its own, and
+        // three builds one shader per graph. Meshes that share a Max TSL
+        // material therefore share one instance, as they do in Max: 35 petals
+        // each carrying a fresh copy of one material were 70 synchronous shader
+        // builds (two scene passes) in plastic-botanic's first post-FX frame.
+        // A node with a bake override keeps its own copy — the override
+        // modifies the material.
         if (info.wantsTSLMaterial && descriptor.tslCode && tslCompiler.nodeMaterialsAvailable) {
+            const shareKey = tslMaterialShareKey(descriptor, context);
+            const shared = shareKey ? sharedTSLMaterials.get(shareKey) : null;
+            if (shared) return shared;
             const tslMaterial = tslCompiler.createTSLMaterial(descriptor);
             if (tslMaterial) {
                 if (descriptor.name) tslMaterial.name = descriptor.name;
@@ -1490,7 +1513,9 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
                 tslMaterial.userData.maxjsRequestedMaterialModel = info.requestedModelName;
                 tslMaterial.userData.maxjsMaterialModel = 'MeshTSLNodeMaterial';
                 tslMaterial.userData.maxjsSourceMaterialName = descriptor.name ?? 'material';
-                return applyBakeOverrideToMaterial(tslMaterial, descriptor, context);
+                const result = applyBakeOverrideToMaterial(tslMaterial, descriptor, context);
+                if (shareKey && result === tslMaterial) sharedTSLMaterials.set(shareKey, tslMaterial);
+                return result;
             }
         }
 
@@ -1594,6 +1619,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
 
     function setBakeState(nextState) {
         bakeOverrides = normalizeBakeState(nextState);
+        // Which nodes need their own copy depends on the bake state.
+        sharedTSLMaterials.clear();
     }
 
     function shouldUpdate({ mesh, nd }) {
@@ -1628,6 +1655,8 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
         textureCache.clear();
         for (const texture of tslTextureCache.values()) texture?.dispose?.();
         tslTextureCache.clear();
+        // The scene's teardown disposes the materials themselves, once each.
+        sharedTSLMaterials.clear();
         for (const texture of Object.values(fallbackTextures)) texture?.dispose?.();
     }
 

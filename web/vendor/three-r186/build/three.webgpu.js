@@ -8944,11 +8944,9 @@ class ContextNode extends Node {
 
 		const previousContext = builder.addContext( this.value );
 
-		const node = this.node.build( builder );
+		this.node.build( builder );
 
 		builder.setContext( previousContext );
-
-		return node;
 
 	}
 
@@ -53772,6 +53770,10 @@ class NodeBuilder {
 		delete context.getAO;
 		delete context.getGI;
 		delete context.getShadow;
+		// max.js: loop/block flow state belongs to this builder's stacks; leaking it into another
+		// material's build loops VarNode/StackNode forever (SSGI under DOF). See web/THREE_MIGRATION.md.
+		delete context.nodeLoop;
+		delete context.nodeBlock;
 
 		return context;
 
@@ -61710,6 +61712,7 @@ const _projScreenMatrix = /*@__PURE__*/ new Matrix4();
 const _vector4 = /*@__PURE__*/ new Vector4();
 
 const _shadowSide = { [ FrontSide ]: BackSide, [ BackSide ]: FrontSide, [ DoubleSide ]: DoubleSide };
+const _shadowPassIds = { [ FrontSide ]: 'shadowSideFront', [ BackSide ]: 'shadowSideBack', [ DoubleSide ]: 'shadowSideDouble' };
 
 /**
  * Base class for renderers.
@@ -65429,6 +65432,10 @@ class Renderer {
 					overrideMaterial.side = ( material.shadowSide !== null ) ? material.shadowSide : _shadowSide[ material.side ];
 
 				}
+
+				// max.js: backport of three.js PR #34647. Keep shadow pipelines for different
+				// material sides cached independently. See web/THREE_MIGRATION.md.
+				if ( passId === null ) passId = _shadowPassIds[ overrideMaterial.side ];
 
 				if ( colorNode !== null ) overrideMaterial.colorNode = colorNode;
 				if ( depthNode !== null ) overrideMaterial.depthNode = depthNode;

@@ -14,7 +14,8 @@ and [r186 release notes](https://github.com/mrdoob/three.js/releases/tag/r186).
 
 ## Vendor provenance
 
-`vendor/three-r186/build` is unmodified `three@0.186.0` from npm. Upstream
+`vendor/three-r186/build` is `three@0.186.0` from npm with one backported
+upstream fix and two local fixes filed upstream as open PRs (all below). Upstream
 `examples/jsm` is stored as `examples` to preserve max.js import-map layout.
 Existing extra decoder/encoder libraries and `examples/materialx` regression
 fixtures are retained. The only edited upstream r186 addon files are below.
@@ -30,6 +31,42 @@ fixtures are retained. The only edited upstream r186 addon files are below.
 
 The temporal fixes retain their inline max.js comments; MaterialX edits are also
 marked inline. Recheck these six files against upstream on the next upgrade.
+
+**Build backport — `build/three.webgpu.js` and `build/three.webgpu.nodes.js`,
+`ContextNode.setup()`:** drop the `return node;` that r186 added. Upstream
+`f6080cc6f0` ("ContextNode: Avoid redundant calls", #34251) made `setup()` return
+the child's build result; on context-heavy graphs that re-runs subgraph setup, and
+Speedball GI's traversal kernel went from 52 ms (r185) to ~8 s of synchronous
+node building on r186 — DREAM's boot freeze. Found by bisecting 220 upstream
+commits; `a32e4d658c` ("Nodes: Make build more efficient", #34531, 2026-09-11)
+removes the `return` again, and this hunk is exactly that part of it. Drop the
+backport when upgrading to a release that contains `a32e4d658c` (r187+). The
+same bytes are mirrored to `clone-llc/vendor/three-r186/build/three.webgpu.js`.
+
+**Build fix — same two files, `NodeBuilder.getSharedContext()`:** also delete
+`nodeLoop` and `nodeBlock` (marked inline `max.js:`). Nodes that build a separate
+material from `context( builder.getSharedContext() )` (`RTTNode`, SSGI, DOF, …)
+inherited the parent's loop state when first set up inside a `Loop` body. DOF
+samples its `convertToTexture()` input only inside `Loop( 64 )`, so an SSGI
+composite under DOF built its whole material "inside a loop" and every top-level
+`.toVar()` re-added itself to the stack being iterated — an infinite main-thread
+loop (plastic-botanic never loaded; 26M → 41M stack nodes in 8 s). r186 made it
+reachable by moving SSGI's shared context onto `material.contextNode` (#34025).
+Filed upstream as [#34650](https://github.com/mrdoob/three.js/pull/34650) (open;
+§21 in `docs/THREEJS_UPSTREAM_PR_CANDIDATES.md`) — the same two lines. Drop when a
+release contains it. Mirrored to the clone-llc copy like the backport above.
+
+**Build fix — same two files, `Renderer.renderObject()`:** a shadow override pass
+without a `passId` now derives one from the resolved shadow side (`_shadowPassIds`,
+marked inline `max.js:`). The shared shadow material's `side` is set per draw, and
+all groups of a multi-material caster share one shadow RenderObject; with mixed
+sides the render cache key flipped between groups and a new render pipeline was
+created synchronously every frame (DREAM `Plane001`: ~120/s, forever). Separate
+RenderObjects per side keep both pipelines cached. DREAM: 492 → 2 synchronous
+`createRenderPipeline` calls per load, shadows unchanged. The two code lines are
+exactly those of the open upstream PR
+[#34647](https://github.com/mrdoob/three.js/pull/34647) (§20); only the comment
+differs (marker). Drop when a release contains it. Mirrored to the clone-llc copy.
 
 ## Removed or reduced patches
 

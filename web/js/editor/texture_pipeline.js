@@ -535,6 +535,34 @@ async function createTexturePipeline(deps = {}) {
             return tex;
         }
 
+        // THREE.TextureLoader hands the raw HTMLImageElement to the GPU upload,
+        // where copyExternalImageToTexture decodes it SYNCHRONOUSLY on the main
+        // thread — one stall per texture on the first frame after a load.
+        // Decode first (HTMLImageElement.decode runs on the image decoder
+        // pool) and only then attach the image, so the upload finds it already
+        // decoded. Otherwise mirrors TextureLoader.load: same manager,
+        // crossOrigin and path, same image-less Texture returned up front.
+        function loadDecodedImageTexture(url, onLoad, onError) {
+            const texture = new THREE.Texture();
+            const source = deps.textureLoader;
+            const imageLoader = new THREE.ImageLoader(source?.manager);
+            if (source?.crossOrigin != null) imageLoader.setCrossOrigin(source.crossOrigin);
+            if (source?.path) imageLoader.setPath(source.path);
+            imageLoader.load(url, (image) => {
+                const attach = () => {
+                    texture.image = image;
+                    texture.needsUpdate = true;
+                    onLoad?.(texture);
+                };
+                if (typeof image?.decode === 'function') {
+                    image.decode().then(attach, attach);
+                } else {
+                    attach();
+                }
+            }, undefined, onError);
+            return texture;
+        }
+
         function loadTexture(url, colorSpace = THREE.LinearSRGBColorSpace, xf = null, fallbackTex = fallbackWhiteTexture) {
             if (!url) return null;
             colorSpace = resolveColorSpace(colorSpace, xf);
@@ -592,7 +620,7 @@ async function createTexturePipeline(deps = {}) {
                 return placeholder;
             }
             deps.beginTextureLoad();
-            const tex = deps.textureLoader.load(
+            const tex = loadDecodedImageTexture(
                 url,
                 loadedTex => {
                     deps.endTextureLoad();
@@ -601,7 +629,6 @@ async function createTexturePipeline(deps = {}) {
                     applyTextureTransform(loadedTex, normalizedXf);
                     loadedTex.needsUpdate = true;
                 },
-                undefined,
                 () => {
                     deps.endTextureLoad();
                     applyFallbackImage(tex, fallbackTex, textureColorSpace, normalizedXf, url);

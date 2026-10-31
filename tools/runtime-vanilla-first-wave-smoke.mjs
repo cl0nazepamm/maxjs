@@ -5,15 +5,11 @@ import * as THREE from '../web/node_modules/three/build/three.module.js';
 import { COMMAND_TYPES, DELTA_FRAME_MAGIC, DELTA_FRAME_VERSION } from '../web/js/protocol.js';
 
 const NOOP = () => {};
-const threeStdUrl = new URL('../web/vendor/three-r186/build/three.module.js', import.meta.url).href;
-const speedballGiUrl = new URL('../web/vendor/speedball-gi/js/index.js', import.meta.url).href;
+const threeStdUrl = new URL('../web/vendor/three-r187/build/three.module.js', import.meta.url).href;
 const loaderSource = `
 export async function resolve(specifier, context, nextResolve) {
     if (specifier === 'three-std') {
         return { url: ${JSON.stringify(threeStdUrl)}, shortCircuit: true };
-    }
-    if (specifier === 'speedball-gi') {
-        return { url: ${JSON.stringify(speedballGiUrl)}, shortCircuit: true };
     }
     return nextResolve(specifier, context);
 }

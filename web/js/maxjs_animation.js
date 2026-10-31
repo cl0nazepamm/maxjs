@@ -201,10 +201,10 @@ export function createMaxJSAnimationSystem({
             return;
         }
         if (target.isCamera) return;
-        // Speedball's deform lane consumes BufferGeometry attribute versions.
+        // The path tracer's deform lane refits BVHs from attribute versions.
         // Custom geometry-frame tracks mutate those buffers; shader-side morph
         // weights do not, so reporting the latter would only schedule a no-op
-        // full BLAS scan every animation frame.
+        // refit every animation frame.
         if (customKind === 'geometry') {
             group.deforms = true;
             return;

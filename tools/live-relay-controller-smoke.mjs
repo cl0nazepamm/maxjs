@@ -230,7 +230,7 @@ function fakeResponse(status) {
     assert.equal(controller.state, RELAY_STATES.OFF);
     controller.enable();
     // This viewer-owned state is cached while producer_hello is in flight.
-    controller.emit({ type: 'speedballGiSettings', settings: { intensity: 2 } });
+    controller.emit({ type: 'lightProbeSettings', settings: { intensity: 2 } });
     await waitFor(() => resyncs.length === 1, 'initial relay_resync');
     assert.equal(controller.state, RELAY_STATES.RECOVERING);
     assert.equal(resyncs[0].reason, 'relay-enabled');
@@ -243,7 +243,7 @@ function fakeResponse(status) {
         'scene plus cached panel and current-cycle host state');
 
     const baseline = posts.find((entry) => entry.isBinary)?.decoded;
-    const speedball = posts.find((entry) => entry.json?.data?.type === 'speedballGiSettings')?.json;
+    const probeSettings = posts.find((entry) => entry.json?.data?.type === 'lightProbeSettings')?.json;
     const env = posts.find((entry) => entry.json?.data?.type === 'env_update')?.json;
     assert.ok(baseline);
     assert.equal(baseline.meta.type, 'scene_bin');
@@ -254,8 +254,8 @@ function fakeResponse(status) {
     assert.equal(baseline.relay.sceneRevision, 1);
     assert.equal(baseline.relay.sequence, 0);
     assert.deepEqual([...baseline.payload], [1, 2, 3, 4]);
-    assert.equal(speedball.relay.sceneRevision, 1);
-    assert.equal(speedball.relay.sequence, 1);
+    assert.equal(probeSettings.relay.sceneRevision, 1);
+    assert.equal(probeSettings.relay.sequence, 1);
     assert.equal(env.relay.sceneRevision, 1);
     assert.equal(env.relay.sequence, 2);
     await waitFor(() => controller.state === RELAY_STATES.STREAMING, 'streaming state');
@@ -276,22 +276,20 @@ function fakeResponse(status) {
     assert.equal(resyncs.length, 1, 'first-ready acknowledgement must not request a second baseline');
     assert.equal(controller.state, RELAY_STATES.STREAMING);
 
-    // Every sync lane the viewer consumes is forwarded: native GI packets ride
-    // as ordered binary continuations, clay mode as an ordered JSON message.
-    host.shared(Uint8Array.from([9, 9]).buffer, { type: 'gi_surface_bin', probeCount: 1 });
-    host.shared(Uint8Array.from([9]).buffer, { type: 'gi_light_bin', lightCount: 1 });
+    // Every sync lane the viewer consumes is forwarded: geometry fast-lane
+    // packets ride as ordered binary continuations, clay mode as an ordered JSON
+    // message.
+    host.shared(Uint8Array.from([9, 9]).buffer, { type: 'geo_fast', h: 1 });
     host.message({ type: 'clay_mode', enabled: true });
-    const giSurface = await waitFor(
-        () => posts.find((entry) => entry.isBinary && entry.decoded.meta.type === 'gi_surface_bin')?.decoded,
-        'gi_surface_bin forwarded');
-    await waitFor(() => posts.some((entry) => entry.isBinary && entry.decoded.meta.type === 'gi_light_bin'),
-        'gi_light_bin forwarded');
+    const geoFast = await waitFor(
+        () => posts.find((entry) => entry.isBinary && entry.decoded.meta.type === 'geo_fast')?.decoded,
+        'geo_fast forwarded');
     const clay = await waitFor(
         () => posts.find((entry) => entry.json?.data?.type === 'clay_mode')?.json,
         'clay_mode forwarded');
-    assert.equal(giSurface.relay.sceneRevision, 1);
-    assert.ok(giSurface.relay.sequence > 0);
-    assert.deepEqual([...giSurface.payload], [9, 9]);
+    assert.equal(geoFast.relay.sceneRevision, 1);
+    assert.ok(geoFast.relay.sequence > 0);
+    assert.deepEqual([...geoFast.payload], [9, 9]);
     assert.equal(clay.data.enabled, true);
     assert.equal(clay.relay.sceneRevision, 1);
 
@@ -308,7 +306,7 @@ function fakeResponse(status) {
     assert.equal(secondBaseline.relay.sceneRevision, 2);
     assert.equal(secondBaseline.relay.sceneRequestId, 1);
     assert.equal(secondBaseline.relay.sequence, 0);
-    await waitFor(() => posts.filter((entry) => entry.json?.data?.type === 'speedballGiSettings').length === 2,
+    await waitFor(() => posts.filter((entry) => entry.json?.data?.type === 'lightProbeSettings').length === 2,
         'persistent panel state replay');
     assert.equal(posts.filter((entry) => entry.json?.data?.type === 'env_update').length, 1,
         'old host state must not overwrite a later baseline');

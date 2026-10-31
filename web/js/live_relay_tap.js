@@ -39,8 +39,6 @@ const BINARY_FORWARD_TYPES = new Set([
     'scene_bin',
     'delta_bin',
     'geo_fast',
-    'gi_surface_bin',  // native Speedball GI surfel/surface packet
-    'gi_light_bin',    // native Speedball GI light packet
 ]);
 const JSON_FORWARD_TYPES = new Set([
     'scene',       // SLOW/full JSON baseline
@@ -57,13 +55,13 @@ const JSON_FORWARD_TYPES = new Set([
 
 // Change-only host lanes observed during one resync are replayed after that
 // baseline only. Array lanes are keyed per authored handle; whole lanes replace
-// their previous value. Panel-owned Speedball/probe state has its own persistent map.
+// their previous value. Panel-owned light probe state has its own persistent map.
 const KEYED_JSON_STATE = Object.freeze({
     audio_update: 'audios',
     gltf_update: 'gltfs',
 });
-const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'speedballGiSettings', 'clay_mode']);
-const PANEL_JSON_TYPES = new Set(['speedballGiSettings', 'probeGrids']);
+const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'lightProbeSettings', 'clay_mode']);
+const PANEL_JSON_TYPES = new Set(['lightProbeSettings', 'probeGrids']);
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const textEncoder = new TextEncoder();
 
@@ -192,7 +190,7 @@ function createLiveRelayController(options = {}) {
     const logger = options.logger ?? console;
 
     const listeners = new Set();
-    const panelJsonStateCache = new Map(); // Speedball/probe state owned by this panel
+    const panelJsonStateCache = new Map(); // light probe state owned by this panel
     const resyncJsonStateCache = new Map(); // host updates observed in this resync only
     const queue = [];
     let queueBytes = 0;

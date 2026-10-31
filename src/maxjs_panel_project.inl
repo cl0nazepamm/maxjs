@@ -36,9 +36,10 @@
         std::wostringstream ss;
         ss.imbue(std::locale::classic());
         ss << L"{\"type\":\"pathtracing_settings\""
-           << L",\"samplesPerFrame\":" << pathTracingSamplesPerFrame_
+           << L",\"renderSamples\":" << pathTracingRenderSamples_
+           << L",\"bounces\":" << pathTracingBounces_
            << L",\"giClamp\":";
-        WriteFloatValue(ss, pathTracingGIClamp_, 8.0f);
+        WriteFloatValue(ss, pathTracingGIClamp_, 10.0f);
         ss
            << L",\"freezeSync\":" << (pathTracingFreezeSync_ ? L"true" : L"false")
            << L"}";
@@ -49,10 +50,11 @@
         return pathTracingViewerActive_ && pathTracingFreezeSync_;
     }
 
-    void SetPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync) {
+    void SetPathTracingSettings(int renderSamples, int bounces, float giClamp, bool freezeSync) {
         const bool wasFrozen = IsPathTracingNativeFreezeActive();
-        pathTracingSamplesPerFrame_ = std::clamp(samplesPerFrame, 1, 512);
-        if (!std::isfinite(giClamp)) giClamp = 8.0f;
+        pathTracingRenderSamples_ = std::clamp(renderSamples, 1, 4096);
+        pathTracingBounces_ = std::clamp(bounces, 1, 32);
+        if (!std::isfinite(giClamp)) giClamp = 10.0f;
         pathTracingGIClamp_ = std::clamp(giClamp, 1.0f, 1000.0f);
         pathTracingFreezeSync_ = freezeSync;
         SendPathTracingSettings();
@@ -62,10 +64,10 @@
         }
     }
 
-    void SetPathTracingRuntimeSettings(int samplesPerFrame, float giClamp, bool freezeSync, bool viewerActive) {
+    void SetPathTracingRuntimeSettings(int bounces, float giClamp, bool freezeSync, bool viewerActive) {
         const bool wasFrozen = IsPathTracingNativeFreezeActive();
         pathTracingViewerActive_ = viewerActive;
-        SetPathTracingSettings(samplesPerFrame, giClamp, freezeSync);
+        SetPathTracingSettings(pathTracingRenderSamples_, bounces, giClamp, freezeSync);
         if (wasFrozen && !IsPathTracingNativeFreezeActive()) {
             ResetFastPathState(true);
             SetDirtyImmediate();

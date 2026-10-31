@@ -7,7 +7,6 @@ import {
     binInRange,
     buildSkinnedMeshFromNd as buildSkinnedMeshFromBinary,
     geometryFromNodeBinary,
-    stampGeometryContentKey,
     typedArrayCanStore,
     updateFloatGeometryAttribute,
     updateGeometryIndexAttribute,
@@ -43,7 +42,7 @@ function createSceneSync(deps = {}) {
         // Handles that stream geometry (deforming characters, live edits).
         // Re-flattening them just re-arms the dissolve on the next packet —
         // a per-scrub merge/dissolve oscillation that churns materials and
-        // every structural change-detector (Speedball GI/PT BVH rebuilds).
+        // every structural change-detector (probe rebakes, PT BVH rebuilds).
         const flattenDeformExcludedHandles = new Set();
         // If a position-only packet dissolves a flattened group, PT owes a
         // structural rebuild—but it must wait for that handle's exact normals.
@@ -262,13 +261,6 @@ function createSceneSync(deps = {}) {
                             // Geometry data on the same Object3D — no pipeline
                             // rebuild needed regardless of which branch ran.
                             deps.maxjsFx?.markGeometryDataDirty?.();
-                            deps.markLightProbeSceneDirty();
-                            if (guardedDeform && !flattenedGroupDissolved) {
-                                deps.markSpeedballDeformsDirty();
-                            } else {
-                                deps.markSpeedballTopologyDirty();
-                            }
-                            if (materialChanged) deps.markSpeedballMaterialsDirty(mesh);
                             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                             // Native interactive deformation is positions-only.
                             // Wait for its exact settle-normal packet so PT does
@@ -675,7 +667,7 @@ function createSceneSync(deps = {}) {
             // clusters, merge only new or edited ones. Untouched merges keep
             // their meshes AND their already-compiled materials — a full
             // dispose-and-remerge here recompiles pipelines and reads as a
-            // structural scene change to Speedball GI/PT on every group edit.
+            // structural scene change to probes and PT on every group edit.
             let changed = false;
             for (const headHandle of [...flattenedClusterSignatures.keys()]) {
                 if (plan.clusterSignatures.get(headHandle) !== flattenedClusterSignatures.get(headHandle)) {
@@ -840,8 +832,8 @@ function createSceneSync(deps = {}) {
         // change first:
         //   • replaced geometry/index/material IDENTITY (or a version bump
         //     on byte-identical data) reads as STRUCTURAL change to the
-        //     speedball/PT signatures → full MeshBVH rebuild + probe-kernel
-        //     recompile (~550 ms on the render thread);
+        //     PT signatures → full MeshBVH rebuild (~550 ms on the render
+        //     thread) and a probe rebake;
         //   • recreated lights or a torn-down environment flip pipeline
         //     cache keys / dirty every material → full TSL recompile of the
         //     whole scene (~140 ms single-frame stall).
@@ -883,18 +875,12 @@ function createSceneSync(deps = {}) {
             const sceneChanged = !!(options.sceneChanged || bucketChanged || flattenChanged);
             if (sceneChanged) {
                 deps.lightLinking.refreshSceneBindings?.();
-                deps.markLightProbeSceneDirty();
             } else if (lightsChanged) {
-                deps.markLightProbeLightsDirty();
                 deps.maxjsFx.markOutputChanged?.();
             }
-            if (sceneChanged || lightsChanged) {
+            // Probe grid helpers fit their volumes from the synced transforms.
+            if (sceneChanged || lightsChanged || options.transformsChanged === true) {
                 deps.scheduleLightProbeFromCurrentScene();
-            }
-            if (sceneChanged || options.topologyChanged === true) {
-                deps.markSpeedballTopologyDirty();
-            } else if (options.transformsChanged === true) {
-                deps.markSpeedballTransformsDirty();
             }
             if (deps.pathTracingFx.isEnabled?.()) {
                 deps.resetPathTracingStartupWarmup();
@@ -905,7 +891,6 @@ function createSceneSync(deps = {}) {
             // entry points, so a full pipeline rebuild is unnecessary here.
             if (sceneChanged) deps.maxjsFx.markSceneChanged?.();
             options.afterWorldUpdate?.();
-            deps.syncSpeedballProbeVolumes();
 
             const applyMs = performance.now() - applyStart;
             deps.markInitialSync();
@@ -1115,8 +1100,6 @@ function createSceneSync(deps = {}) {
                 // Renderable-type swap (mesh ↔ line) — scene structure changed,
                 // refresh the post-pass hide list / toon cache. Cheap.
                 deps.maxjsFx.markSceneChanged?.();
-                deps.markLightProbeSceneDirty();
-                deps.markSpeedballTopologyDirty();
                 deps.scheduleLightProbeFromCurrentScene();
                 deps.schedulePathTracingLiveRebuild();
                 deps.lightLinking.refreshSceneBindings?.();
@@ -1161,9 +1144,6 @@ function createSceneSync(deps = {}) {
             // refresh, no pipeline rebuild. pass(scene, camera) picks up the new
             // BufferGeometry attributes on the next frame automatically.
             deps.maxjsFx.markGeometryDataDirty?.();
-            deps.markLightProbeSceneDirty();
-            deps.markSpeedballTopologyDirty();
-            if (materialChanged) deps.markSpeedballMaterialsDirty(mesh);
             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             deps.schedulePathTracingLiveRebuild();
         }
@@ -1179,10 +1159,7 @@ function createSceneSync(deps = {}) {
             let pathTraceStructuralChanged = false;
             let pathTraceLightsChanged = false;
             let hierarchyLightTransformsChanged = false;
-            let speedballTopologyChanged = false;
-            let speedballAllTransformsChanged = false;
-            const speedballTransformTargets = new Set();
-            const speedballMaterialTargets = new Set();
+            let pathTraceMaterialsChanged = false;
             for (const nd of msg.nodes) {
                 const mesh = deps.nodeMap.get(nd.h);
                 if (mesh) {
@@ -1196,29 +1173,27 @@ function createSceneSync(deps = {}) {
                     giSurfaceChanged ||= affectsSurface && (change.transformChanged || change.structuralChanged);
                     hierarchyLightTransformsChanged ||= isLightCarrier && change.transformChanged;
                     visibilityChanged ||= change.structuralChanged && nd.vis != null;
-                    if (affectsSurface && change.topologyChanged) speedballTopologyChanged = true;
-                    if (affectsSurface && change.transformChanged) {
-                        if (mesh.geometry) speedballTransformTargets.add(mesh);
-                        else speedballAllTransformsChanged = true;
+                    if (affectsSurface && change.materialChanged) {
+                        giSurfaceChanged = true;
+                        pathTraceMaterialsChanged = true;
                     }
-                    if (affectsSurface && change.materialChanged) speedballMaterialTargets.add(mesh);
                 }
                 if (nd.t) {
                     deps.applyHairTransform(nd.h, nd.t);
                 }
-                if (nd.vis != null) {
-                    if (deps.applyHairVisibility(nd.h, nd.vis)) speedballTopologyChanged = true;
+                if (nd.vis != null && deps.applyHairVisibility(nd.h, nd.vis)) {
+                    giSurfaceChanged = true;
+                    pathTraceStructuralChanged = true;
                 }
             }
             if (hierarchyLightTransformsChanged) {
                 deps.refreshSkyFromLinkedSun();
-                deps.markLightProbeLightsDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                 pathTraceLightsChanged = true;
             }
             if (msg.lights) {
                 pathTraceLightsChanged ||= deps.applyLightUpdates(msg.lights) === true;
-                if (msg.lights.length > 0) deps.markSpeedballLightsDirty();
+                if (pathTraceLightsChanged) deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                 // Deliberately broad: applyLightData's return value is the PATH
                 // TRACE payload signature, which excludes castShadow, the shadow
                 // params, map and visibility — all of which it writes anyway.
@@ -1237,20 +1212,11 @@ function createSceneSync(deps = {}) {
                 // Visibility flip changes the post-pass hide list — cheap refresh.
                 deps.maxjsFx.markSceneChanged?.();
             }
-            if (giSurfaceChanged) {
-                deps.markLightProbeSceneDirty();
-                deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
-            }
-            if (speedballTopologyChanged) {
-                deps.markSpeedballTopologyDirty();
-            } else {
-                if (speedballAllTransformsChanged) deps.markSpeedballTransformsDirty();
-                else if (speedballTransformTargets.size > 0) deps.markSpeedballTransformsDirty(speedballTransformTargets);
-                if (speedballMaterialTargets.size > 0) deps.markSpeedballMaterialsDirty(speedballMaterialTargets);
-            }
+            if (giSurfaceChanged) deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             if (pathTraceStructuralChanged) deps.schedulePathTracingLiveRebuild();
             else {
                 if (pathTraceTransformsChanged) deps.schedulePathTracingLiveRebuild('transform');
+                if (pathTraceMaterialsChanged) deps.schedulePathTracingLiveRebuild('material');
                 if (pathTraceLightsChanged) deps.schedulePathTracingLiveRebuild('light');
             }
             const applyMs = performance.now() - applyStart;
@@ -1468,9 +1434,7 @@ function createSceneSync(deps = {}) {
                     const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
                     if (srcGeom) geom = deps.resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
                 } else if (nd.geo && !jsmodSkipGeo) {
-                    // contentKey: stamp the Speedball BLAS cache key so a
-                    // scene switch that brings this mesh back reuses its BVH.
-                    geom = geometryFromNodeBinary(nd, buffer, { contentKey: true });
+                    geom = geometryFromNodeBinary(nd, buffer);
                     if (!geom) continue;
                     setGeometryVertexColorAttributes(geom, nd.geo.vc, buffer);
                     // Add material groups for Multi/Sub
@@ -1584,10 +1548,7 @@ function createSceneSync(deps = {}) {
             let pathTraceStructuralChanged = false;
             let pathTraceLightsChanged = false;
             let hierarchyLightTransformsChanged = false;
-            let speedballTopologyChanged = false;
-            let speedballAllTransformsChanged = false;
-            const speedballTransformTargets = new Set();
-            const speedballMaterialTargets = new Set();
+            let pathTraceMaterialsChanged = false;
             const result = applyDeltaFrame(buffer, {
                 onTransform(nodeHandle, matrix) {
                     const mesh = deps.nodeMap.get(nodeHandle);
@@ -1600,11 +1561,6 @@ function createSceneSync(deps = {}) {
                         pathTraceTransformsChanged ||= affectsSurface && change.transformChanged;
                         pathTraceStructuralChanged ||= affectsSurface && change.structuralChanged;
                         hierarchyLightTransformsChanged ||= isLightCarrier && change.transformChanged;
-                        if (affectsSurface && change.topologyChanged) speedballTopologyChanged = true;
-                        if (affectsSurface && change.transformChanged) {
-                            if (mesh.geometry) speedballTransformTargets.add(mesh);
-                            else speedballAllTransformsChanged = true;
-                        }
                     }
                     deps.applyHairTransform(nodeHandle, matrix);
                 },
@@ -1612,10 +1568,9 @@ function createSceneSync(deps = {}) {
                     const mesh = deps.nodeMap.get(nodeHandle);
                     if (mesh) {
                         const change = applyIncrementalNodeUpdate(mesh, { mat: material }, nodeHandle);
-                        giSurfaceChanged ||= change.structuralChanged;
+                        giSurfaceChanged ||= change.structuralChanged || change.materialChanged;
                         pathTraceStructuralChanged ||= change.structuralChanged;
-                        speedballTopologyChanged ||= change.topologyChanged;
-                        if (change.materialChanged) speedballMaterialTargets.add(mesh);
+                        pathTraceMaterialsChanged ||= change.materialChanged;
                     }
                 },
                 onSelection(nodeHandle, selected) {
@@ -1629,9 +1584,11 @@ function createSceneSync(deps = {}) {
                         runtimeOverridesChanged ||= change.structuralChanged;
                         giSurfaceChanged ||= change.structuralChanged;
                         pathTraceStructuralChanged ||= change.structuralChanged;
-                        speedballTopologyChanged ||= change.topologyChanged;
                     }
-                    if (deps.applyHairVisibility(nodeHandle, visible)) speedballTopologyChanged = true;
+                    if (deps.applyHairVisibility(nodeHandle, visible)) {
+                        giSurfaceChanged = true;
+                        pathTraceStructuralChanged = true;
+                    }
                 },
                 onCamera(cameraState) {
                     deps.applyCamera(cameraState);
@@ -1661,10 +1618,8 @@ function createSceneSync(deps = {}) {
                     // Not gated on lightChanged — see the JSON lane above:
                     // that flag is the PT signature, not "wrote something".
                     runtimeOverridesChanged = true;
-                    deps.markSpeedballLightsDirty();
                     if (lightChanged) {
                         if (ld.type === 0) deps.refreshSkyFromLinkedSun();
-                        deps.markLightProbeLightsDirty();
                         deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                         pathTraceLightsChanged = true;
                     }
@@ -1682,25 +1637,15 @@ function createSceneSync(deps = {}) {
             }, meta?.stats?.producerBytes);
             if (hierarchyLightTransformsChanged) {
                 deps.refreshSkyFromLinkedSun();
-                deps.markLightProbeLightsDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                 pathTraceLightsChanged = true;
             }
             if (runtimeOverridesChanged) deps.layerManager.markRuntimeTransformsDirty?.();
-            if (giSurfaceChanged) {
-                deps.markLightProbeSceneDirty();
-                deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
-            }
-            if (speedballTopologyChanged) {
-                deps.markSpeedballTopologyDirty();
-            } else {
-                if (speedballAllTransformsChanged) deps.markSpeedballTransformsDirty();
-                else if (speedballTransformTargets.size > 0) deps.markSpeedballTransformsDirty(speedballTransformTargets);
-                if (speedballMaterialTargets.size > 0) deps.markSpeedballMaterialsDirty(speedballMaterialTargets);
-            }
+            if (giSurfaceChanged) deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             if (pathTraceStructuralChanged) deps.schedulePathTracingLiveRebuild();
             else {
                 if (pathTraceTransformsChanged) deps.schedulePathTracingLiveRebuild('transform');
+                if (pathTraceMaterialsChanged) deps.schedulePathTracingLiveRebuild('material');
                 if (pathTraceLightsChanged) deps.schedulePathTracingLiveRebuild('light');
             }
             deps.markInitialSync();
@@ -1829,8 +1774,6 @@ function createSceneSync(deps = {}) {
                 geom.computeBoundingBox();
                 geom.computeBoundingSphere();
             }
-            // Same Speedball BLAS cache key the binary path stamps.
-            if (!isLine) stampGeometryContentKey(geom);
             return geom;
         }
 

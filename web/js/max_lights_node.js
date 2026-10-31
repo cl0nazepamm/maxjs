@@ -22,8 +22,7 @@ import DirectionalLightDataNode from 'three/addons/tsl/lighting/data/Directional
 import PointLightDataNode from 'three/addons/tsl/lighting/data/PointLightDataNode.js';
 import SpotLightDataNode from 'three/addons/tsl/lighting/data/SpotLightDataNode.js';
 import HemisphereLightDataNode from 'three/addons/tsl/lighting/data/HemisphereLightDataNode.js';
-import { AmbientLightNode, HemisphereLightNode, NodeUtils } from 'three/webgpu';
-import { getGiVolumeNode, getGiProbeNode, isIrEmitter, getOrCreateIrLightNode } from 'speedball-gi';
+import { AmbientLightNode, HemisphereLightNode, LightsNode, NodeUtils } from 'three/webgpu';
 import {
     LIGHT_MASK_HI_KEY,
     LIGHT_LINK_REFRESH_NODE_KEY,
@@ -490,8 +489,8 @@ function getOrCreateMaskedHemisphereLightNode(light, cache, maskDefaults) {
     return lightNode;
 }
 
-function getOrCreateFallbackLightNode(light, nodeLibrary, cache) {
-    const LightNodeClass = nodeLibrary.getLightNodeClass(light.constructor);
+function getOrCreateFallbackLightNode(light, cache) {
+    const LightNodeClass = light._lightNode;
     if (!LightNodeClass) return null;
     let lightNode = cache.get(light);
     if (!lightNode) {
@@ -522,14 +521,10 @@ export default class MaxLightsNode extends DynamicLightsNode {
             && light.isNode !== true
             && light.castShadow !== true
             && !isSpecialSpotLight(light)
-            && !isIrEmitter(light)
             && STOCK_DATA_CLASSES[light.constructor.name] !== undefined;
     }
 
     _canBatchMaskedBase(light) {
-        // IR emitters (emitterClass 'ir') never batch: the batched data nodes read
-        // light.color CPU-side (black for a true IR illuminator) — they take the
-        // sensed-band per-light path in setupLightsNode instead.
         const linkedId = light?.userData?.maxjsLightId;
         return isLinkedLight(light)
             && Number.isInteger(linkedId)
@@ -538,7 +533,6 @@ export default class MaxLightsNode extends DynamicLightsNode {
             && light.isNode !== true
             && light.castShadow !== true
             && !isSpecialSpotLight(light)
-            && !isIrEmitter(light)
             && MASKED_DATA_CLASSES[light.constructor.name] !== undefined;
     }
 
@@ -568,9 +562,17 @@ export default class MaxLightsNode extends DynamicLightsNode {
         return { stock, masked };
     }
 
+    // Lights outside the shared batches; their shader variants key the program.
+    getBuiltinLights() {
+        const batchable = this._computeBatchableSets();
+        return this._lights.filter((light) => !batchable.stock.has(light) && !batchable.masked.has(light));
+    }
+
     customCacheKey() {
         const typeSet = new Set();
         const batchable = this._computeBatchableSets();
+        // Upstream keys the per-light programs (id, shadows and their version, spot maps).
+        HASH_DATA.push(LightsNode.prototype.customCacheKey.call(this));
         for (const light of this._lights) {
             if (batchable.stock.has(light)) {
                 typeSet.add(`stock:${light.constructor.name}`);
@@ -580,9 +582,6 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 typeSet.add(`masked:${light.constructor.name}`);
                 continue;
             }
-            HASH_DATA.push(light.id);
-            HASH_DATA.push(light.castShadow ? 1 : 0);
-            HASH_DATA.push(isIrEmitter(light) ? 1 : 0);
             // Linked state + id gate the fallback mask multiply (setupDirectLight).
             // A linked↔unlinked flip or an id reassignment must rebuild the program
             // since the bit shift is baked in at compile time. 0 = unlinked.
@@ -596,19 +595,7 @@ export default class MaxLightsNode extends DynamicLightsNode {
             } else {
                 HASH_DATA.push(0);
             }
-            if (light.isSpotLight === true) {
-                HASH_DATA.push(light.map !== null ? light.map.id : -1);
-                HASH_DATA.push(light.colorNode ? light.colorNode.getCacheKey() : -1);
-            }
         }
-        // GI irradiance volume: token carries a generation so enable/disable and
-        // grid-resize recompile, but data-only surfel-buffer writes share the same
-        // program.
-        if (getGiVolumeNode().active) typeSet.add(getGiVolumeNode().cacheToken);
-        // Speedball GI probe field: token bumps ONLY on grid resize / enable, never on
-        // per-tick atlas writes (the atlas is a stable sampled binding) — so probe
-        // updates never recompile materials. This is the churn-free contract.
-        if (getGiProbeNode().active) typeSet.add(getGiProbeNode().cacheToken);
         for (const token of [...typeSet].sort()) HASH_DATA.push(NodeUtils.hashString(token));
         const key = NodeUtils.hashArray(HASH_DATA);
         HASH_DATA.length = 0;
@@ -659,9 +646,12 @@ export default class MaxLightsNode extends DynamicLightsNode {
         const lights = [...materialLightings, ...this._lights]
             .sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
         const batchable = this._computeBatchableSets(lights);
-        const nodeLibrary = builder.renderer.library;
+        // Lightmapped surfaces take their indirect light from the lightmap, so
+        // probe grids would count it twice.
+        const lightmapped = builder.material?.lightMap != null;
 
         for (const light of lights) {
+            if (lightmapped && light.isLightProbeGrid === true) continue;
             if (light.isNode === true) {
                 lightNodes.push(nodeObject(light));
                 continue;
@@ -678,16 +668,11 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 if (list) list.push(light); else maskedLightsByType.set(typeName, [light]);
                 continue;
             }
-            // IR emitters ride speedball's sensed-band light node (colorNode =
-            // white × intensity × nirGate; light.color stays black) so the direct
-            // term appears only under NV — same switch as the probes' NEE gate.
             const lightNode = isLinkedLight(light) && light.isAmbientLight === true
                 ? getOrCreateMaskedAmbientLightNode(light, this._maskedAmbientNodeRef, this._maskDefaults)
                 : (isLinkedLight(light) && light.isHemisphereLight === true
                     ? getOrCreateMaskedHemisphereLightNode(light, this._maskedHemisphereNodeRef, this._maskDefaults)
-                    : (isIrEmitter(light)
-                        ? getOrCreateIrLightNode(light, nodeLibrary)
-                        : getOrCreateFallbackLightNode(light, nodeLibrary, this._fallbackLightNodeRef)));
+                    : getOrCreateFallbackLightNode(light, this._fallbackLightNodeRef));
             if (lightNode) lightNodes.push(lightNode);
         }
 
@@ -726,22 +711,6 @@ export default class MaxLightsNode extends DynamicLightsNode {
             lightNodes.push(dataNode);
         }
 
-        // GI irradiance volume — adds position-dependent local diffuse bounce into
-        // builder.context.irradiance for every synced material (global; not
-        // per-mesh light-link masked — indirect bounce is unmasked by design).
-        const giVolumeNode = getGiVolumeNode();
-        if (giVolumeNode.active) lightNodes.push(giVolumeNode);
-
-        // Speedball GI BVH-traced DDGI probe field — leak-free room-scale bounce into
-        // context.irradiance (global, unmasked, same as the surfel volume). The
-        // two are mutually exclusive at runtime (index.html mutes the surfel
-        // volume when the probe field is active) to avoid double-counting bounce.
-        const giProbeNode = getGiProbeNode();
-        // materialLightings were already folded into lightNodes above, so the
-        // EnvironmentNode needed by Speedball's reflection composite is ordered
-        // before this probe without a second insertion or a separate graph path.
-        if (giProbeNode.active) lightNodes.push(giProbeNode);
-
         this._lightNodes = lightNodes;
         return lightNodes;
     }
@@ -775,10 +744,15 @@ export default class MaxLightsNode extends DynamicLightsNode {
         );
     }
 
+    // The renderer-shared data nodes replace DynamicLightsNode's per-instance ones.
     setLights(lights) {
-        super.setLights(lights);
+        LightsNode.prototype.setLights.call(this, lights);
         this._updateSharedDataNodes(lights);
         return this;
+    }
+
+    get hasLights() {
+        return this._lights.length > 0;
     }
 }
 

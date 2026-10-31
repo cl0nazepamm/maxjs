@@ -100,48 +100,29 @@ assert.match(boot, /optionalModules\.gltf\?\.applyGLTFs/,
 assert.match(boot, /enforceRuntimeHiddenSources\(runtimeSceneState\.hiddenSourceHandles,\s*nodeMap\)/,
     'hidden Max sources are reasserted after animation and delta changes');
 
-const irLightGraph = functionBody('async function installSnapshotIrLightGraph(');
-assert.match(irLightGraph, /snapshotHasIrEmitters\(lights\)/,
-    'snapshot installs specialized lighting only when its payload declares IR emitters');
-assert.match(irLightGraph, /import\('\.\/max_lights_node\.js'\)/,
-    'IR snapshot lighting uses the same adaptive light graph as live max.js');
-assert.match(irLightGraph, /installMaxLightsRenderer\(renderer\)/,
-    'IR lights install MaxLightsNode even when Speedball GI and Studio are disabled');
+const probeReplay = functionBody('async function createSnapshotLightProbes(');
+assert.match(probeReplay, /import\('\.\/light_probes\.js'\)/,
+    'snapshot probes rebake through the same module as the editor');
+assert.match(probeReplay, /snapshotUi\?\.lightProbeEnabled === false/,
+    'snapshot honors the exported light probe toggle');
+assert.match(probeReplay, /probes\.setVolumes\(exported\.volumes\)/,
+    'snapshot bakes the exported world-space probe volumes');
+assert.match(probeReplay, /await probes\.bakeNow\(\)/,
+    'snapshot bakes its probes before the first frame');
+assert.match(probeReplay, /installHdriDiffuseSplit\(hdriDiffuse\)/,
+    'snapshot probes own HDRI diffuse like the editor');
 assert.ok(
-    boot.indexOf('installSnapshotIrLightGraph(renderer, meta.lights)')
-        < boot.indexOf('createScene({ meta, renderer, canvas })'),
-    'IR lighting installs before the snapshot scene and its materials compile',
+    boot.indexOf('createSnapshotLightProbes({') > boot.indexOf('syncDefaultLights();'),
+    'snapshot probes bake after the environment and lights are applied',
 );
 
-const speedballReplay = functionBody('async function createSnapshotSpeedballGi(');
-assert.match(speedballReplay, /import\('speedball-gi'\)/,
-    'snapshot Speedball replay resolves through the package import map');
-assert.match(speedballReplay, /import\('\.\/max_lights_node\.js'\)/,
-    'snapshot Speedball replay installs the same adaptive light graph as live max.js');
-assert.match(speedballReplay, /installMaxLightsRenderer\(renderer\)/,
-    'snapshot Speedball replay installs MaxLightsNode before the first render compile');
-assert.doesNotMatch(speedballReplay, /\bgiLights\b/,
-    'snapshot Speedball replay does not diverge through the generic library light graph');
-assert.match(source, /snapshotUi\?\.speedballGi/,
-    'snapshot replay reads the Speedball-branded UI state');
-assert.match(speedballReplay, /maxTimeline\.playing\?\.\(\) === true/,
-    'snapshot Speedball replay observes standalone timeline playback after warmup');
-
-const nirSensingReplay = functionBody('async function createSnapshotNirSensingController(');
-assert.match(nirSensingReplay, /import\('speedball-gi'\)/,
-    'snapshot NIR replay resolves the shared direct-light gates lazily');
+const nirSensingReplay = functionBody('function createSnapshotNirSensingController(');
+assert.match(nirSensingReplay, /createIrEmitterGate\(\)/,
+    'snapshot NIR replay gates IR illuminators like the editor');
 assert.match(nirSensingReplay, /powerShot\.mode === 'infrared'.*powerShot\.mode === 'nightshot'/s,
     'standalone sensing follows the same PowerShot imager modes as the editor');
-for (const consumer of [
-    'setNirDirectSensing',
-    'setNirIlluminatorGain',
-    'setNirSensing',
-    'setNirGain',
-    'setSpectralRasterSensing',
-]) {
-    assert.match(nirSensingReplay, new RegExp(`\\b${consumer}\\b`),
-        `snapshot NIR replay drives ${consumer}`);
-}
+assert.match(nirSensingReplay, /\bsetSpectralRasterSensing\b/,
+    'snapshot NIR replay drives ctx.spectral raster sensing');
 assert.match(snapshotFxSource, /getPowerShotOptions\(\)\s*\{\s*return state\.powershot;/,
     'snapshot PowerShot exposes its active imager state to the frame driver');
 const snapshotLoop = functionBody('async function startRenderLoop(');
@@ -166,7 +147,7 @@ assert.ok(
     'snapshot precompiles with yields before its first render',
 );
 assert.match(snapshotLoop, /renderer\.setAnimationLoop\(null\);\s*nirSensing\.dispose\(\);/,
-    'snapshot teardown resets module-shared NIR state');
+    'snapshot teardown resets the IR illuminators');
 
 const animationSource = readFileSync(
     new URL('../web/js/maxjs_animation.js', import.meta.url),
@@ -177,17 +158,15 @@ assert.match(animationSource, /syncAnimatedLightTarget\(target\)/,
 assert.match(animationSource, /\.set\(0, -ANIMATED_LIGHT_TARGET_DISTANCE, 0\)/,
     'animated light targeting preserves the exported Max -Y beam convention');
 
-assert.match(snapshotExportSource, /const std::wstring speedballVendor = webDir \+ L"\\\\vendor\\\\speedball-gi";/,
-    'standalone export resolves the vendored Speedball package');
-assert.match(snapshotExportSource, /CopyDirectoryRecursive\(speedballVendor, outDir \+ L"\\\\vendor\\\\speedball-gi"\)/,
-    'standalone export copies Speedball beside the snapshot runtime');
-assert.match(snapshotExportSource, /const std::wstring speedballBvhDependency = webDir \+ L"\\\\node_modules\\\\three-mesh-bvh";/,
-    'standalone export resolves Speedball\'s BVH peer dependency');
-assert.match(snapshotExportSource, /CopyDirectoryRecursive\(speedballBvhDependency, outDir \+ L"\\\\node_modules\\\\three-mesh-bvh"\)/,
-    'standalone export copies Speedball\'s BVH peer dependency');
+assert.match(snapshotExportSource, /const std::wstring bvhDependency = webDir \+ L"\\\\node_modules\\\\three-mesh-bvh";/,
+    'standalone export resolves three-mesh-bvh for runtime layers');
+assert.match(snapshotExportSource, /CopyDirectoryRecursive\(bvhDependency, outDir \+ L"\\\\node_modules\\\\three-mesh-bvh"\)/,
+    'standalone export copies three-mesh-bvh beside the snapshot runtime');
+assert.doesNotMatch(snapshotExportSource, /speedball/i, 'standalone export no longer ships Speedball');
 for (const page of snapshotPages) {
-    assert.match(page, /"speedball-gi": "\.\/vendor\/speedball-gi\/js\/index\.js"/,
-        'every snapshot shell maps the Speedball package to the copied vendor');
+    assert.doesNotMatch(page, /speedball-gi/, 'snapshot shells no longer map Speedball');
+    assert.match(page, /"three-mesh-bvh": "\.\/node_modules\/three-mesh-bvh\/src\/index\.js"/,
+        'every snapshot shell maps three-mesh-bvh to the copied dependency');
 }
 
 assert.match(sceneLightsSource, /THREE\.MathUtils\.clamp\(penumbra, 0, 1\)/,

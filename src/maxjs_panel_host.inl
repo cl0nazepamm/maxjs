@@ -205,12 +205,12 @@
     bool renderSequenceAlpha_ = false;
     std::wstring renderSequenceLastError_;
     ULONG lockedCameraHandle_ = 0;  // 0 = viewport (default), nonzero = scene camera handle
-    int pathTracingSamplesPerFrame_ = 64;
-    float pathTracingGIClamp_ = 8.0f;
+    int pathTracingRenderSamples_ = 64;
+    int pathTracingBounces_ = 8;
+    float pathTracingGIClamp_ = 10.0f;
     bool pathTracingFreezeSync_ = false;
     bool pathTracingViewerActive_ = false;
     bool pathTracingHasSceneSync_ = false;
-    bool nativeGiSurfaceDirty_ = true;
     bool pendingSnapshotExportRequest_ = false;
     std::wstring lastSnapshotExportPath_;
     std::wstring snapshotServePath_;
@@ -519,7 +519,7 @@
     // ── WebView2 failure forensics ─────────────────────────────────────
     // Renderer/GPU process deaths are otherwise SILENT: WebView2 recovers by
     // renavigating and the viewer just "randomly restarts" with no dump, no
-    // event-log entry (2026-07-23: aggressive scrubbing + speedball GI drove
+    // event-log entry (2026-07-23: aggressive scrubbing + the old probe GI drove
     // renderer OOM via the since-fixed full-rebuild treadmill — took a live
     // debugging session to even name the killer). Every failure appends one
     // line to %LOCALAPPDATA%\MaxJS\webview_failures.log so a restart can be

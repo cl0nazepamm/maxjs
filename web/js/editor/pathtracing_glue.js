@@ -1,4 +1,4 @@
-// pathtracing_glue.js - editor glue for live Spectral path tracing.
+// pathtracing_glue.js - editor glue for the live path tracing view (path_tracer.js).
 import * as THREE from 'three';
 
 function createPathTracingGlue(deps = {}) {
@@ -6,6 +6,7 @@ function createPathTracingGlue(deps = {}) {
         const PATH_TRACE_UPDATE_DEFORM = 2;
         const PATH_TRACE_UPDATE_FULL = 4;
         const PATH_TRACE_UPDATE_LIGHT = 8;
+        const PATH_TRACE_UPDATE_MATERIAL = 16;
         let pathTracingLiveRebuildTimer = 0;
         let pathTracingLiveUpdateMask = 0;
         let pathTracingInactiveUpdateMask = 0;
@@ -14,34 +15,33 @@ function createPathTracingGlue(deps = {}) {
         }
 
         function leavePathTracingView() {
-            // A scheduled update must survive switching to Probe view. The
-            // retained tracer scene is intentionally kept alive, so dropping
-            // this mask would show stale geometry/lights on the next Trace entry.
+            // A scheduled update must survive leaving the view: the tracer keeps its
+            // scene, so dropping this mask would show stale geometry on the next entry.
             pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(
                 pathTracingInactiveUpdateMask,
                 pathTracingLiveUpdateMask,
             );
             clearScheduledPathTracingLiveRebuild();
-            deps.pathTracingFx.setToneMapInBlit?.(true);
             deps.maxjsFx.setPathTracedSource?.(null);
         }
 
-        // Live spectral-view switch: probe GI <-> path tracer, no reload.
-        // The probe ticker checks isPathTracingMode per tick and the render
-        // loop gates the PT branch on it. Leaving trace view must also clear
-        // the post stack's PT source, otherwise regular spectral/probe frames
-        // keep presenting the last path-traced texture.
-        function setSpectralView(view) {
-            const next = view === 'trace' ? 'trace' : 'probes';
-            if (next === 'trace' && deps.hasActiveLightLinks?.()) {
-                deps.perfHud?.setStatus?.('max.js - set linked lights to None before using Trace');
-                return deps.spectralView;
+        // Live raster <-> path tracing switch, no reload. Leaving the view must also
+        // clear the post stack's path-traced source, or raster frames keep
+        // presenting the last traced texture.
+        function setPathTracingActive(active) {
+            const next = active === true;
+            if (next === deps.isPathTracingMode) return deps.isPathTracingMode;
+            if (next && !deps.pathTracingFx.isEnabled?.()) {
+                deps.perfHud?.setStatus?.('max.js - path tracing needs the WebGPU backend');
+                return false;
             }
-            if (!deps.isStudioMode || deps.spectralView === next) return deps.spectralView;
-            deps.spectralView = next;
-            deps.isPathTracingMode = next === 'trace';
-            document.body.classList.toggle('pathtracing-mode', deps.isPathTracingMode);
-            if (deps.isPathTracingMode) {
+            if (next && deps.hasActiveLightLinks?.()) {
+                deps.perfHud?.setStatus?.('max.js - set linked lights to None before path tracing');
+                return false;
+            }
+            deps.isPathTracingMode = next;
+            document.body.classList.toggle('pathtracing-mode', next);
+            if (next) {
                 deps.pathTracingFx.start?.();
                 resetPathTracingStartupWarmup();
                 if (pathTracingInactiveUpdateMask) {
@@ -55,20 +55,21 @@ function createPathTracingGlue(deps = {}) {
             } else {
                 leavePathTracingView();
             }
-            const skyChanged = deps.refreshSkyForSpectralView?.() === true;
-            if (deps.isPathTracingMode && skyChanged) markPathTracingSceneDirtyNow();
-            window.__maxjsSyncSpectralViewUi?.();
+            if (deps.refreshSkyForPathTracing?.() === true && next) markPathTracingSceneDirtyNow();
+            window.__maxjsSyncPathTracingUi?.();
             if (window.chrome?.webview) sendPathTracingRuntimeState();
-            return deps.spectralView;
+            return deps.isPathTracingMode;
         }
-        window.maxjsSpectral = { getView: () => deps.spectralView, setView: setSpectralView };
-        // Linear-HDR target the path tracer blits into when its output is routed
-        // through the camera post stack (bloom/grade/grain + PowerShot). The
-        // post stack gates its own gbuffer effects (SSGI/SSR/...) once a PT
-        // source is set, so only the color-domain effects fold over PT's beauty.
+        window.maxjsPathTracing = {
+            isActive: () => deps.isPathTracingMode,
+            setActive: setPathTracingActive,
+        };
+
+        // Linear-HDR target the path tracer renders into when its output goes through
+        // the camera post stack. The stack skips its g-buffer effects (SSGI/SSR/...)
+        // while a path-traced source is set; only color-domain effects apply.
         let pathTracingPostTarget = null;
         function ensurePathTracingPostTarget() {
-            if (typeof THREE.RenderTarget !== 'function') return null;
             const v = new THREE.Vector2();
             deps.renderer.getDrawingBufferSize(v);
             const w = Math.max(1, Math.floor(v.x));
@@ -77,13 +78,11 @@ function createPathTracingGlue(deps = {}) {
                 pathTracingPostTarget.dispose();
                 pathTracingPostTarget = null;
             }
-            if (!pathTracingPostTarget) {
-                pathTracingPostTarget = new THREE.RenderTarget(w, h, {
-                    type: THREE.HalfFloatType,
-                    colorSpace: THREE.LinearSRGBColorSpace,
-                    depthBuffer: false,
-                });
-            }
+            pathTracingPostTarget ??= new THREE.RenderTarget(w, h, {
+                type: THREE.HalfFloatType,
+                colorSpace: THREE.LinearSRGBColorSpace,
+                depthBuffer: false,
+            });
             return pathTracingPostTarget;
         }
 
@@ -104,41 +103,19 @@ function createPathTracingGlue(deps = {}) {
                 && hasPathTracingPostFxActive();
             if (wantPost) {
                 const rt = ensurePathTracingPostTarget();
-                if (rt) {
-                    deps.pathTracingFx.setToneMapInBlit?.(false); // emit linear HDR
-                    const prevTarget = deps.renderer.getRenderTarget();
-                    deps.renderer.setRenderTarget(rt);
-                    const ok = deps.pathTracingFx.render?.();
-                    deps.renderer.setRenderTarget(prevTarget);
-                    if (ok) {
-                        deps.maxjsFx.setPathTracedSource?.(rt.texture);
-                        deps.maxjsFx.render();
-                        return;
-                    }
+                const prevTarget = deps.renderer.getRenderTarget();
+                deps.renderer.setRenderTarget(rt);
+                const ok = deps.pathTracingFx.render?.();
+                deps.renderer.setRenderTarget(prevTarget);
+                if (ok) {
+                    deps.maxjsFx.setPathTracedSource?.(rt.texture);
+                    deps.maxjsFx.render();
+                    return;
                 }
             }
-            // Direct path: the blit tone-maps straight to the canvas.
-            deps.pathTracingFx.setToneMapInBlit?.(true);
+            // Direct path: the renderer's output transform tone maps the canvas blit.
             deps.maxjsFx.setPathTracedSource?.(null);
             if (!deps.pathTracingFx.render?.()) renderPathTracingFallbackFrame();
-        }
-
-        function normalizePathTracingSamplesPerFrame(value) {
-            const n = Math.round(Number(value));
-            if (!Number.isFinite(n)) return 64;
-            return Math.max(1, Math.min(512, n));
-        }
-
-        function normalizePathTracingGIClamp(value) {
-            const n = Number(value);
-            if (!Number.isFinite(n)) return 8.0;
-            return Math.max(1.0, Math.min(1000.0, n));
-        }
-
-        function normalizePathTracingSampleLimit(value) {
-            const n = Math.round(Number(value));
-            if (!Number.isFinite(n) || n <= 0) return 0; // 0 = unlimited
-            return Math.min(100000, n);
         }
 
         function resetPathTracingStartupWarmup() {
@@ -170,9 +147,11 @@ function createPathTracingGlue(deps = {}) {
         function markPathTracingSceneDirtyNow() {
             clearScheduledPathTracingLiveRebuild();
             pathTracingInactiveUpdateMask = 0;
-            if (deps.pathTracingFx.isEnabled?.()) {
-                deps.pathTracingFx.markSceneDirty?.();
-            }
+            deps.pathTracingFx.markSceneDirty?.();
+        }
+
+        function markPathTracingEnvironmentDirty() {
+            deps.pathTracingFx.markEnvironmentDirty?.();
         }
 
         function armPathTracingLiveUpdateTimer() {
@@ -186,38 +165,23 @@ function createPathTracingGlue(deps = {}) {
                 pathTracingLiveUpdateMask = 0;
                 return;
             }
-            // Playback can stop without another geometry packet. Poll the
-            // authoritative timeline state, but never land CPU scene work in
-            // the middle of playback. Paused slider packets keep resetting the
-            // trailing edge naturally.
+            // Playback can stop without another packet: poll the timeline, but never
+            // land scene work in the middle of playback.
             if (deps.maxTimeline?.playing?.() === true) {
                 armPathTracingLiveUpdateTimer();
                 return;
             }
             const mask = pathTracingLiveUpdateMask;
             pathTracingLiveUpdateMask = 0;
+            const fx = deps.pathTracingFx;
             if ((mask & PATH_TRACE_UPDATE_FULL) !== 0) {
-                deps.pathTracingFx.markSceneDirty?.();
-            } else if ((mask & PATH_TRACE_UPDATE_DEFORM) !== 0) {
-                if (typeof deps.pathTracingFx.markDeformsDirty === 'function') {
-                    deps.pathTracingFx.markDeformsDirty({ transforms: (mask & PATH_TRACE_UPDATE_TRANSFORM) !== 0 });
-                } else {
-                    deps.pathTracingFx.markSceneDirty?.();
-                }
-            } else if ((mask & PATH_TRACE_UPDATE_TRANSFORM) !== 0) {
-                if (typeof deps.pathTracingFx.markTransformsDirty === 'function') {
-                    deps.pathTracingFx.markTransformsDirty();
-                } else {
-                    deps.pathTracingFx.markSceneDirty?.();
-                }
+                fx.markSceneDirty();
+                return;
             }
-            if ((mask & PATH_TRACE_UPDATE_LIGHT) !== 0) {
-                if (typeof deps.pathTracingFx.markLightsDirty === 'function') {
-                    deps.pathTracingFx.markLightsDirty();
-                } else {
-                    deps.pathTracingFx.markSceneDirty?.();
-                }
-            }
+            if ((mask & PATH_TRACE_UPDATE_DEFORM) !== 0) fx.markDeformsDirty({ transforms: (mask & PATH_TRACE_UPDATE_TRANSFORM) !== 0 });
+            else if ((mask & PATH_TRACE_UPDATE_TRANSFORM) !== 0) fx.markTransformsDirty();
+            if ((mask & PATH_TRACE_UPDATE_MATERIAL) !== 0) fx.markMaterialsDirty();
+            if ((mask & PATH_TRACE_UPDATE_LIGHT) !== 0) fx.markLightsDirty();
         }
 
         function mergePathTracingUpdateMasks(currentMask, nextMask) {
@@ -226,35 +190,31 @@ function createPathTracingGlue(deps = {}) {
             return currentMask | nextMask;
         }
 
+        const UPDATE_LANES = {
+            transform: PATH_TRACE_UPDATE_TRANSFORM,
+            deform: PATH_TRACE_UPDATE_DEFORM,
+            light: PATH_TRACE_UPDATE_LIGHT,
+            material: PATH_TRACE_UPDATE_MATERIAL,
+        };
+
         function schedulePathTracingLiveRebuild(changeKind = 'full') {
             if (deps.pathTracingSettings.freezeSync) return;
-            let nextMask = PATH_TRACE_UPDATE_FULL;
-            if (changeKind === 'transform') nextMask = PATH_TRACE_UPDATE_TRANSFORM;
-            else if (changeKind === 'deform') nextMask = PATH_TRACE_UPDATE_DEFORM;
-            else if (changeKind === 'light') nextMask = PATH_TRACE_UPDATE_LIGHT;
-            if (!deps.pathTracingFx.isStarted?.()) {
-                // The first start always builds from the current scene.
-                return;
-            }
+            // The first start always builds from the current scene.
+            if (!deps.pathTracingFx.isStarted?.()) return;
+            const nextMask = UPDATE_LANES[changeKind] ?? PATH_TRACE_UPDATE_FULL;
             if (!deps.isPathTracingMode) {
-                pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(
-                    pathTracingInactiveUpdateMask,
-                    nextMask,
-                );
+                pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(pathTracingInactiveUpdateMask, nextMask);
                 return;
             }
-            pathTracingLiveUpdateMask = mergePathTracingUpdateMasks(
-                pathTracingLiveUpdateMask,
-                nextMask,
-            );
-            // True trailing edge: every packet moves the flush point. This
-            // coalesces a play/scrub burst into one latest-pose update.
+            pathTracingLiveUpdateMask = mergePathTracingUpdateMasks(pathTracingLiveUpdateMask, nextMask);
+            // True trailing edge: every packet moves the flush point, so a play/scrub
+            // burst lands as one latest-pose update.
             armPathTracingLiveUpdateTimer();
         }
 
         function sendPathTracingRuntimeState() {
             deps.bridge?.send?.('pathtracing_settings', {
-                samplesPerFrame: deps.pathTracingSettings.samplesPerFrame,
+                bounces: deps.pathTracingSettings.bounces,
                 giClamp: deps.pathTracingSettings.giClamp,
                 freezeSync: deps.pathTracingSettings.freezeSync,
                 paused: deps.pathTracingSettings.paused,
@@ -265,57 +225,35 @@ function createPathTracingGlue(deps = {}) {
 
         function applyPathTracingSettings(next = {}, { notify = false, sendHost = false } = {}) {
             const wasFrozen = deps.pathTracingSettings.freezeSync === true;
-            deps.pathTracingSettings.samplesPerFrame = normalizePathTracingSamplesPerFrame(
-                next.samplesPerFrame ?? deps.pathTracingSettings.samplesPerFrame,
-            );
-            deps.pathTracingSettings.giClamp = normalizePathTracingGIClamp(
-                next.giClamp ?? deps.pathTracingSettings.giClamp,
-            );
-            deps.pathTracingSettings.sampleLimit = normalizePathTracingSampleLimit(
-                next.sampleLimit ?? deps.pathTracingSettings.sampleLimit,
-            );
-            if (next.freezeSync != null) deps.pathTracingSettings.freezeSync = next.freezeSync === true;
-            if (next.paused != null) {
-                deps.pathTracingSettings.paused = next.paused === true;
-                // Pause stops all compute dispatch → GPU idle → UI panels stay
-                // responsive while the last accumulated frame holds on screen.
-                deps.pathTracingFx.setPaused?.(deps.pathTracingSettings.paused);
-                deps.ptPauseUiSync?.();
-            }
-            deps.pathTracingFx.setOptions?.(deps.pathTracingSettings);
+            deps.pathTracingFx.setOptions(next);
+            if (next.paused != null) deps.ptPauseUiSync?.();
             if (wasFrozen && !deps.pathTracingSettings.freezeSync) {
                 if (deps.isPathTracingMode && deps.bridgeHasInitialSync()) {
-                    // C++ still advanced its sent-state caches while JS was ignoring updates.
-                    // Ask for one authoritative resync when accumulation is unfrozen.
+                    // The host kept advancing its sent-state caches while sync was frozen:
+                    // ask for one authoritative resync.
                     deps.bridge.send('scene_dirty', { reason: 'pathtracing_unfreeze' });
                     markPathTracingSceneDirtyNow();
                 } else if (deps.pathTracingFx.isStarted?.()) {
-                    pathTracingInactiveUpdateMask = mergePathTracingUpdateMasks(
-                        pathTracingInactiveUpdateMask,
-                        PATH_TRACE_UPDATE_FULL,
-                    );
+                    pathTracingInactiveUpdateMask = PATH_TRACE_UPDATE_FULL;
                 }
             }
-            if (sendHost && window.chrome?.webview) {
-                sendPathTracingRuntimeState();
-            }
+            if (sendHost && window.chrome?.webview) sendPathTracingRuntimeState();
             if (notify && deps.isPathTracingMode) {
-                deps.perfHud.setStatus(
-                    `max.js - PT samples/frame ${deps.pathTracingSettings.samplesPerFrame}, GI clamp ${deps.pathTracingSettings.giClamp.toFixed(1)}, sync ${deps.pathTracingSettings.freezeSync ? 'frozen' : 'live'}`,
-                );
+                const s = deps.pathTracingSettings;
+                deps.perfHud.setStatus(`max.js - PT bounces ${s.bounces}, GI clamp ${s.giClamp.toFixed(1)}, sync ${s.freezeSync ? 'frozen' : 'live'}`);
             }
         }
-
 
         return {
             isPathTracingViewActive,
             leavePathTracingView,
-            setSpectralView,
+            setPathTracingActive,
             renderPathTracingLiveFrame,
             resetPathTracingStartupWarmup,
             canStartPathTracingNow,
             renderPathTracingFallbackFrame,
             markPathTracingSceneDirtyNow,
+            markPathTracingEnvironmentDirty,
             schedulePathTracingLiveRebuild,
             sendPathTracingRuntimeState,
             applyPathTracingSettings,

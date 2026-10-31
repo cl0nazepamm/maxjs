@@ -12,7 +12,7 @@ export const SKY_DETAIL_DEFAULTS = Object.freeze({
     sunShadowDistance: 10000,
 });
 
-const registeredRenderers = new WeakSet();
+SunLight.registerNode(SunLightNode);
 
 export function normalizeSkyDetails(params) {
     for (const [key, min, max] of [
@@ -39,11 +39,7 @@ export function applySkyDetails(mesh, params) {
     uniforms.showSunDisc.value = params.showSunDisc ? 1 : 0;
 }
 
-export function createSkySun(renderer, params) {
-    if (params.sunShadows && renderer.library && !registeredRenderers.has(renderer)) {
-        renderer.library.addLight(SunLightNode, SunLight);
-        registeredRenderers.add(renderer);
-    }
+export function createSkySun(params) {
     const sun = params.sunShadows
         ? new SunLight(0xffffff, 2)
         : new THREE.DirectionalLight(0xffffff, 2);

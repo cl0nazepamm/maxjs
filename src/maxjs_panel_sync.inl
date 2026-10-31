@@ -1738,254 +1738,6 @@
             frame.bytes(), frameId, frame.command_count(), producerBytesFallback);
     }
 
-    bool PostSharedFloatPacket(const wchar_t* type, const std::vector<float>& floats, const std::wstring& extraMeta = L"") {
-        if (!webview_ || !env_ || !useBinary_ || !type || floats.empty()) return false;
-
-        ComPtr<ICoreWebView2_17> wv17;
-        ComPtr<ICoreWebView2Environment12> env12;
-        webview_->QueryInterface(IID_PPV_ARGS(&wv17));
-        env_->QueryInterface(IID_PPV_ARGS(&env12));
-        if (!wv17 || !env12) return false;
-
-        const size_t totalBytes = std::max<size_t>(4, floats.size() * sizeof(float));
-        ComPtr<ICoreWebView2SharedBuffer> sharedBuf;
-        HRESULT hr = env12->CreateSharedBuffer(totalBytes, &sharedBuf);
-        if (FAILED(hr) || !sharedBuf) return false;
-
-        BYTE* bufPtr = nullptr;
-        sharedBuf->get_Buffer(&bufPtr);
-        if (bufPtr) memcpy(bufPtr, floats.data(), floats.size() * sizeof(float));
-
-        std::wostringstream meta;
-        meta.imbue(std::locale::classic());
-        meta << L"{\"type\":\"" << type << L"\",\"floatCount\":" << floats.size();
-        if (!extraMeta.empty()) meta << L',' << extraMeta;
-        meta << L'}';
-
-        wv17->PostSharedBufferToScript(
-            sharedBuf.Get(),
-            COREWEBVIEW2_SHARED_BUFFER_ACCESS_READ_ONLY,
-            meta.str().c_str());
-        return true;
-    }
-
-    static Point3 TransformPoint16(const float* m, const Point3& p) {
-        return Point3(
-            p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12],
-            p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13],
-            p.x * m[2] + p.y * m[6] + p.z * m[10] + m[14]);
-    }
-
-    bool SendNativeGiSurfacePacket(TimeValue t) {
-        if (!nativeGiSurfaceDirty_ || geomHandles_.empty()) return false;
-        Interface* ip = GetCOREInterface();
-        if (!ip) return false;
-
-        static constexpr size_t kGiSampleStride = 12;
-        static constexpr size_t kGiSurfaceBudget = 1024;
-
-        struct GiMesh {
-            INode* node = nullptr;
-            std::vector<float> verts;
-            std::vector<float> norms;
-            std::vector<int> indices;
-            float xform[16] = {};
-            float albedo[3] = { 1.0f, 1.0f, 1.0f };
-            size_t triCount = 0;
-        };
-
-        std::vector<GiMesh> meshes;
-        meshes.reserve(geomHandles_.size());
-        size_t totalTriangles = 0;
-
-        std::vector<ULONG> handles(geomHandles_.begin(), geomHandles_.end());
-        std::sort(handles.begin(), handles.end());
-        for (ULONG handle : handles) {
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node || !IsMaxJsSyncDrawVisible(node)) continue;
-
-            GiMesh gm;
-            gm.node = node;
-            std::vector<float> uvs, norms;
-            std::vector<MatGroup> groups;
-            std::vector<VertexColorAttributeRecord> vertexColors;
-            if (!ExtractMesh(node, t, gm.verts, uvs, gm.indices, groups, &norms, nullptr, &vertexColors, nullptr, nullptr, false, nullptr)) {
-                continue;
-            }
-            gm.norms = std::move(norms);
-            if (gm.verts.empty()) continue;
-            gm.triCount = gm.indices.empty() ? gm.verts.size() / 9 : gm.indices.size() / 3;
-            if (gm.triCount == 0) continue;
-
-            GetTransform16(node, t, gm.xform);
-            MaxJSPBR pbr;
-            ExtractPBR(node, t, pbr);
-            gm.albedo[0] = std::clamp(pbr.color[0], 0.0f, 1.0f);
-            gm.albedo[1] = std::clamp(pbr.color[1], 0.0f, 1.0f);
-            gm.albedo[2] = std::clamp(pbr.color[2], 0.0f, 1.0f);
-
-            totalTriangles += gm.triCount;
-            meshes.push_back(std::move(gm));
-        }
-
-        const size_t sampleCount = std::min(kGiSurfaceBudget, totalTriangles);
-        if (sampleCount == 0) return false;
-
-        std::vector<float> out;
-        out.reserve(sampleCount * kGiSampleStride);
-
-        Point3 boundsMin(FLT_MAX, FLT_MAX, FLT_MAX);
-        Point3 boundsMax(-FLT_MAX, -FLT_MAX, -FLT_MAX);
-        auto expandBounds = [&](const Point3& p) {
-            boundsMin.x = std::min(boundsMin.x, p.x);
-            boundsMin.y = std::min(boundsMin.y, p.y);
-            boundsMin.z = std::min(boundsMin.z, p.z);
-            boundsMax.x = std::max(boundsMax.x, p.x);
-            boundsMax.y = std::max(boundsMax.y, p.y);
-            boundsMax.z = std::max(boundsMax.z, p.z);
-        };
-
-        size_t emitted = 0;
-        size_t globalTri = 0;
-        size_t nextTarget = totalTriangles > sampleCount
-            ? static_cast<size_t>((0.5 * static_cast<double>(totalTriangles)) / static_cast<double>(sampleCount))
-            : 0;
-
-        auto readVertex = [](const std::vector<float>& verts, int idx) -> Point3 {
-            const size_t o = static_cast<size_t>(std::max(0, idx)) * 3u;
-            if (o + 2 >= verts.size()) return Point3(0, 0, 0);
-            return Point3(verts[o + 0], verts[o + 1], verts[o + 2]);
-        };
-        auto transformVector = [](const float* m, const Point3& v) -> Point3 {
-            return Point3(
-                v.x * m[0] + v.y * m[4] + v.z * m[8],
-                v.x * m[1] + v.y * m[5] + v.z * m[9],
-                v.x * m[2] + v.y * m[6] + v.z * m[10]);
-        };
-
-        for (const GiMesh& gm : meshes) {
-            for (size_t tri = 0; tri < gm.triCount && emitted < sampleCount; ++tri, ++globalTri) {
-                const bool take = totalTriangles <= sampleCount || globalTri >= nextTarget;
-                if (!take) continue;
-
-                int ia = 0, ib = 0, ic = 0;
-                if (!gm.indices.empty()) {
-                    const size_t io = tri * 3u;
-                    ia = gm.indices[io + 0];
-                    ib = gm.indices[io + 1];
-                    ic = gm.indices[io + 2];
-                } else {
-                    ia = static_cast<int>(tri * 3u + 0u);
-                    ib = static_cast<int>(tri * 3u + 1u);
-                    ic = static_cast<int>(tri * 3u + 2u);
-                }
-
-                const Point3 a = TransformPoint16(gm.xform, readVertex(gm.verts, ia));
-                const Point3 b = TransformPoint16(gm.xform, readVertex(gm.verts, ib));
-                const Point3 c = TransformPoint16(gm.xform, readVertex(gm.verts, ic));
-                Point3 n(0, 0, 0);
-                if (gm.norms.size() == gm.verts.size()) {
-                    n = transformVector(gm.xform, readVertex(gm.norms, ia))
-                        + transformVector(gm.xform, readVertex(gm.norms, ib))
-                        + transformVector(gm.xform, readVertex(gm.norms, ic));
-                } else {
-                    n = CrossProd(b - a, c - a);
-                }
-                const float len = n.Length();
-                if (len <= 1.0e-7f || !std::isfinite(len)) continue;
-                n /= len;
-                Point3 p = (a + b + c) / 3.0f;
-                expandBounds(p);
-
-                out.push_back(p.x); out.push_back(p.y); out.push_back(p.z);
-                out.push_back(n.x); out.push_back(n.y); out.push_back(n.z);
-                out.push_back(gm.albedo[0]); out.push_back(gm.albedo[1]); out.push_back(gm.albedo[2]);
-                out.push_back(0.0f); out.push_back(0.0f); out.push_back(0.0f);
-                ++emitted;
-                if (totalTriangles > sampleCount) {
-                    nextTarget = static_cast<size_t>(((static_cast<double>(emitted) + 0.5) * static_cast<double>(totalTriangles)) / static_cast<double>(sampleCount));
-                }
-            }
-            globalTri += (gm.triCount > 0 ? 0 : 0);
-        }
-
-        if (emitted == 0) return false;
-        out.resize(emitted * kGiSampleStride);
-
-        const Point3 size = boundsMax - boundsMin;
-        const float pad = std::max(10.0f, std::max(size.x, std::max(size.y, size.z)) * 0.08f);
-        boundsMin -= Point3(pad, pad, pad);
-        boundsMax += Point3(pad, pad, pad);
-        const Point3 paddedSize = boundsMax - boundsMin;
-
-        std::wostringstream extra;
-        extra.imbue(std::locale::classic());
-        extra << L"\"sampleCount\":" << emitted << L",\"stride\":" << kGiSampleStride;
-        extra << L",\"boundsMin\":[" << boundsMin.x << L',' << boundsMin.y << L',' << boundsMin.z << L']';
-        extra << L",\"boundsSize\":[" << paddedSize.x << L',' << paddedSize.y << L',' << paddedSize.z << L']';
-
-        if (PostSharedFloatPacket(L"gi_surface_bin", out, extra.str())) {
-            nativeGiSurfaceDirty_ = false;
-            return true;
-        }
-        return false;
-    }
-
-    bool SendNativeGiLightPacket(TimeValue t) {
-        if (lightHandles_.empty()) return false;
-        Interface* ip = GetCOREInterface();
-        if (!ip) return false;
-
-        static constexpr size_t kLightStride = 16;
-        static constexpr size_t kMaxLights = 64;
-        std::vector<float> out;
-        out.reserve(kMaxLights * kLightStride);
-
-        std::vector<ULONG> handles(lightHandles_.begin(), lightHandles_.end());
-        std::sort(handles.begin(), handles.end());
-        for (ULONG handle : handles) {
-            if (out.size() >= kMaxLights * kLightStride) break;
-            INode* node = ip->GetINodeByHandle(handle);
-            if (!node) continue;
-
-            float xform[16];
-            GetTransform16(node, t, xform);
-            maxjs::sync::DeltaFrameBuilder::LightData ld = {};
-            ld.matrix16 = xform;
-            ld.visible = IsMaxJsSyncDrawVisible(node);
-            if (!ExtractLightBinaryData(node, t, ld) || !ld.visible) continue;
-            if (ld.type > 2u) continue; // GI currently consumes directional, point, and spot lights.
-
-            const float dirX = -xform[4];
-            const float dirY = -xform[5];
-            const float dirZ = -xform[6];
-            const float dirLen = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
-            const float invDirLen = dirLen > 1.0e-7f ? 1.0f / dirLen : 1.0f;
-            const float angle = ld.type == 2u && ld.angle > 1.0e-5f ? ld.angle : 1.04719755f;
-            const float penumbra = ld.type == 2u ? std::clamp(ld.penumbra, 0.0f, 1.0f) : 0.0f;
-
-            out.push_back(static_cast<float>(ld.type));
-            out.push_back(xform[12]); out.push_back(xform[13]); out.push_back(xform[14]);
-            out.push_back(dirX * invDirLen); out.push_back(dirY * invDirLen); out.push_back(dirZ * invDirLen);
-            out.push_back(ld.color[0] * ld.intensity);
-            out.push_back(ld.color[1] * ld.intensity);
-            out.push_back(ld.color[2] * ld.intensity);
-            out.push_back(ld.distance);
-            out.push_back(ld.decay > 0.0f ? ld.decay : 2.0f);
-            out.push_back(std::cos(angle));
-            out.push_back(std::cos(angle * (1.0f - penumbra)));
-            out.push_back(std::max(0.0f, ld.volContrib));
-            out.push_back(0.0f);
-        }
-
-        if (out.empty()) return false;
-
-        std::wostringstream extra;
-        extra.imbue(std::locale::classic());
-        extra << L"\"lightCount\":" << (out.size() / kLightStride) << L",\"stride\":" << kLightStride;
-        return PostSharedFloatPacket(L"gi_light_bin", out, extra.str());
-    }
-
     void ResetInProgressPlaybackSnapshot() {
         playbackSnapshotActive_ = false;
         playbackSnapshotFinalized_ = false;
@@ -3310,15 +3062,15 @@
             return;
         }
         if (type == L"pathtracing_settings") {
-            int samplesPerFrame = pathTracingSamplesPerFrame_;
+            int bounces = pathTracingBounces_;
             float giClamp = pathTracingGIClamp_;
             bool freezeSync = pathTracingFreezeSync_;
             bool viewerActive = false;
-            ExtractJsonInt(msg, L"samplesPerFrame", samplesPerFrame);
+            ExtractJsonInt(msg, L"bounces", bounces);
             ExtractJsonFloat(msg, L"giClamp", giClamp);
             ExtractJsonBool(msg, L"freezeSync", freezeSync);
             ExtractJsonBool(msg, L"active", viewerActive);
-            SetPathTracingRuntimeSettings(samplesPerFrame, giClamp, freezeSync, viewerActive);
+            SetPathTracingRuntimeSettings(bounces, giClamp, freezeSync, viewerActive);
             return;
         }
         if (type == L"live_sync_settings") {
@@ -3334,22 +3086,6 @@
             bool disabled = false;
             ExtractJsonBool(msg, L"disabled", disabled);
             SetSlowJsonSyncMode(disabled);
-            return;
-        }
-        if (type == L"gi_probe_refresh") {
-            bool surface = true;
-            bool lights = true;
-            ExtractJsonBool(msg, L"surface", surface);
-            ExtractJsonBool(msg, L"lights", lights);
-            Interface* ip = GetCOREInterface();
-            TimeValue t = ip ? ip->GetTime() : 0;
-            if (surface) {
-                nativeGiSurfaceDirty_ = true;
-                SendNativeGiSurfacePacket(t);
-            }
-            if (lights) {
-                SendNativeGiLightPacket(t);
-            }
             return;
         }
         // Layer mount/remove or host-side sync repair — full resend without reloading WebView2
@@ -3649,7 +3385,7 @@
         if (type == L"ready" || msg.find(L"\"ready\"") != std::wstring::npos) {
             jsReady_ = true; SetDirtyImmediate();
             pathTracingHasSceneSync_ = false;
-            SetPathTracingSettings(g_pathTracingSamplesPerFrame, g_pathTracingGIClamp, g_pathTracingFreezeSync);
+            SetPathTracingSettings(g_pathTracingRenderSamples, g_pathTracingBounces, g_pathTracingGIClamp, g_pathTracingFreezeSync);
             PollViewportModes(true);
             mtlHashMap_.clear();
             mtlScalarHashMap_.clear();
@@ -4885,7 +4621,7 @@
         webview_->PostWebMessageAsJson(ss.str().c_str());
     }
 
-    // Speedball GI Probe Grid out-of-band sync: a tiny JSON side-channel carrying each
+    // Light Probe Grid out-of-band sync: a tiny JSON side-channel carrying each
     // probe grid's box size + manual divisions + enabled flag, keyed by node handle.
     // The grid's TRANSFORM rides the normal helper-node sync (both JSON and binary
     // paths); the viewer fits the GI volume from (synced transform x this size).

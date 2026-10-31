@@ -2,6 +2,14 @@
 import * as THREE from 'three';
 import { powerShotInfraredPresetUiDefaults } from '../fx/final/powershot.js';
 import { getHostProfile } from '../host_profile.js';
+import { LIGHT_PROBE_DEFAULTS, LIGHT_PROBE_LIMITS } from '../light_probes.js';
+
+const LIGHT_PROBE_CONTROLS = Object.freeze([
+    { key: 'intensity', label: 'Intensity', step: 0.05, format: (v) => v.toFixed(2) },
+    { key: 'bounces', label: 'Bounces', step: 1, format: String, hint: 'Extra capture passes; each adds one bounce of indirect light.' },
+    { key: 'density', label: 'Auto density', step: 1, format: String, hint: 'Probes along the longest scene axis when no Light Probe Grid helper is placed.' },
+    { key: 'probesPerFrame', label: 'Probes / frame', step: 8, format: String, hint: 'Bake budget per frame. Higher finishes sooner and stutters more.' },
+].map((control) => ({ ...control, min: LIGHT_PROBE_LIMITS[control.key][0], max: LIGHT_PROBE_LIMITS[control.key][1] })));
 
 function createPostFxGlue(deps = {}) {
         let syncClonePanelFn = null;
@@ -47,7 +55,7 @@ function createPostFxGlue(deps = {}) {
 
         const isPowerShotInfraredMode = (values) => values.mode === 'infrared';
         const isPowerShotNightshotMode = (values) => values.mode === 'nightshot';
-        // Both drive the NIR sensing controls; spectral mode can additionally supply NIR flux.
+        // Both drive the NIR sensing controls.
         const isPowerShotNirMode = (values) => isPowerShotInfraredMode(values) || isPowerShotNightshotMode(values);
         const isPowerShotDigitalMode = (values) => values.mode !== 'analog' && values.mode !== 'film' && !isPowerShotNirMode(values);
         const isPowerShotAnalogMode = (values) => values.mode === 'analog';
@@ -1003,47 +1011,41 @@ function createPostFxGlue(deps = {}) {
                             </label>
                         </div>
                     </section>
-                    <section class="fx-section collapsed" data-fx-section="speedball-gi" data-keep-on-shader-lab>
+                    <section class="fx-section collapsed" data-fx-section="light-probes" data-keep-on-shader-lab>
                         <div class="fx-section-header">
-                            <div class="fx-section-title">Global Illumination</div>
+                            <div class="fx-section-title">Light Probes</div>
                             <div style="display:flex;align-items:center;gap:6px">
-                                <button class="fx-toggle" id="fx-gi-reset" type="button">Reset</button>
-                                <button class="fx-toggle" id="fx-gi-toggle" type="button">Off</button>
+                                <button class="fx-toggle" id="fx-probes-rebake" type="button">Rebake</button>
+                                <button class="fx-toggle" id="fx-probes-toggle" type="button">Off</button>
                             </div>
                         </div>
-                        <div class="fx-note" style="margin:0;padding:2px 0;color:#666;font-size:9px">BVH-traced indirect bounce (Speedball GI). WebGPU, any render mode.</div>
+                        <div class="fx-note" id="fx-probes-status" style="margin:0;padding:2px 0;color:#666;font-size:9px">Irradiance probe grids. Light Probe Grid helpers set the volumes; without one the grid fits the scene.</div>
                         <div class="fx-grid">
-                            ${deps.SPEEDBALL_GI_NUMERIC_CONTROLS.map(control => `
-                            <label class="fx-control" for="fx-gi-${control.key}">
-                                <div class="fx-control-head"><span title="${control.hint || ''}">${control.label}</span><span class="fx-value" id="fx-gi-${control.key}-val">${deps.formatSpeedballGiValue(control.key)}</span></div>
-                                <input class="fx-range" id="fx-gi-${control.key}" title="${control.hint || ''}" type="range" min="${control.min}" max="${control.maxFor?.(deps.getSpeedballGiSettings()) ?? control.max}" step="${control.step}" value="${deps.getSpeedballGiSettings()[control.key]}">
+                            ${LIGHT_PROBE_CONTROLS.map(control => `
+                            <label class="fx-control" for="fx-probes-${control.key}">
+                                <div class="fx-control-head"><span title="${control.hint || ''}">${control.label}</span><span class="fx-value" id="fx-probes-${control.key}-val"></span></div>
+                                <input class="fx-range" id="fx-probes-${control.key}" title="${control.hint || ''}" type="range" min="${control.min}" max="${control.max}" step="${control.step}">
                             </label>`).join('')}
-                            <label class="fx-control" for="fx-gi-jitter-mode" title="Gated Basis holds ray directions steady. Brute force resamples every solve; hysteresis still controls temporal smoothing.">
-                                <div class="fx-control-head"><span>Sampling</span></div>
-                                <select id="fx-gi-jitter-mode" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
-                                    <option value="gated">Gated Basis</option>
-                                    <option value="montecarlo">Brute force (Monte Carlo)</option>
+                            <label class="fx-control" for="fx-probes-cubemap" title="Capture resolution of each probe face. Higher is sharper and slower to bake.">
+                                <div class="fx-control-head"><span>Capture size</span></div>
+                                <select id="fx-probes-cubemap" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
+                                    <option value="8">8</option>
+                                    <option value="16">16</option>
+                                    <option value="32">32</option>
                                 </select>
                             </label>
-                            <label class="fx-control" for="fx-gi-reflection-quality" title="Changes the reflection caches and rebuilds the GI field. Higher tiers use more GPU memory and work.">
-                                <div class="fx-control-head"><span>Reflection quality</span></div>
-                                <select id="fx-gi-reflection-quality" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
-                                    <option value="off">Off</option>
-                                    <option value="rough">Rough</option>
-                                    <option value="high">High</option>
-                                    <option value="ultra">Ultra</option>
+                            <label class="fx-check" for="fx-probes-show"><span>Show probes</span><input id="fx-probes-show" type="checkbox"></label>
+                            <label class="fx-check" for="fx-probes-lightmaps" title="Bake the probe irradiance into lightmaps on meshes with a Max map channel 2 UV set. WebGPU renderer only."><span>GI lightmaps</span><input id="fx-probes-lightmaps" type="checkbox"></label>
+                            <label class="fx-control" for="fx-probes-lightmap-size" title="Lightmap size of the largest surface; smaller surfaces scale down by area.">
+                                <div class="fx-control-head"><span>Lightmap size</span></div>
+                                <select id="fx-probes-lightmap-size" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
+                                    <option value="64">64</option>
+                                    <option value="128">128</option>
+                                    <option value="256">256</option>
+                                    <option value="512">512</option>
+                                    <option value="1024">1024</option>
                                 </select>
                             </label>
-                            <label class="fx-control" for="fx-gi-cascades">
-                                <div class="fx-control-head"><span>Cascades</span></div>
-                                <select id="fx-gi-cascades" style="background:rgba(255,255,255,0.05);color:#aaa;border:1px solid rgba(255,255,255,0.08);border-radius:0;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%;outline:none;cursor:pointer">
-                                    <option value="1" ${deps.getSpeedballGiSettings().cascades === 1 ? 'selected' : ''}>Single grid</option>
-                                    <option value="2" ${deps.getSpeedballGiSettings().cascades === 2 ? 'selected' : ''}>Cascaded (2)</option>
-                                </select>
-                            </label>
-                            <label class="fx-check" for="fx-gi-continuous"><span>Continuous solve</span><input id="fx-gi-continuous" type="checkbox" ${deps.getSpeedballGiSettings().continuous ? 'checked' : ''}></label>
-                            <label class="fx-check" for="fx-gi-hyst-norm"><span>Normalize hysteresis</span><input id="fx-gi-hyst-norm" type="checkbox" ${deps.getSpeedballGiSettings().hysteresisNormalize ? 'checked' : ''}></label>
-                            <label class="fx-check" for="fx-gi-show-probes" title="Diagnostics: show the probe field as a grid of spheres in the viewport."><span>Show probes</span><input id="fx-gi-show-probes" type="checkbox" ${deps.getSpeedballGiSettings().showProbes ? 'checked' : ''}></label>
                         </div>
                     </section>
                     ${sectionsHtml}
@@ -1536,111 +1538,78 @@ function createPostFxGlue(deps = {}) {
             hdriReflectionOnlyCheck.checked = deps.localHdriReflectionOnly;
             deps.syncHdriPanel();
 
-            // Speedball GI controls (window.maxjsSpeedballGI exists only in Studio + WebGPU)
+            // Light probe controls
             {
-                const giToggle = document.getElementById('fx-gi-toggle');
-                const giReset = document.getElementById('fx-gi-reset');
-                const giCascades = document.getElementById('fx-gi-cascades');
-                const giContinuous = document.getElementById('fx-gi-continuous');
-                const giJitterMode = document.getElementById('fx-gi-jitter-mode');
-                const giReflectionQuality = document.getElementById('fx-gi-reflection-quality');
-                const giHystNorm = document.getElementById('fx-gi-hyst-norm');
-                const giShowProbes = document.getElementById('fx-gi-show-probes');
-                const canSyncGiInput = (input) => !!input && document.activeElement !== input;
-                const syncGiPanel = () => {
-                    const gi = window.maxjsSpeedballGI;
-                    const giSettings = deps.getSpeedballGiSettings();
-                    const on = !!(gi && gi.isOn && gi.isOn());
-                    if (giToggle) {
-                        giToggle.textContent = gi ? (on ? 'On' : 'Off') : 'N/A';
-                        giToggle.classList.toggle('active', on);
-                        giToggle.disabled = !gi;
+                const probesToggle = document.getElementById('fx-probes-toggle');
+                const probesRebake = document.getElementById('fx-probes-rebake');
+                const probesStatus = document.getElementById('fx-probes-status');
+                const probesCubemap = document.getElementById('fx-probes-cubemap');
+                const probesShow = document.getElementById('fx-probes-show');
+                const probesLightmaps = document.getElementById('fx-probes-lightmaps');
+                const probesLightmapSize = document.getElementById('fx-probes-lightmap-size');
+                const syncProbesPanel = () => {
+                    const settings = deps.getLightProbeSettings();
+                    const on = deps.lightProbeEnabled === true;
+                    if (probesToggle) {
+                        probesToggle.textContent = on ? 'On' : 'Off';
+                        probesToggle.classList.toggle('active', on);
                     }
-                    if (giReset) giReset.disabled = !gi;
-                    for (const control of deps.SPEEDBALL_GI_NUMERIC_CONTROLS) {
-                        const input = document.getElementById(`fx-gi-${control.key}`);
-                        const val = document.getElementById(`fx-gi-${control.key}-val`);
-                        const value = giSettings[control.key];
-                        if (input) {
-                            const max = control.maxFor?.(giSettings) ?? control.max;
-                            input.max = String(max);
-                            input.disabled = !gi || max <= control.min
-                                || (control.key === 'autoPadding' && gi?.getSettings?.().volumes?.length > 0)
-                                || (control.key === 'smoothness' && giSettings.filter === 0)
-                                || (control.key === 'reflectionIntensity' && !giSettings.roughReflections);
-                            if (canSyncGiInput(input)) input.value = String(value);
-                        }
-                        if (val) val.textContent = deps.formatSpeedballGiValue(control.key, value);
+                    if (probesRebake) probesRebake.disabled = !on;
+                    for (const control of LIGHT_PROBE_CONTROLS) {
+                        const input = document.getElementById(`fx-probes-${control.key}`);
+                        const val = document.getElementById(`fx-probes-${control.key}-val`);
+                        if (input && document.activeElement !== input) input.value = String(settings[control.key]);
+                        if (val) val.textContent = control.format(settings[control.key]);
                     }
-                    if (giCascades) {
-                        giCascades.disabled = !gi;
-                        if (canSyncGiInput(giCascades)) giCascades.value = String(giSettings.cascades);
+                    if (probesCubemap && document.activeElement !== probesCubemap) probesCubemap.value = String(settings.cubemapSize);
+                    if (probesShow) probesShow.checked = settings.showProbes;
+                    if (probesLightmaps) {
+                        probesLightmaps.checked = settings.lightmaps;
+                        probesLightmaps.disabled = !deps.lightmapsSupported;
                     }
-                    if (giContinuous) {
-                        giContinuous.disabled = !gi;
-                        if (canSyncGiInput(giContinuous)) giContinuous.checked = !!giSettings.continuous;
+                    if (probesLightmapSize) {
+                        probesLightmapSize.disabled = !deps.lightmapsSupported || !settings.lightmaps;
+                        if (document.activeElement !== probesLightmapSize) probesLightmapSize.value = String(settings.lightmapResolution);
                     }
-                    if (giJitterMode) {
-                        giJitterMode.disabled = !gi;
-                        if (canSyncGiInput(giJitterMode)) giJitterMode.value = giSettings.jitterMode;
-                    }
-                    if (giReflectionQuality) {
-                        giReflectionQuality.disabled = !gi;
-                        if (canSyncGiInput(giReflectionQuality)) giReflectionQuality.value = giSettings.reflectionQuality;
-                    }
-                    if (giHystNorm) {
-                        giHystNorm.disabled = !gi;
-                        if (canSyncGiInput(giHystNorm)) giHystNorm.checked = !!giSettings.hysteresisNormalize;
-                    }
-                    if (giShowProbes) {
-                        giShowProbes.disabled = !gi;
-                        if (canSyncGiInput(giShowProbes)) giShowProbes.checked = !!giSettings.showProbes;
+                    if (probesStatus) {
+                        const grids = deps.lightProbes.grids;
+                        const count = grids.reduce((sum, g) => sum + g.resolution.x * g.resolution.y * g.resolution.z, 0);
+                        const lightmaps = deps.getLightmapCount();
+                        probesStatus.textContent = deps.lightProbes.baking || deps.isLightmapBakePending()
+                            ? 'Baking...'
+                            : (grids.length
+                                ? `${grids.length} grid${grids.length > 1 ? 's' : ''}, ${count} probes${lightmaps ? `, ${lightmaps} lightmaps` : ''}`
+                                : 'No baked grid');
                     }
                 };
-                window.__maxjsSyncGiPanel = syncGiPanel;
-                if (giReset) giReset.onclick = () => deps.resetSpeedballGiToDefaults({ persist: true });
-                if (giToggle) giToggle.onclick = () => {
-                    const gi = window.maxjsSpeedballGI;
-                    if (!gi) return;
-                    deps.setSpeedballGiSetting('enabled', !(gi.isOn && gi.isOn()), { persist: true });
-                    syncGiPanel();
+                window.__maxjsSyncProbesPanel = syncProbesPanel;
+                const applyProbeSetting = (key, value, persist) => {
+                    deps.applyLightProbeSettings({ [key]: value }, { persist });
+                    syncProbesPanel();
                 };
-                const SPEEDBALL_GI_RANGE_DEFAULTS = Object.freeze({
-                    intensity: 10, divisions: 16, autoPadding: 1, rays: 64, hysteresis: 0.9,
-                    normalBias: 1.75, radianceClamp: 8, depthSharpness: 40,
-                    cheby: 0.5, classify: 0, filter: 1, smoothness: 1, detail: 1,
-                    reflectionIntensity: 1.0,
-                    changeThreshold: 2.5, snapAmount: 0.30, fireflyClamp: 6.0,
-                });
-                for (const control of deps.SPEEDBALL_GI_NUMERIC_CONTROLS) {
-                    const input = document.getElementById(`fx-gi-${control.key}`);
-                    const val = document.getElementById(`fx-gi-${control.key}-val`);
+                if (probesToggle) probesToggle.onclick = () => {
+                    deps.toggleLightProbes();
+                    syncProbesPanel();
+                };
+                if (probesRebake) probesRebake.onclick = () => {
+                    deps.rebakeLightProbes({ refreshLightmapUvs: true });
+                    syncProbesPanel();
+                };
+                for (const control of LIGHT_PROBE_CONTROLS) {
+                    const input = document.getElementById(`fx-probes-${control.key}`);
                     if (!input) continue;
-                    const apply = (persist = false) => {
-                        const v = deps.clampSpeedballGiNumber(control.key, input.value);
-                        input.value = String(v);
-                        if (val) val.textContent = deps.formatSpeedballGiValue(control.key, v);
-                        deps.setSpeedballGiSetting(control.key, v, { persist });
-                    };
-                    input.oninput = () => apply(false);
-                    input.onchange = () => apply(true);
+                    input.oninput = () => applyProbeSetting(control.key, Number(input.value), false);
+                    input.onchange = () => applyProbeSetting(control.key, Number(input.value), true);
                     bindRangeReset(input, {
-                        defaultValue: SPEEDBALL_GI_RANGE_DEFAULTS[control.key] ?? control.min,
-                        apply: (raw) => {
-                            const next = deps.clampSpeedballGiNumber(control.key, raw);
-                            input.value = String(next);
-                            if (val) val.textContent = deps.formatSpeedballGiValue(control.key, next);
-                            deps.setSpeedballGiSetting(control.key, next, { persist: true });
-                        },
+                        defaultValue: LIGHT_PROBE_DEFAULTS[control.key],
+                        apply: (raw) => applyProbeSetting(control.key, Number(raw), true),
                     });
                 }
-                if (giCascades) giCascades.onchange = () => deps.setSpeedballGiSetting('cascades', giCascades.value, { persist: true });
-                if (giContinuous) giContinuous.onchange = () => deps.setSpeedballGiSetting('continuous', giContinuous.checked, { persist: true });
-                if (giJitterMode) giJitterMode.onchange = () => deps.setSpeedballGiSetting('jitterMode', giJitterMode.value, { persist: true });
-                if (giReflectionQuality) giReflectionQuality.onchange = () => deps.setSpeedballGiSetting('reflectionQuality', giReflectionQuality.value, { persist: true });
-                if (giHystNorm) giHystNorm.onchange = () => deps.setSpeedballGiSetting('hysteresisNormalize', giHystNorm.checked, { persist: true });
-                if (giShowProbes) giShowProbes.onchange = () => deps.setSpeedballGiSetting('showProbes', giShowProbes.checked, { persist: true });
-                syncGiPanel();
+                if (probesCubemap) probesCubemap.onchange = () => applyProbeSetting('cubemapSize', Number(probesCubemap.value), true);
+                if (probesShow) probesShow.onchange = () => applyProbeSetting('showProbes', probesShow.checked, true);
+                if (probesLightmaps) probesLightmaps.onchange = () => applyProbeSetting('lightmaps', probesLightmaps.checked, true);
+                if (probesLightmapSize) probesLightmapSize.onchange = () => applyProbeSetting('lightmapResolution', Number(probesLightmapSize.value), true);
+                syncProbesPanel();
             }
 
             // Clone blob tracker controls
@@ -2208,8 +2177,8 @@ function createPostFxGlue(deps = {}) {
                     deps.cameraClip.far = Number.isFinite(saved.cameraClip.far) && saved.cameraClip.far > 0 ? saved.cameraClip.far : null;
                     deps.applyCameraClipOverrides(deps.camera);
                 }
-                if (saved.speedballGi && typeof saved.speedballGi === 'object') {
-                    deps.applySpeedballGiState(saved.speedballGi);
+                if (saved.lightProbes?.settings) {
+                    deps.applyLightProbeSettings(saved.lightProbes.settings);
                 }
                 if (saved.performance) {
                     if (Number.isFinite(saved.performance.fpsCap)) {

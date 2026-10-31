@@ -199,11 +199,11 @@ function createSceneExtras(deps = {}) {
             const hadHair = deps.hairMeshes.size > 0;
             disposeHairInstances();
             if (!Array.isArray(groups) || groups.length === 0) {
-                if (hadHair) deps.markSpeedballTopologyDirty();
+                if (hadHair) deps.scheduleLightProbeFromCurrentScene();
                 return;
             }
             for (const grp of groups) buildHairEntry(grp);
-            deps.markSpeedballTopologyDirty();
+            deps.scheduleLightProbeFromCurrentScene();
         }
 
 
@@ -439,8 +439,6 @@ function createSceneExtras(deps = {}) {
                 deps.scene.updateMatrixWorld(true);
                 deps.layerManager.markRuntimeTransformsDirty?.();
                 deps.maxjsFx.markSceneChanged?.();
-                deps.markLightProbeSceneDirty();
-                deps.markSpeedballTopologyDirty();
                 deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
                 deps.schedulePathTracingLiveRebuild();
                 deps.updateSyncHud({

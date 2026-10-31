@@ -104,7 +104,7 @@ export function createSky({ scene, renderer } = {}) {
             sun = null;
         }
         if (!sun) {
-            sun = createSkySun(renderer, params);
+            sun = createSkySun(params);
             sun.name = '__maxjs_sky_sun__';
             sun.userData.volumetricBypass = true;
             sun.visible = visible;

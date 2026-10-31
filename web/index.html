@@ -163,12 +163,10 @@
                         <button id="btnForceWebGL" class="rail-mode-option" type="button" title="Run the WebGPU renderer stack through WebGL">Force WebGL</button>
                     </div>
                 </div>
-                <div class="vpmenu-row vpmenu-row-switch devonly">
-                    <span class="vpmenu-label">Mode</span>
-                    <div id="renderModeSwitch" class="rail-mode-switch" role="group" aria-label="Render mode">
-                        <button class="rail-mode-option" type="button" data-render-mode="standard" title="Standard render mode">STD</button>
-                        <button class="rail-mode-option" type="button" data-render-mode="spectral" title="Spectral render mode">SPC</button>
-                        <button class="rail-mode-option" type="button" id="btnSpectralTrace" title="Path-traced view (spectral mode)">PT</button>
+                <div id="pathTraceRow" class="vpmenu-row vpmenu-row-switch devonly">
+                    <span class="vpmenu-label">Trace</span>
+                    <div class="rail-mode-switch" role="group" aria-label="Path tracing">
+                        <button class="rail-mode-option" type="button" id="btnPathTrace" aria-pressed="false" title="Path-traced view">PT</button>
                     </div>
                 </div>
                 <div class="vpmenu-row devonly" data-vpmenu-close>
@@ -343,17 +341,17 @@
     <script type="importmap">
     {
         "imports": {
-            "three": "./vendor/three-r186/build/three.webgpu.js",
-            "three-std": "./vendor/three-r186/build/three.module.js",
-            "three/webgpu": "./vendor/three-r186/build/three.webgpu.js",
-            "three/tsl": "./vendor/three-r186/build/three.tsl.js",
+            "three": "./vendor/three-r187/build/three.webgpu.js",
+            "three-std": "./vendor/three-r187/build/three.module.js",
+            "three/webgpu": "./vendor/three-r187/build/three.webgpu.js",
+            "three/tsl": "./vendor/three-r187/build/three.tsl.js",
             "tsl-textures": "./vendor/tsl-textures/tsl-textures.js",
-            "three/addons/": "./vendor/three-r186/examples/",
-            "three/examples/jsm/": "./vendor/three-r186/examples/",
+            "three/addons/": "./vendor/three-r187/examples/",
+            "three/examples/jsm/": "./vendor/three-r187/examples/",
             "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
-            "speedball-gi": "./vendor/speedball-gi/js/index.js",
-            "speedball-gi/spectral-tracer": "./vendor/speedball-gi/js/spectral_tracer.js",
-            "speedball-gi/caustics": "./vendor/speedball-gi/js/caustic_engine.js",
+            "three-mesh-bvh/webgpu": "./node_modules/three-mesh-bvh/src/webgpu/index.js",
+            "three-gpu-pathtracer/webgpu": "./vendor/three-gpu-pathtracer/src/webgpu/index.js",
+            "three-gpu-pathtracer/src/": "./vendor/three-gpu-pathtracer/src/",
             "powershot-threejs/pipeline": "./vendor/powershot-threejs/pipeline.js",
             "powershot-threejs/presets": "./vendor/powershot-threejs/presets.js",
             "powershot-threejs/film": "./vendor/powershot-threejs/film.js",
@@ -371,35 +369,41 @@
             "react-dom/client": "https://esm.sh/react-dom@18.3.1/client"
         },
         "scopes": {
-            "./vendor/three-r186/examples/objects/Sky.js": {
-                "three": "./vendor/three-r186/build/three.module.js"
+            "./vendor/three-r187/examples/objects/Sky.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
             },
-            "./vendor/three-r186/examples/lighting/LightProbeGridWebGL.js": {
-                "three": "./vendor/three-r186/build/three.module.js"
+            "./vendor/three-r187/examples/lighting/LightProbeGridWebGL.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./vendor/three-r187/examples/helpers/LightProbeGridHelperWebGL.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
             },
             "./node_modules/three-mesh-bvh/": {
-                "three": "./vendor/three-r186/build/three.module.js"
+                "three": "./vendor/three-r187/build/three.module.js"
             },
             "./node_modules/postprocessing/": {
-                "three": "./vendor/three-r186/build/three.module.js"
+                "three": "./vendor/three-r187/build/three.module.js"
             },
             "https://maxjs-assets.local/": {
-                "three": "https://maxjs.local/vendor/three-r186/build/three.webgpu.js",
-                "three-std": "https://maxjs.local/vendor/three-r186/build/three.module.js",
-                "three/webgpu": "https://maxjs.local/vendor/three-r186/build/three.webgpu.js",
-                "three/tsl": "https://maxjs.local/vendor/three-r186/build/three.tsl.js",
-                "three/addons/": "https://maxjs.local/vendor/three-r186/examples/",
+                "three": "https://maxjs.local/vendor/three-r187/build/three.webgpu.js",
+                "three-std": "https://maxjs.local/vendor/three-r187/build/three.module.js",
+                "three/webgpu": "https://maxjs.local/vendor/three-r187/build/three.webgpu.js",
+                "three/tsl": "https://maxjs.local/vendor/three-r187/build/three.tsl.js",
+                "three/addons/": "https://maxjs.local/vendor/three-r187/examples/",
                 "postprocessing": "https://maxjs.local/node_modules/postprocessing/build/index.js",
                 "@dimforge/rapier3d-compat": "https://maxjs.local/vendor/rapier/rapier.es.js"
             },
-            "https://maxjs.local/vendor/three-r186/examples/objects/Sky.js": {
-                "three": "https://maxjs.local/vendor/three-r186/build/three.module.js"
+            "https://maxjs.local/vendor/three-r187/examples/objects/Sky.js": {
+                "three": "https://maxjs.local/vendor/three-r187/build/three.module.js"
             },
-            "https://maxjs.local/vendor/three-r186/examples/lighting/LightProbeGridWebGL.js": {
-                "three": "https://maxjs.local/vendor/three-r186/build/three.module.js"
+            "https://maxjs.local/vendor/three-r187/examples/lighting/LightProbeGridWebGL.js": {
+                "three": "https://maxjs.local/vendor/three-r187/build/three.module.js"
+            },
+            "https://maxjs.local/vendor/three-r187/examples/helpers/LightProbeGridHelperWebGL.js": {
+                "three": "https://maxjs.local/vendor/three-r187/build/three.module.js"
             },
             "https://maxjs.local/node_modules/postprocessing/": {
-                "three": "https://maxjs.local/vendor/three-r186/build/three.module.js"
+                "three": "https://maxjs.local/vendor/three-r187/build/three.module.js"
             }
         }
     }

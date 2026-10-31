@@ -227,7 +227,7 @@ function createRendererCore(deps = {}) {
             // WebGPU devices come up at spec-MINIMUM limits unless asked
             // otherwise — 16 sampled textures per shader stage is one
             // shadow-casting light away from overflowing a scene material's
-            // bind group once shadow maps and the Speedball GI probe atlases fold
+            // bind group once shadow maps and probe atlases fold
             // in (2026-07-24: "add one light and the floor vanishes" —
             // BindGroupLayout creation failed, every mesh on that material
             // stopped rendering). Mirror the adapter's real limits into the
@@ -264,11 +264,7 @@ function createRendererCore(deps = {}) {
                 }
             }
 
-            // The WebGPU spectral path tracer requires the NATIVE WebGPU
-            // backend (backend.isWebGPUBackend). Ignore any forced-WebGL
-            // preference while in pathtracing mode so PT always lands on the
-            // native WebGPU renderer below.
-            if (requestedBackend === 'webgl2' && !deps.isPathTracingMode) {
+            if (requestedBackend === 'webgl2') {
                 nextRenderer = new THREE_STD.WebGLRenderer({
                     antialias: false,
                     alpha: true,
@@ -278,7 +274,7 @@ function createRendererCore(deps = {}) {
                 backendLabel = 'WebGL Mode';
                 configureRenderer(nextRenderer);
                 await initializeRenderer(nextRenderer);
-            } else if (requestedBackend === 'webgl-fallback' && !deps.isPathTracingMode) {
+            } else if (requestedBackend === 'webgl-fallback') {
                 // Normal viewer WebGL2 uses the modern renderer stack so TSL /
                 // Shader Lab can compile to the forced WebGL backend.
                 nextRenderer = new THREE.WebGPURenderer({ antialias: false, alpha: true, forceWebGL: true, preserveDrawingBuffer: deps.shouldPreserveCanvasForCapture });
@@ -334,18 +330,14 @@ function createRendererCore(deps = {}) {
             'webgl-fallback': 'WGPU',
         };
         const WEBGL_PIPELINE_CONFIRM_MESSAGE =
-            'This is the simple WebGL pipeline. It is snapshot friendly, supported by every browser and has superior light probing. But you will lose rendering modes, TSL materials and the max.js post processing stack.';
+            'This is the simple WebGL pipeline. It is snapshot friendly and supported by every browser, but you will lose TSL materials, path tracing and the max.js post processing stack.';
         function isWgl2FallbackBackendActive() {
             const label = String(deps.rendererBackendLabel || '');
             return label === 'TSL_GL' || label === 'WGL2 Fallback';
         }
         function isWgl2BackendActive() {
             const label = String(deps.rendererBackendLabel || '');
-            return deps.renderer?.isWebGLRenderer === true
-                && (label === 'WebGL Mode' || label === 'WebGL (Pathtracing)');
-        }
-        function isSimpleWebGLPipelineActive() {
-            return isWgl2BackendActive() && !deps.isPathTracingMode;
+            return deps.renderer?.isWebGLRenderer === true && label === 'WebGL Mode';
         }
         function isWebGLPipelineActive() {
             return isWgl2BackendActive();
@@ -398,11 +390,6 @@ function createRendererCore(deps = {}) {
                 || `Restart max.js with ${label} pipeline now?`;
             if (options.prompt === false || confirm(confirmMessage)) {
                 persistRendererBackendPreference(normalizedMode);
-                // Pathtracing now runs on WebGPU; only the WebGL2 backend (which
-                // can't host the spectral tracer) drops back to standard mode.
-                if (normalizedMode === 'webgl2') {
-                    try { localStorage.setItem(deps.MAXJS_MODE_KEY, 'standard'); } catch {}
-                }
                 sessionStorage.setItem('maxjs_renderer_backend', normalizedMode);
                 location.reload();
                 return true;
@@ -468,7 +455,6 @@ function createRendererCore(deps = {}) {
             createRenderer,
             isWgl2FallbackBackendActive,
             isWgl2BackendActive,
-            isSimpleWebGLPipelineActive,
             isWebGLPipelineActive,
             getRendererPipelineMode,
             syncRendererButtonUi,

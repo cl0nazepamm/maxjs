@@ -9,7 +9,7 @@
 //   2. every named import resolves to a real export (following re-exports and
 //      export * chains),
 //   3. dynamic import('./x.js') literals point at real files.
-// Bare specifiers (three, three-std, speedball-gi, CDN URLs) are importmap
+// Bare specifiers (three, three-std, three-gpu-pathtracer, CDN URLs) are importmap
 // territory and are skipped.
 //
 // Usage: node tools/check_esm_graph.mjs   (exit 1 on any failure)

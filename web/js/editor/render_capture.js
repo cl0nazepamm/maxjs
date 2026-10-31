@@ -108,7 +108,7 @@ function createRenderCapture(deps = {}) {
             const usePathTracing = deps.isPathTracingViewActive();
             const ptMinSamples = Number.isFinite(msg.pathTracingSamples)
                 ? Math.max(1, Math.floor(msg.pathTracingSamples))
-                : Math.max(deps.PATH_TRACING_CAPTURE_DEFAULT_SAMPLES, deps.pathTracingSettings.samplesPerFrame);
+                : (deps.pathTracingSettings.sampleLimit || deps.PATH_TRACING_CAPTURE_DEFAULT_SAMPLES);
             const wasAlreadyActive = deps.renderToImageActive === true;
             deps.renderToImageActive = true;
             deps.pendingRenderToImage = {
@@ -197,7 +197,7 @@ function createRenderCapture(deps = {}) {
             }
             if (deps.pendingRenderToImage.pathTracing) {
                 deps.resetPathTracingStartupWarmup();
-                deps.pathTracingFx.setCaptureMode?.(true);
+                deps.pathTracingFx.setCaptureMode?.(true, deps.pendingRenderToImage.pathTracingMinSamples);
                 deps.pathTracingFx.markSceneDirty?.();
             } else {
                 deps.pathTracingFx.setCaptureMode?.(false);

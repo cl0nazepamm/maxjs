@@ -107,10 +107,7 @@ export function createSpectralMaterialSystem({
     // diffuse scalar becomes grey at its authored NIR level. TSL materials may
     // additionally provide per-pixel `userData.maxjsNirColorNode` and
     // `maxjsNirEmissiveNode`; those replace the visible nodes only for the NIR
-    // pass. The scalar tag remains the spectral tracer fallback because the PT
-    // cannot execute arbitrary raster material graphs. The true visible color
-    // is parked in userData.giColor, which the spectral/probe packer honors
-    // FIRST, so PT and probe-bounce albedo stay band-correct throughout.
+    // pass.
     let rasterSensing = false;
 
     function applyRasterSwap(material, state, value) {
@@ -121,10 +118,6 @@ export function createSpectralMaterialSystem({
         if (!state.rasterSaved) {
             state.rasterSaved = true;
             state.savedColor = hasScalarColor ? material.color.clone() : null;
-            state.hadGiColor = hasOwn(material.userData ?? {}, 'giColor');
-            state.savedGiColor = material.userData?.giColor;
-            material.userData ??= {};
-            if (state.savedColor) material.userData.giColor = state.savedColor;
         }
 
         state.savedRasterNodes ??= {};
@@ -162,13 +155,8 @@ export function createSpectralMaterialSystem({
         }
         if (nodeChanged && material) material.needsUpdate = true;
         if (material?.color?.isColor && state.savedColor) material.color.copy(state.savedColor);
-        if (material?.userData) {
-            if (state.hadGiColor) material.userData.giColor = state.savedGiColor;
-            else delete material.userData.giColor;
-        }
         state.savedColor = null;
         state.savedRasterNodes = null;
-        state.savedGiColor = undefined;
     }
 
     function nodeSpecMatches(spec, handle, object, getAdapter) {

@@ -196,7 +196,6 @@ function createCameraSystem(deps = {}) {
             if (!deps.isFiniteArray(cam?.pos, 3) || !deps.isFiniteArray(cam?.tgt, 3) || !deps.isFiniteArray(cam?.up, 3)) {
                 return;
             }
-            deps.noteGiVolumeCameraSync(cam);
 
             const wantOrtho = cam.persp === false;
             const isOrtho = deps.camera.isOrthographicCamera;

@@ -24,7 +24,7 @@ extern void StopMaxJSActiveShade();
 extern HWND GetMaxJSWebViewHWND();
 extern void ReparentMaxJSPanel(HWND newParent);
 extern void RestoreMaxJSPanel();
-extern void SetMaxJSPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync);
+extern void SetMaxJSPathTracingSettings(int renderSamples, int bounces, float giClamp, bool freezeSync);
 extern bool RenderMaxJSFrameToBitmap(Bitmap* target, int width, int height, TimeValue t,
                                      INode* renderViewNode, const ViewParams* renderViewParams,
                                      RendProgressCallback* prog);
@@ -38,17 +38,25 @@ extern bool StartMaxJSRenderSequence(const std::wstring& outputPath,
                                      INode* renderViewNode,
                                      const ViewParams* renderViewParams);
 
-static constexpr int kPathTracingDefaultSamplesPerFrame = 64;
-static constexpr int kPathTracingMinSamplesPerFrame = 1;
-static constexpr int kPathTracingMaxSamplesPerFrame = 512;
-static constexpr float kPathTracingDefaultGIClamp = 8.0f;
+// Render samples: samples per pixel a Render to Image / Sequence frame accumulates.
+static constexpr int kPathTracingDefaultRenderSamples = 64;
+static constexpr int kPathTracingMinRenderSamples = 1;
+static constexpr int kPathTracingMaxRenderSamples = 4096;
+static constexpr int kPathTracingDefaultBounces = 8;
+static constexpr int kPathTracingMinBounces = 1;
+static constexpr int kPathTracingMaxBounces = 32;
+static constexpr float kPathTracingDefaultGIClamp = 10.0f;
 static constexpr float kPathTracingMinGIClamp = 1.0f;
 static constexpr float kPathTracingMaxGIClamp = 1000.0f;
 static constexpr bool kDefaultUseMaxJSOrchestrator = true;
 static constexpr USHORT kThreeJSRendererSettingsChunk = 0x5100;
 
-static int ClampPathTracingSamplesPerFrame(int value) {
-    return std::clamp(value, kPathTracingMinSamplesPerFrame, kPathTracingMaxSamplesPerFrame);
+static int ClampPathTracingRenderSamples(int value) {
+    return std::clamp(value, kPathTracingMinRenderSamples, kPathTracingMaxRenderSamples);
+}
+
+static int ClampPathTracingBounces(int value) {
+    return std::clamp(value, kPathTracingMinBounces, kPathTracingMaxBounces);
 }
 
 static float ClampPathTracingGIClamp(float value) {
@@ -249,7 +257,8 @@ class ThreeJSRenderer : public Renderer {
     int renderStartFrame_ = 0;
     int renderEndFrame_ = 0;
     int renderFrameStep_ = 1;
-    int pathTracingSamplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
+    int pathTracingRenderSamples_ = kPathTracingDefaultRenderSamples;
+    int pathTracingBounces_ = kPathTracingDefaultBounces;
     float pathTracingGIClamp_ = kPathTracingDefaultGIClamp;
     bool pathTracingFreezeSync_ = false;
     bool useMaxJSOrchestrator_ = kDefaultUseMaxJSOrchestrator;
@@ -275,7 +284,8 @@ public:
     // ── ReferenceTarget ──────────────────────────────────────
     RefTargetHandle Clone(RemapDir& remap) override {
         ThreeJSRenderer* r = new ThreeJSRenderer();
-        r->pathTracingSamplesPerFrame_ = pathTracingSamplesPerFrame_;
+        r->pathTracingRenderSamples_ = pathTracingRenderSamples_;
+        r->pathTracingBounces_ = pathTracingBounces_;
         r->pathTracingGIClamp_ = pathTracingGIClamp_;
         r->pathTracingFreezeSync_ = pathTracingFreezeSync_;
         r->useMaxJSOrchestrator_ = useMaxJSOrchestrator_;
@@ -283,17 +293,19 @@ public:
         return r;
     }
 
-    int GetPathTracingSamplesPerFrame() const { return pathTracingSamplesPerFrame_; }
+    int GetPathTracingRenderSamples() const { return pathTracingRenderSamples_; }
+    int GetPathTracingBounces() const { return pathTracingBounces_; }
     float GetPathTracingGIClamp() const { return pathTracingGIClamp_; }
     bool GetPathTracingFreezeSync() const { return pathTracingFreezeSync_; }
     bool GetUseMaxJSOrchestrator() const { return useMaxJSOrchestrator_; }
 
     void BroadcastPathTracingSettings() const {
-        SetMaxJSPathTracingSettings(pathTracingSamplesPerFrame_, pathTracingGIClamp_, pathTracingFreezeSync_);
+        SetMaxJSPathTracingSettings(pathTracingRenderSamples_, pathTracingBounces_, pathTracingGIClamp_, pathTracingFreezeSync_);
     }
 
-    void SetPathTracingSettings(int samplesPerFrame, float giClamp, bool freezeSync, bool broadcast = true) {
-        pathTracingSamplesPerFrame_ = ClampPathTracingSamplesPerFrame(samplesPerFrame);
+    void SetPathTracingSettings(int renderSamples, int bounces, float giClamp, bool freezeSync, bool broadcast = true) {
+        pathTracingRenderSamples_ = ClampPathTracingRenderSamples(renderSamples);
+        pathTracingBounces_ = ClampPathTracingBounces(bounces);
         pathTracingGIClamp_ = ClampPathTracingGIClamp(giClamp);
         pathTracingFreezeSync_ = freezeSync;
         if (broadcast) BroadcastPathTracingSettings();
@@ -391,7 +403,8 @@ public:
 
     void ResetParams() override {
         SetPathTracingSettings(
-            kPathTracingDefaultSamplesPerFrame,
+            kPathTracingDefaultRenderSamples,
+            kPathTracingDefaultBounces,
             kPathTracingDefaultGIClamp,
             false
         );
@@ -433,12 +446,13 @@ public:
 
         std::ostringstream payload;
         payload.imbue(std::locale::classic());
-        payload << 3 << ' '
-                << pathTracingSamplesPerFrame_ << ' '
+        // Version 4 stores the bounce count in the field version 3 left unused.
+        payload << 4 << ' '
+                << pathTracingRenderSamples_ << ' '
                 << pathTracingGIClamp_ << ' '
                 << (pathTracingFreezeSync_ ? 1 : 0) << ' '
                 << (useMaxJSOrchestrator_ ? 1 : 0) << ' '
-                << 0; // Retain the version-3 field count for existing .max files.
+                << pathTracingBounces_;
 
         isave->BeginChunk(kThreeJSRendererSettingsChunk);
         result = isave->WriteCString(payload.str().c_str());
@@ -459,20 +473,23 @@ public:
                     return readResult;
                 }
                 if (payload) {
+                    // The second field was the spectral tracer's samples per frame,
+                    // which also set the render sample count.
                     int version = 0;
-                    int samplesPerFrame = kPathTracingDefaultSamplesPerFrame;
+                    int renderSamples = kPathTracingDefaultRenderSamples;
                     float giClamp = kPathTracingDefaultGIClamp;
                     int freezeSync = 0;
                     int useOrchestrator = kDefaultUseMaxJSOrchestrator ? 1 : 0;
-                    int retiredField = 0;
+                    int bounces = kPathTracingDefaultBounces;
                     std::istringstream input(payload);
                     input.imbue(std::locale::classic());
-                    if (input >> version >> samplesPerFrame >> giClamp >> freezeSync) {
-                        SetPathTracingSettings(samplesPerFrame, giClamp, freezeSync != 0, false);
+                    if (input >> version >> renderSamples >> giClamp >> freezeSync) {
                         if (version >= 2 && (input >> useOrchestrator)) {
                             SetUseMaxJSOrchestrator(useOrchestrator != 0);
                         }
-                        if (version >= 3) input >> retiredField;
+                        int lastField = 0;
+                        if (version >= 4 && (input >> lastField)) bounces = lastField;
+                        SetPathTracingSettings(renderSamples, bounces, giClamp, freezeSync != 0, false);
                     }
                 }
             }
@@ -489,9 +506,11 @@ class ThreeJSRendererParamDlg : public RendParamDlg {
     HWND panel_ = nullptr;
     BOOL prog_ = FALSE;
     ISpinnerControl* samplesSpin_ = nullptr;
+    ISpinnerControl* bouncesSpin_ = nullptr;
     ISpinnerControl* giClampSpin_ = nullptr;
     bool updating_ = false;
-    int samplesPerFrame_ = kPathTracingDefaultSamplesPerFrame;
+    int renderSamples_ = kPathTracingDefaultRenderSamples;
+    int bounces_ = kPathTracingDefaultBounces;
     float giClamp_ = kPathTracingDefaultGIClamp;
     bool freezeSync_ = false;
     bool useMaxJSOrchestrator_ = kDefaultUseMaxJSOrchestrator;
@@ -499,7 +518,8 @@ class ThreeJSRendererParamDlg : public RendParamDlg {
 public:
     ThreeJSRendererParamDlg(ThreeJSRenderer* renderer, IRendParams* rendParams, BOOL prog)
         : renderer_(renderer), rendParams_(rendParams), prog_(prog) {
-        samplesPerFrame_ = renderer_ ? renderer_->GetPathTracingSamplesPerFrame() : kPathTracingDefaultSamplesPerFrame;
+        renderSamples_ = renderer_ ? renderer_->GetPathTracingRenderSamples() : kPathTracingDefaultRenderSamples;
+        bounces_ = renderer_ ? renderer_->GetPathTracingBounces() : kPathTracingDefaultBounces;
         giClamp_ = renderer_ ? renderer_->GetPathTracingGIClamp() : kPathTracingDefaultGIClamp;
         freezeSync_ = renderer_ ? renderer_->GetPathTracingFreezeSync() : false;
         useMaxJSOrchestrator_ = renderer_ ? renderer_->GetUseMaxJSOrchestrator() : kDefaultUseMaxJSOrchestrator;
@@ -533,13 +553,23 @@ private:
         updating_ = true;
         samplesSpin_ = SetupIntSpinner(
             hWnd,
-            IDC_RENDERER_PT_SPF_SPIN,
-            IDC_RENDERER_PT_SPF_EDIT,
-            kPathTracingMinSamplesPerFrame,
-            kPathTracingMaxSamplesPerFrame,
-            samplesPerFrame_
+            IDC_RENDERER_PT_SAMPLES_SPIN,
+            IDC_RENDERER_PT_SAMPLES_EDIT,
+            kPathTracingMinRenderSamples,
+            kPathTracingMaxRenderSamples,
+            renderSamples_
         );
         if (samplesSpin_) samplesSpin_->SetScale(1.0f);
+
+        bouncesSpin_ = SetupIntSpinner(
+            hWnd,
+            IDC_RENDERER_PT_BOUNCES_SPIN,
+            IDC_RENDERER_PT_BOUNCES_EDIT,
+            kPathTracingMinBounces,
+            kPathTracingMaxBounces,
+            bounces_
+        );
+        if (bouncesSpin_) bouncesSpin_->SetScale(1.0f);
 
         giClampSpin_ = SetupFloatSpinner(
             hWnd,
@@ -555,8 +585,10 @@ private:
         CheckDlgButton(hWnd, IDC_RENDERER_PT_FREEZE_SYNC, freezeSync_ ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hWnd, IDC_RENDERER_USE_ORCHESTRATOR, useMaxJSOrchestrator_ ? BST_CHECKED : BST_UNCHECKED);
         if (prog_) {
-            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_EDIT), FALSE);
-            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SPF_SPIN), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SAMPLES_EDIT), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_SAMPLES_SPIN), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_BOUNCES_EDIT), FALSE);
+            EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_BOUNCES_SPIN), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_EDIT), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_GI_CLAMP_SPIN), FALSE);
             EnableWindow(GetDlgItem(hWnd, IDC_RENDERER_PT_FREEZE_SYNC), FALSE);
@@ -570,6 +602,10 @@ private:
             ReleaseISpinner(samplesSpin_);
             samplesSpin_ = nullptr;
         }
+        if (bouncesSpin_) {
+            ReleaseISpinner(bouncesSpin_);
+            bouncesSpin_ = nullptr;
+        }
         if (giClampSpin_) {
             ReleaseISpinner(giClampSpin_);
             giClampSpin_ = nullptr;
@@ -578,7 +614,10 @@ private:
 
     void ReadControls(HWND hWnd) {
         if (samplesSpin_) {
-            samplesPerFrame_ = ClampPathTracingSamplesPerFrame(samplesSpin_->GetIVal());
+            renderSamples_ = ClampPathTracingRenderSamples(samplesSpin_->GetIVal());
+        }
+        if (bouncesSpin_) {
+            bounces_ = ClampPathTracingBounces(bouncesSpin_->GetIVal());
         }
         if (giClampSpin_) {
             giClamp_ = ClampPathTracingGIClamp(giClampSpin_->GetFVal());
@@ -591,7 +630,7 @@ private:
         if (updating_ || prog_ || !renderer_) return;
         if (!hWnd && panel_) hWnd = panel_;
         if (hWnd) ReadControls(hWnd);
-        renderer_->SetPathTracingSettings(samplesPerFrame_, giClamp_, freezeSync_, true);
+        renderer_->SetPathTracingSettings(renderSamples_, bounces_, giClamp_, freezeSync_, true);
         renderer_->SetUseMaxJSOrchestrator(useMaxJSOrchestrator_);
     }
 

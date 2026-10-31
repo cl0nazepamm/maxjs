@@ -1654,9 +1654,6 @@ body.light-mode .rail-mode-option.active {
     border-color: rgba(255, 255, 255, 0.16);
     box-shadow: inset 2px 0 0 var(--accent);
 }
-.pathtrace-only { display: none; }
-body.pathtracing-mode .pathtrace-only { display: block; }
-body.pathtracing-mode .pathtrace-only.rail-btn { display: flex; }
 /* Theme icon crossfade — both present, CSS swaps by mode. */
 .rail-btn .icon-sun { display: none; }
 body.light-mode .rail-btn .icon-moon { display: none; }

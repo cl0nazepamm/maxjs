@@ -178,35 +178,23 @@
             return false;
         }
 
-        // Speedball owns the snapshot DDGI implementation. Its public entry is
-        // resolved by the snapshot import map, so every standalone export must
-        // carry the package alongside the copied runtime shell.
-        const std::wstring speedballVendor = webDir + L"\\vendor\\speedball-gi";
-        if (!DirectoryExists(speedballVendor + L"\\js")) {
-            error = L"Snapshot runtime dependency missing: web/vendor/speedball-gi/js";
-            return false;
-        }
-        if (!CopyDirectoryRecursive(speedballVendor, outDir + L"\\vendor\\speedball-gi")) {
-            error = L"Failed to copy snapshot runtime Speedball vendor";
-            return false;
-        }
-
-        const std::wstring speedballBvhDependency = webDir + L"\\node_modules\\three-mesh-bvh";
-        if (!DirectoryExists(speedballBvhDependency + L"\\src")) {
+        // The snapshot import maps resolve three-mesh-bvh for runtime layers.
+        const std::wstring bvhDependency = webDir + L"\\node_modules\\three-mesh-bvh";
+        if (!DirectoryExists(bvhDependency + L"\\src")) {
             error = L"Snapshot runtime dependency missing: web/node_modules/three-mesh-bvh/src";
             return false;
         }
-        if (!CopyDirectoryRecursive(speedballBvhDependency, outDir + L"\\node_modules\\three-mesh-bvh")) {
-            error = L"Failed to copy snapshot runtime Speedball BVH dependency";
+        if (!CopyDirectoryRecursive(bvhDependency, outDir + L"\\node_modules\\three-mesh-bvh")) {
+            error = L"Failed to copy snapshot runtime three-mesh-bvh dependency";
             return false;
         }
 
-        const std::wstring threeVendor = webDir + L"\\vendor\\three-r186";
+        const std::wstring threeVendor = webDir + L"\\vendor\\three-r187";
         if (!DirectoryExists(threeVendor + L"\\build")) {
-            error = L"Snapshot runtime dependency missing: web/vendor/three-r186/build";
+            error = L"Snapshot runtime dependency missing: web/vendor/three-r187/build";
             return false;
         }
-        if (!CopyDirectoryRecursive(threeVendor + L"\\build", outDir + L"\\vendor\\three-r186\\build")) {
+        if (!CopyDirectoryRecursive(threeVendor + L"\\build", outDir + L"\\vendor\\three-r187\\build")) {
             error = L"Failed to copy snapshot runtime three.js build vendor";
             return false;
         }
@@ -216,16 +204,16 @@
         for (const std::wstring& fileName : threeRootFiles) {
             const std::wstring src = threeVendor + L"\\" + fileName;
             if (FileExists(src)) {
-                CopyFileEnsuringDirectories(src, outDir + L"\\vendor\\three-r186\\" + fileName);
+                CopyFileEnsuringDirectories(src, outDir + L"\\vendor\\three-r187\\" + fileName);
             }
         }
 
         const std::wstring threeExamples = threeVendor + L"\\examples";
         if (!DirectoryExists(threeExamples)) {
-            error = L"Snapshot runtime dependency missing: web/vendor/three-r186/examples";
+            error = L"Snapshot runtime dependency missing: web/vendor/three-r187/examples";
             return false;
         }
-        if (!CopyDirectoryRecursive(threeExamples, outDir + L"\\vendor\\three-r186\\examples")) {
+        if (!CopyDirectoryRecursive(threeExamples, outDir + L"\\vendor\\three-r187\\examples")) {
             error = L"Failed to copy snapshot runtime three.js examples vendor";
             return false;
         }

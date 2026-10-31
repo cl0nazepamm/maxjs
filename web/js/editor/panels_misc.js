@@ -7,8 +7,6 @@ import { getHostProfile } from '../host_profile.js';
 import { COMPOSITION_GUIDES, COMPOSITION_ASPECTS } from '../composition_overlay.js';
 
 function createPanelsMisc(deps = {}) {
-        const STUDIO_ONLY_RAIL_IDS = [];
-
         function setRailButtonMeta(button, { label, badge } = {}) {
             if (!button) return;
             if (typeof label === 'string') {
@@ -493,65 +491,34 @@ function createPanelsMisc(deps = {}) {
         syncEnvButtonUi();
 
         const btnLightProbe = document.getElementById('btnLightProbe');
-        btnLightProbe.onclick = () => {
-            deps.lightProbeEnabled = !deps.lightProbeEnabled;
+        function setLightProbesEnabled(enabled) {
+            deps.lightProbeEnabled = enabled === true;
             btnLightProbe.classList.toggle('active', deps.lightProbeEnabled);
             deps.applyLightProbeState();
             if (deps.lightProbeEnabled) deps.refreshLightProbeFromCurrentHDRI();
             deps.savePostFxState();
-        };
-
-        const renderModeSwitch = document.getElementById('renderModeSwitch');
-        const modeLabels = {
-            standard: 'Standard',
-            spectral: 'Spectral',
-        };
-        if (renderModeSwitch) {
-            renderModeSwitch.title = 'Render mode: Standard, or Spectral (probe GI + live path tracer)';
-            renderModeSwitch.querySelectorAll('[data-render-mode]').forEach(button => {
-                const mode = button.dataset.renderMode;
-                const active = mode === deps.maxjsRenderMode;
-                button.classList.toggle('active', active);
-                button.setAttribute('aria-pressed', active ? 'true' : 'false');
-                button.title = `${modeLabels[mode] || mode} mode${active ? ' active' : ''}`;
-                button.addEventListener('click', () => {
-                    if (mode === deps.maxjsRenderMode) return;
-                    const label = modeLabels[mode] || mode;
-                    if (!confirm(`Switch to ${label} mode? Reloads the page.`)) return;
-                    // Pathtracing runs on the same WebGPU backend now — no
-                    // backend switch, just re-init the render mode on reload.
-                    try { localStorage.setItem(deps.MAXJS_MODE_KEY, mode); } catch {}
-                    location.reload();
-                });
-            });
+            window.__maxjsSyncProbesPanel?.();
         }
+        btnLightProbe.onclick = () => setLightProbesEnabled(!deps.lightProbeEnabled);
 
-        // Spectral sub-view toggle: probes <-> path tracer, live (no reload).
-        const spectralTraceButton = document.getElementById('btnSpectralTrace');
-        window.__maxjsSyncSpectralViewUi = () => {
-            if (!spectralTraceButton) return;
-            const webGL = typeof deps.isWebGLPipelineActive === 'function' && deps.isWebGLPipelineActive();
+        // Live path tracing view (WebGPU backend only), no reload.
+        const pathTraceButton = document.getElementById('btnPathTrace');
+        window.__maxjsSyncPathTracingUi = () => {
+            if (!pathTraceButton) return;
+            const available = deps.isPathTracingAvailable();
             const lightLinksActive = deps.lightLinking?.hasActiveLinks?.() === true;
-            spectralTraceButton.style.display = (deps.isStudioMode && !webGL) ? '' : 'none';
-            spectralTraceButton.disabled = lightLinksActive;
-            const active = deps.isStudioMode && deps.spectralView === 'trace';
-            spectralTraceButton.classList.toggle('active', active);
-            spectralTraceButton.setAttribute('aria-pressed', active ? 'true' : 'false');
-            spectralTraceButton.title = lightLinksActive
+            setViewportMenuItemHidden(pathTraceButton.closest('.vpmenu-row'), !available);
+            pathTraceButton.disabled = lightLinksActive;
+            const active = deps.isPathTracingMode === true;
+            pathTraceButton.classList.toggle('active', active);
+            pathTraceButton.setAttribute('aria-pressed', active ? 'true' : 'false');
+            pathTraceButton.title = lightLinksActive
                 ? 'Path tracing is unavailable while Light Linking is active'
-                : (active
-                    ? 'Path-traced view active — click for probe GI'
-                    : 'Path-traced view (spectral mode)');
+                : (active ? 'Path-traced view active - click to rasterize' : 'Path-traced view');
         };
-        spectralTraceButton?.addEventListener('click', () => {
-            if (!deps.isStudioMode) return;
-            if (deps.lightLinking?.hasActiveLinks?.()) {
-                deps.perfHud?.setStatus?.('max.js - set linked lights to None before using Trace');
-                return;
-            }
-            deps.setSpectralView(deps.spectralView === 'trace' ? 'probes' : 'trace');
+        pathTraceButton?.addEventListener('click', () => {
+            deps.setPathTracingActive(!deps.isPathTracingMode);
         });
-        window.__maxjsSyncSpectralViewUi();
 
         // Path-tracer pause toggle. Stops compute dispatch so the GPU goes idle
         // and the maxjs UI panels stay responsive while the accumulated frame
@@ -587,84 +554,27 @@ function createPanelsMisc(deps = {}) {
         }
 
         function syncSimpleWebGLPipelineUi() {
-            const simpleWebGL = deps.isSimpleWebGLPipelineActive();
             const webGLPipeline = deps.isWebGLPipelineActive();
-            const tslGl = deps.isWgl2FallbackBackendActive();
-            const renderModeRow = renderModeSwitch?.closest('.vpmenu-row');
-            setViewportMenuItemHidden(renderModeRow, false);
-            renderModeSwitch?.querySelectorAll('[data-render-mode]').forEach(button => {
-                const mode = button.dataset.renderMode;
-                // Spectral mode (probe GI + path tracer) requires the native
-                // WebGPU stack; hide it on the WebGL pipeline.
-                const hideForPipeline = webGLPipeline && mode === 'spectral';
-                setViewportMenuItemHidden(button, hideForPipeline);
-                const gated = hideForPipeline;
-                button.disabled = gated;
-                button.classList.toggle('is-gated', gated);
-                button.setAttribute('aria-disabled', gated ? 'true' : 'false');
-                button.title = `${modeLabels[mode] || mode} mode${mode === deps.maxjsRenderMode ? ' active' : ''}`;
-                if (webGLPipeline && mode === 'spectral') {
-                    button.title = 'Spectral mode requires the native WebGPU pipeline';
-                }
-            });
-
             const vrButton = document.getElementById('btnEnterVR');
             const vrRow = vrButton?.closest('.vpmenu-row');
             setViewportMenuItemHidden(vrRow, webGLPipeline);
             if (vrButton) {
                 vrButton.disabled = webGLPipeline || vrButton.disabled;
                 vrButton.classList.toggle('is-gated', webGLPipeline || vrButton.disabled);
-                if (webGLPipeline) vrButton.title = 'VR is unavailable in the WebGL/pathtracing pipeline';
+                if (webGLPipeline) vrButton.title = 'VR is unavailable in the classic WebGL pipeline';
             }
-
-            for (const id of STUDIO_ONLY_RAIL_IDS) {
-                const button = document.getElementById(id);
-                const row = button?.closest('.vpmenu-row');
-                setViewportMenuItemHidden(row, simpleWebGL);
-                if (button && simpleWebGL) {
-                    button.disabled = true;
-                    button.classList.add('is-gated');
-                    button.setAttribute('aria-disabled', 'true');
-                }
-            }
-            const renderMenuSep = document.querySelector('[data-menu="render"] .vpmenu-sep');
-            setViewportMenuItemHidden(renderMenuSep, simpleWebGL || !deps.isStudioMode);
 
             const shaderLabButton = document.getElementById('btnShaderLabPanel');
             const shaderLabRow = shaderLabButton?.closest('.vpmenu-row');
-            setViewportMenuItemHidden(shaderLabRow, simpleWebGL || !isShaderLabBackendAvailable());
+            setViewportMenuItemHidden(shaderLabRow, webGLPipeline || !isShaderLabBackendAvailable());
 
-            if (simpleWebGL) {
+            if (webGLPipeline) {
                 deps.setLightLinkPanelVisible(false);
             }
-            window.__maxjsSyncSpectralViewUi?.();
+            window.__maxjsSyncPathTracingUi?.();
         }
 
-        function syncStudioOnlyUi() {
-            const gated = !deps.isStudioMode;
-            for (const id of STUDIO_ONLY_RAIL_IDS) {
-                const button = document.getElementById(id);
-                if (!button) continue;
-                const row = button.closest('.vpmenu-row');
-                if (deps.isSimpleWebGLPipelineActive()) {
-                    setViewportMenuItemHidden(row, true);
-                    continue;
-                }
-                setViewportMenuItemHidden(row, gated);
-                if (!button.dataset.baseTitle) button.dataset.baseTitle = button.title || '';
-                button.disabled = gated;
-                button.classList.toggle('is-gated', gated);
-                button.setAttribute('aria-disabled', gated ? 'true' : 'false');
-                button.title = gated
-                    ? `${button.dataset.baseTitle} (Advanced mode only)`
-                    : button.dataset.baseTitle;
-            }
-            if (gated) {
-                deps.setLightLinkPanelVisible(false);
-            }
-            syncSimpleWebGLPipelineUi();
-        }
-        syncStudioOnlyUi();
+        syncSimpleWebGLPipelineUi();
 
         function syncBackgroundColorSlot() {
             const input = document.getElementById('bgColorSlot');
@@ -734,7 +644,7 @@ function createPanelsMisc(deps = {}) {
             const available = isShaderLabBackendAvailable();
             if (btnShaderLabPanel) {
                 const row = btnShaderLabPanel.closest('.vpmenu-row');
-                setViewportMenuItemHidden(row, !available || deps.isSimpleWebGLPipelineActive());
+                setViewportMenuItemHidden(row, !available || deps.isWebGLPipelineActive());
                 btnShaderLabPanel.disabled = !available;
                 btnShaderLabPanel.classList.toggle('disabled', !available);
                 btnShaderLabPanel.title = available
@@ -1169,7 +1079,6 @@ function createPanelsMisc(deps = {}) {
             setRailButtonMeta,
             setViewportMenuItemHidden,
             syncSimpleWebGLPipelineUi,
-            syncStudioOnlyUi,
             syncAudioMuteButtonUi,
             syncBackgroundColorSlot,
             syncEnvButtonUi,
@@ -1195,6 +1104,7 @@ function createPanelsMisc(deps = {}) {
             setRightDockWidth,
             clampDockWidth,
             btnLightProbe,
+            setLightProbesEnabled,
             btnPostFxPanel,
             rightDock,
             postPanel,

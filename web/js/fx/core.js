@@ -647,7 +647,7 @@ export function createFxCore({
             currentDerived = computeDerivedState();
 
             // ── Path-traced source ──────────────────────────────────────────
-            // The spectral PT already produced linear-HDR beauty (with real GI +
+            // The path tracer already produced linear-HDR beauty (with real GI +
             // DOF), so there is no scene pass and no gbuffer. Feed that color in
             // as the beauty and fold ONLY the color-domain effects (bloom/pixel/
             // retro); the gbuffer passes are gated off via isEffectActive. Output

@@ -100,14 +100,10 @@ function createEnvironment(deps = {}) {
         // "no environment", this ran on each scrub release, and the whole
         // scene recompiled per seek.
         function resetEnvironmentLighting({ restoreDefaultLights = true } = {}) {
-            if (deps.lightProbeRefreshTimer) {
-                clearTimeout(deps.lightProbeRefreshTimer);
-                deps.lightProbeRefreshTimer = 0;
-            }
             deps.currentHdriProbeSignature = '';
             deps.hdriLoadGeneration = deps.hdriLoadGeneration + 1;
             deps.clearLightProbe();
-            deps.markLightProbeSceneDirty();
+            deps.scheduleLightProbeFromCurrentScene();
             deps.markLightProbeMaterialsDirty();
             if (restoreDefaultLights) {
                 syncDefaultLightsVisibility();
@@ -125,12 +121,10 @@ function createEnvironment(deps = {}) {
         }
         function applyHdriReflectionOnlyState({ markOutput = false } = {}) {
             const hdriReflectionOnly = isHdriReflectionOnlyEffective();
-            const spectralSkyDdgiOwnsDiffuse = isNativeWebGPUBackend()
-                && deps.scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse === true;
             deps.scene.userData.maxjsHdriReflectionOnly = hdriReflectionOnly;
-            // Speedball's sky is occlusion-aware diffuse lighting. Keep the PMREM for
-            // glossy reflections, but do not also inject its flat diffuse IBL.
-            deps.maxjsHdriDiffuseIntensity.value = hdriReflectionOnly || spectralSkyDdgiOwnsDiffuse ? 0.0 : 1.0;
+            // Probe grids captured the environment with occlusion. Keep the PMREM
+            // for glossy reflections, but do not also inject its flat diffuse IBL.
+            deps.maxjsHdriDiffuseIntensity.value = hdriReflectionOnly || deps.isLightProbeGridActive() ? 0.0 : 1.0;
             deps.applyLightProbeState();
             if (markOutput) {
                 deps.markLightProbeMaterialsDirty();
@@ -161,7 +155,6 @@ function createEnvironment(deps = {}) {
 
         function refreshLightProbeFromCurrentHDRI() {
             if (!deps.currentEnvParams?.hdri) {
-                deps.markLightProbeSceneDirty();
                 deps.scheduleLightProbeFromCurrentScene({ force: true, delay: 0 });
                 return;
             }
@@ -210,9 +203,7 @@ function createEnvironment(deps = {}) {
                 currentHdriRawTexture = hdrTex;
                 deps.scene.userData.maxjsPathTraceEnvironment = hdrTex;
                 const previousEnvMap = currentHdriEnvMap;
-                const envMap = deps.isPathTracingMode
-                    ? null
-                    : retainPMREMTexture(deps.pmremGenerator.fromEquirectangular(hdrTex));
+                const envMap = retainPMREMTexture(deps.pmremGenerator.fromEquirectangular(hdrTex));
                 currentHdriEnvMap = envMap;
                 deps.scene.environment = envMap;
                 applyHdriReflectionOnlyState();
@@ -224,11 +215,7 @@ function createEnvironment(deps = {}) {
                     await deps.updateLightProbeFromHDRI(hdrTex, probeSignature, loadGeneration);
                 }
                 deps.maxjsFx.markEnvironmentChanged?.();
-                // The path tracer bakes the env texture into its kernel at
-                // build time, so an async HDRI load that lands after the scene
-                // was built needs an explicit rebuild — otherwise the tracer
-                // keeps its stale (null) env and shows the black/no-env state.
-                deps.markPathTracingSceneDirtyNow();
+                deps.markPathTracingEnvironmentDirty();
                 syncHdriPanel();
             }, undefined, (error) => {
                 console.error('max.js HDRI load failed', { hdriUrl, error });
@@ -242,7 +229,7 @@ function createEnvironment(deps = {}) {
                 deps.syncMaterialEnvMaps();
                 syncEnvironmentDisplay();
                 resetEnvironmentLighting();
-                deps.markPathTracingSceneDirtyNow(); // drop the now-cleared env binding
+                deps.markPathTracingEnvironmentDirty();
                 syncHdriPanel();
             });
         }
@@ -319,18 +306,14 @@ function createEnvironment(deps = {}) {
             loadEnvironmentTexture(localHdriObjectUrl, file.name, async (hdrTex) => {
                 if (loadGen !== deps.hdriLoadGeneration) { hdrTex.dispose(); return; }
                 localHdriRawTexture = hdrTex;
-                localHdriEnvMap = deps.isPathTracingMode
-                    ? null
-                    : retainPMREMTexture(deps.pmremGenerator.fromEquirectangular(hdrTex));
+                localHdriEnvMap = retainPMREMTexture(deps.pmremGenerator.fromEquirectangular(hdrTex));
                 applyLocalHDRIToScene();
                 deps.currentHdriUrl = localHdriObjectUrl;
                 if (!deps.hasAuthoredEnvironmentActive() && deps.lightProbeEnabled) {
                     await deps.updateLightProbeFromHDRI(hdrTex, 'local-' + deps.localHdriFileName, loadGen);
                 }
                 deps.maxjsFx.markEnvironmentChanged?.();
-                // Async load: rebuild the tracer so it picks up the new env
-                // texture (baked into the kernel at build time). See loadHDRI.
-                deps.markPathTracingSceneDirtyNow();
+                deps.markPathTracingEnvironmentDirty();
                 if (persist) deps.savePostFxState();
                 syncHdriPanel();
             }, undefined, (error) => {
@@ -387,7 +370,7 @@ function createEnvironment(deps = {}) {
             deps.localHdriEnabled = enabled;
             applyLocalHDRIToScene();
             deps.maxjsFx.markEnvironmentChanged?.();
-            deps.markPathTracingSceneDirtyNow(); // env texture binding toggled on/off
+            deps.markPathTracingEnvironmentDirty();
             deps.savePostFxState();
             syncHdriPanel();
         }
@@ -407,7 +390,7 @@ function createEnvironment(deps = {}) {
             if (authoredEnvironmentActive) {
                 deps.restoreAuthoredEnvironmentAfterLocalHDRIChange();
                 deps.maxjsFx.markEnvironmentChanged?.();
-                deps.markPathTracingSceneDirtyNow(); // env binding swapped back to authored
+                deps.markPathTracingEnvironmentDirty();
                 deps.savePostFxState();
                 syncHdriPanel();
                 return;
@@ -423,7 +406,7 @@ function createEnvironment(deps = {}) {
             deps.scene.backgroundBlurriness = 0;
             syncEnvironmentDisplay();
             resetEnvironmentLighting();
-            deps.markPathTracingSceneDirtyNow(); // env binding cleared
+            deps.markPathTracingEnvironmentDirty();
             deps.savePostFxState();
             syncHdriPanel();
         }

@@ -249,9 +249,8 @@ import { createLongTaskMonitor } from '../web/js/long_task_monitor.js';
     assert.match(renderLoop, /if \(sceneLoadGate\?\.isBlockingRender\?\.\(\)\) return;/);
     assert.match(renderLoop, /if \(gateFirstFrame\) sceneLoadGate\.end\('rendered'\);/);
     assert.match(renderLoop, /deps\.longTaskMonitor\?\.setPhase\?\.\(gateFirstFrame \? 'scene:first-frame' : 'render'\);/);
-    // Boot owns one gate and one monitor and hands them to both consumers;
-    // Speedball's rest window restarts when the gate ends.
-    assert.match(boot, /const sceneLoadGate = createSceneLoadGate\(\{\s*\n\s*onEnd: \(\{ reason, elapsedMs \}\) => \{\s*\n\s*speedballGiLastInteractionMs = performance\.now\(\);/);
+    // Boot owns one gate and one monitor and hands them to both consumers.
+    assert.match(boot, /const sceneLoadGate = createSceneLoadGate\(\{\s*\n\s*onEnd: \(\{ reason, elapsedMs \}\) => \{/);
     assert.match(boot, /const longTaskMonitor = createLongTaskMonitor\(\{ isLogEnabled: \(\) => debugMode \}\);\s*\n\s*longTaskMonitor\.start\(\);/);
     assert.equal((boot.match(/get sceneLoadGate\(\) \{ return sceneLoadGate; \},/g) || []).length, 2, 'gate reaches scene sync and the render loop');
     assert.match(boot, /get camera\(\) \{ return camera; \},\s*\n\s*get sceneLoadGate\(\)/);

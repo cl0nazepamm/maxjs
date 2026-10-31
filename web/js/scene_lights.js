@@ -71,15 +71,6 @@ export function resolveLightEmitterClass(lightData = {}) {
     return null;
 }
 
-export function isIrEmitterClass(value) {
-    if (typeof value === 'string') {
-        const normalized = value.trim().toLowerCase();
-        return normalized === 'ir' || normalized.startsWith('ir_')
-            || normalized.startsWith('ir ') || normalized.includes('illuminator');
-    }
-    return Number.isFinite(value) && Math.trunc(value) >= 4;
-}
-
 function getLightParentObject(light, ld, parent, nodeMap) {
     const explicitParent = Object.prototype.hasOwnProperty.call(ld ?? {}, 'p')
         ? Number(ld.p)

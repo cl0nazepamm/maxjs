@@ -1,9 +1,10 @@
 // render_loop.js - editor frame driver and visible-frame render path.
 
-import { setNirDirectSensing, setNirIlluminatorGain } from 'speedball-gi';
+import { createIrEmitterGate } from '../ir_emitters.js';
 
 function createRenderLoop(deps = {}) {
         let lastPostFxPanelSyncMs = 0;
+        const syncIrEmitters = createIrEmitterGate();
 
         function renderViewerFrame() {
             if (deps.webglBasicFx.isAvailable?.()) {
@@ -50,17 +51,9 @@ function createRenderLoop(deps = {}) {
             if (!deps.xrRuntime.active && deps.layerManager.cameraMode === 'viewport') {
                 deps.syncOrbitNavigationFeel();
             }
-            let controlsChanged = false;
             if (!deps.xrRuntime.active && !(deps.animationSystem?.isDrivingSceneCamera?.())) {
                 deps.layerManager.enforceCameraControls?.();
-                controlsChanged = deps.controls.update() === true;
-            }
-            if (controlsChanged) {
-                deps.scheduleGiVolumeFromCurrentScene({
-                    delay: deps.GI_VOLUME_CAMERA_DEBOUNCE_MS,
-                    refresh: false,
-                    reason: 'controls',
-                });
+                deps.controls.update();
             }
             // Auto-update DOF focus distance from camera-to-target when enabled.
             // Physical Camera DOF owns focus/bokeh while the camera packet is active.
@@ -73,7 +66,6 @@ function createRenderLoop(deps = {}) {
                 const cameraWorldPosition = deps.getActiveCameraWorldPosition(deps.cameraPositionWorld);
                 if (!deps.defaultKey.position.equals(cameraWorldPosition)) {
                     deps.defaultKey.position.copy(cameraWorldPosition);
-                    deps.speedballGi?.markLightsDirty?.({ defer: true });
                 }
             }
             deps.updateVolumeUniforms();
@@ -96,6 +88,17 @@ function createRenderLoop(deps = {}) {
             if (perfHudActive) deps.perfHud.updateLayers(deps.layerManager.getStats());
             deps.maxjsFx.applySharedSceneEffects?.();
             deps.removeWebGPUIncompatibleSceneMaterials();
+            // PowerShot infrared / NightShot sense NIR: IR illuminators light up and
+            // ctx.spectral materials swap to their NIR albedo. Re-applied every frame
+            // because light sync rewrites colors; a sensed change rebakes the probes.
+            const psOptions = deps.maxjsFx.getPowerShotOptions?.();
+            const nirSensing = deps.maxjsFx.isPowerShotEnabled?.() === true
+                && (psOptions?.mode === 'infrared' || psOptions?.mode === 'nightshot');
+            const irGain = Number.isFinite(Number(psOptions?.irIlluminator)) ? Number(psOptions.irIlluminator) : 1;
+            if (syncIrEmitters(deps.lightHandleMap.values(), nirSensing, irGain)) deps.scheduleLightProbeFromCurrentScene();
+            deps.layerManager?.setSpectralRasterSensing?.(nirSensing);
+            // Probe bakes render the scene, so they run before this frame's draw.
+            if (!deps.isPathTracingViewActive()) deps.updateLightProbes();
             const renderStart = performance.now();
             // Last-mile render-only camera offsets (handheld shake, etc.).
             // Applied after layer.update + camera sync so they survive until
@@ -165,55 +168,6 @@ function createRenderLoop(deps = {}) {
                 deps.layerManager.afterRender?.(frameElapsed);
             }
             if (gateFirstFrame) sceneLoadGate.end('rendered');
-            // Idle GI: keep probe rebuilds out of camera/playback/sync churn.
-            // Existing probes stay visible as history; after idle, the GPU solve
-            // blends new C++/viewer data into the same volume.
-            if (!deps.renderToImageActive) {
-                deps.updateGiVolumeIdleWork();
-                deps.syncGiVolumeActive();
-                // Speedball GI probe field tick — every frame (the field idle-gates and
-                // budget-throttles itself); no-op unless enabled; never recompiles
-                // materials. ONLY camera movement marks interaction — matching the
-                // speedball standalone. Host/layer/animation edits send explicit,
-                // coalesced dirty packets without marking camera interaction: cheap
-                // light/material/transform refits stay live during motion, while
-                // structural rebuilds retain Speedball's own rest gate. No fallback
-                // scene-signature traversals run in the editor integration.
-                const speedballNowMs = performance.now();
-                if (controlsChanged || deps.animationSystem?.isDrivingSceneCamera?.()) {
-                    deps.speedballGiLastInteractionMs = speedballNowMs;
-                }
-                deps.speedballGi?.tick(speedballNowMs);
-                // White Phosphor = the imager senses NIR. One state, three
-                // consumers, each a no-op when unchanged so the per-frame calls
-                // are free — and they catch every state path (panel, restore,
-                // console):
-                //   • trace view: flip the tracer's λ domain to photocathode flux,
-                //   • probes NEE: un-gate class-4 IR lights (gi_probes nirGate),
-                //   • direct raster term: un-gate the lifted IR light nodes
-                //     (gi_lights_node nirGate, shared with MaxLightsNode).
-                const psMode = deps.maxjsFx.getPowerShotOptions?.()?.mode;
-                const nirSensing = deps.maxjsFx.isPowerShotEnabled?.() === true
-                    && (psMode === 'infrared' || psMode === 'nightshot');
-                deps.pathTracingFx?.setRenderMode?.(
-                    deps.isPathTracingMode && nirSensing ? 'nv' : 'visible');
-                deps.speedballGi?.field?.setNirSensing?.(nirSensing);
-                setNirDirectSensing(nirSensing);
-                // Raster band swap for ctx.spectral material tags: tagged
-                // diffuse scalars flip to their authored NIR level under NV
-                // (uniform writes only; giColor keeps PT/probe packing on the
-                // true visible albedo).
-                deps.layerManager?.setSpectralRasterSensing?.(nirSensing);
-                // IR Illuminator gain (PowerShot panel): one knob, all three
-                // consumers — direct raster term, probes' NEE, PT 850 nm band.
-                // Every setter no-ops when unchanged, so per-frame is free.
-                const psIrGain = Number(deps.maxjsFx.getPowerShotOptions?.()?.irIlluminator);
-                const irGain = Number.isFinite(psIrGain) ? psIrGain : 1;
-                setNirIlluminatorGain(irGain);
-                deps.speedballGi?.field?.setNirGain?.(irGain);
-                deps.pathTracingFx?.setNirGain?.(irGain);
-                deps.updateProbeHelpers();
-            }
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (deps.maxjsFx.isCloneEnabled() && !deps.renderToImageActive) {
                 deps.maxjsFx.drawBlobOverlay(deps.blobOverlayCtx, deps.blobOverlayCvs.width, deps.blobOverlayCvs.height);
@@ -249,6 +203,9 @@ function createRenderLoop(deps = {}) {
                         && deps.pathTracingFx.isCaptureReady?.(deps.pendingRenderToImage.pathTracingMinSamples) === true
                     );
                 const timedOut = nowMs >= deps.pendingRenderToImage.syncDeadlineMs;
+                // A raster capture waits for in-flight probe and lightmap bakes to land.
+                const probesReady = deps.pendingRenderToImage.pathTracing
+                    || (!deps.lightProbes.baking && !deps.isLightmapBakePending());
                 if (timedOut && deps.pendingRenderToImage.pathTracing && !pathTracingReady) {
                     const sampleCount = Math.floor(deps.pathTracingFx.getSampleCount?.() ?? 0);
                     deps.perfHud.setStatus(
@@ -256,7 +213,7 @@ function createRenderLoop(deps = {}) {
                     );
                     deps.pendingRenderToImage.syncDeadlineMs = nowMs + 30000;
                 }
-                if ((syncReady && settledEnough && pathTracingReady) || (!deps.pendingRenderToImage.pathTracing && timedOut)) {
+                if ((syncReady && settledEnough && pathTracingReady && probesReady) || (!deps.pendingRenderToImage.pathTracing && timedOut)) {
                     const capture = deps.pendingRenderToImage;
                     const renderTimeSeconds = capture.renderTimeSeconds;
                     deps.pendingRenderToImage = null;

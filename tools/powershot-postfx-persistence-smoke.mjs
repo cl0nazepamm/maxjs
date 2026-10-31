@@ -34,6 +34,10 @@ const testableSource = source
     .replace(
         "import { getHostProfile } from '../host_profile.js';",
         "const getHostProfile = () => ({ app: 'Max' });",
+    )
+    .replace(
+        "from '../light_probes.js';",
+        `from '${new URL('../web/js/light_probes.js', import.meta.url).href}';`,
     );
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(testableSource).toString('base64')}`;
 

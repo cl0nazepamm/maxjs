@@ -108,8 +108,9 @@ class MaxJSPanel;
 static MaxJSPanel* g_panel = nullptr;
 void MaxJSNotifyMaterialEdited(ReferenceTarget* target = nullptr);
 static HWND g_helperHwnd = nullptr;
-static int g_pathTracingSamplesPerFrame = 64;
-static float g_pathTracingGIClamp = 8.0f;
+static int g_pathTracingRenderSamples = 64;
+static int g_pathTracingBounces = 8;
+static float g_pathTracingGIClamp = 10.0f;
 static bool g_pathTracingFreezeSync = false;
 
 // Forward — used by renderer's ActiveShade

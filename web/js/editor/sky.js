@@ -46,8 +46,6 @@ function createSky(deps = {}) {
         const skyLinkedSunPosition = new THREE.Vector3();
         const skyLinkedSunTarget = new THREE.Vector3();
         const skySunDirectionScratch = new THREE.Vector3();
-        const skyGiSunDirectionScratch = new THREE.Vector3();
-        const SPECTRAL_GI_SKY_INTENSITY = 2.0;
         const SKY_DEFAULTS = Object.freeze({
             ...SKY_DETAIL_DEFAULTS,
             turbidity: 10,
@@ -228,10 +226,6 @@ function createSky(deps = {}) {
         }
 
         function updateSkyReflectionEnvironment(params, sunDir) {
-            if (deps.isPathTracingMode) {
-                disposeSkyReflectionEnvironment();
-                return;
-            }
             const nextEnvMap = buildProceduralSkyReflectionEnvironment(params, sunDir);
             if (!nextEnvMap) return;
 
@@ -243,15 +237,6 @@ function createSky(deps = {}) {
         }
 
         function updateSkyAmbientLightProbe(params, sunDir) {
-            if (deps.isPathTracingMode) {
-                deps.clearLightProbe();
-                return;
-            }
-            if (deps.lightProbeGrid) {
-                if (deps.lightProbeGrid.parent) deps.lightProbeGrid.parent.remove(deps.lightProbeGrid);
-                deps.lightProbeGrid.dispose?.();
-                deps.lightProbeGrid = null;
-            }
             skyProbeSH.zero();
             const weight = (Math.PI * 4) / skyProbeDirections.length;
             for (const direction of skyProbeDirections) {
@@ -259,7 +244,6 @@ function createSky(deps = {}) {
             }
             deps.lightProbe.sh.copy(skyProbeSH);
             deps.hasLightProbeData = true;
-            deps.hasLightProbeGridData = false;
             deps.applyLightProbeState();
         }
 
@@ -304,47 +288,6 @@ function createSky(deps = {}) {
             params.showSunDisc = params.showSunDisc !== false && params.showSunDisc !== 0;
             normalizeSkyDetails(params);
             return params;
-        }
-
-        // Match Speedball's DDGI sky: a low-frequency, sun-free dome that only
-        // enters probe miss rays. The directional light owns the sun itself.
-        function buildSpectralGiSky(params) {
-            const sunDirection = getSkySunDirectionWorld(params, skyGiSunDirectionScratch);
-            const elevation = THREE.MathUtils.clamp(
-                THREE.MathUtils.radToDeg(Math.asin(THREE.MathUtils.clamp(sunDirection.y, -1, 1))),
-                0,
-                88,
-            );
-            const sunUp = THREE.MathUtils.clamp(Math.sin(THREE.MathUtils.degToRad(elevation)), 0, 1);
-            const daylight = Math.sqrt(sunUp);
-            const rayleigh = THREE.MathUtils.clamp(skyNumber(params?.rayleigh, 3) / 8, 0, 1);
-            const turbidity = THREE.MathUtils.clamp(skyNumber(params?.turbidity, 10) / 20, 0, 1);
-            const haze = THREE.MathUtils.clamp((1 - daylight) * 0.65 + turbidity * 0.35, 0, 1);
-            const exposureScale = skyExposureScale(params);
-
-            return {
-                zenith: new THREE.Color(
-                    0.10 + 0.12 * rayleigh,
-                    0.20 + 0.20 * rayleigh,
-                    0.42 + 0.34 * rayleigh,
-                ).multiplyScalar((0.18 + 0.62 * daylight) * exposureScale),
-                horizon: new THREE.Color(
-                    0.34 + 0.34 * haze,
-                    0.39 + 0.18 * daylight,
-                    0.48 + 0.24 * daylight,
-                ).multiplyScalar((0.16 + 0.50 * daylight) * exposureScale),
-                ground: new THREE.Color(0.10, 0.085, 0.065).multiplyScalar((0.06 + 0.16 * daylight) * exposureScale),
-            };
-        }
-
-        function syncSpectralGiSky(params) {
-            if (!deps.isStudioMode || !deps.speedballGi?.setSky) return false;
-            if (!params) {
-                deps.speedballGi.setSky(null);
-                return false;
-            }
-            deps.speedballGi.setSky(buildSpectralGiSky(params), { intensity: SPECTRAL_GI_SKY_INTENSITY });
-            return true;
         }
 
         function getSkySunDirectionWorld(params, target = skySunDirectionScratch) {
@@ -439,7 +382,6 @@ function createSky(deps = {}) {
             lastSkySourceParams = skyParams;
 
             const params = normalizeSkyParams(withLinkedSkySun(skyParams));
-            syncSpectralGiSky(params);
             const sig = JSON.stringify(params);
             if (sig === lastSkySig) {
                 if (!deps.hasLightProbeData) refreshSkyAmbientLightProbeFromCurrentSky();
@@ -507,7 +449,7 @@ function createSky(deps = {}) {
                     skySunLight = null;
                 }
                 if (!skySunLight) {
-                    skySunLight = createSkySun(deps.renderer, params);
+                    skySunLight = createSkySun(params);
                     skySunLight.name = '__maxjs_sky_sun__';
                     skySunLight.userData.volumetricBypass = true;
                 }
@@ -526,7 +468,7 @@ function createSky(deps = {}) {
                     skyFillLight.userData.volumetricBypass = true;
                 }
                 if (skyFillLight.parent !== deps.scene) deps.scene.add(skyFillLight);
-                skyFillLight.intensity = deps.isStudioMode ? 0.05 : 0.5 + sunStrength * 0.5;
+                skyFillLight.intensity = 0.5 + sunStrength * 0.5;
 
                 deps.syncDefaultLightsVisibility();
                 updateSkyAmbientLightProbe(params, sunDir);
@@ -538,6 +480,7 @@ function createSky(deps = {}) {
                 deps.currentHdriProbeSignature = '';
 
                 deps.maxjsFx.markEnvironmentChanged?.();
+                deps.scheduleLightProbeFromCurrentScene?.();
                 deps.syncHdriPanel();
 
             } catch (err) {
@@ -553,20 +496,27 @@ function createSky(deps = {}) {
             if (skyFillLight?.parent) skyFillLight.parent.remove(skyFillLight);
             disposeSkyReflectionEnvironment();
             disposeSkyPathTraceEnvironment();
-            syncSpectralGiSky(null);
         }
 
-        function refreshSkyForSpectralView() {
-            if (!deps.isStudioMode) return false;
-            if (!deps.skyActive || !lastSkySourceParams) {
-                syncSpectralGiSky(null);
-                return false;
-            }
-            // Probe view needs the PMREM for reflections; Trace needs the raw
-            // equirectangular texture. Re-run even when sky params are unchanged.
-            lastSkySig = '';
-            applySky(lastSkySourceParams);
+        // The path tracer samples the raw equirect sky, built only while it traces.
+        function refreshSkyForPathTracing() {
+            if (!deps.skyActive || !lastSkySourceParams) return false;
+            const params = normalizeSkyParams(withLinkedSkySun(lastSkySourceParams));
+            updateSkyPathTraceEnvironment(params, getSkySunDirectionWorld(params));
             return true;
+        }
+
+        // The sun DirectionalLight already lights probe captures; a visible disc
+        // would add the sun a second time to their irradiance.
+        function withSunDiscHidden(fn) {
+            const uniform = skyMesh?.parent ? (skyMesh.isSkyMesh ? skyMesh.showSunDisc : skyMesh.material.uniforms.showSunDisc) : null;
+            const previous = uniform?.value;
+            if (uniform) uniform.value = 0;
+            try {
+                return fn();
+            } finally {
+                if (uniform) uniform.value = previous;
+            }
         }
 
         return {
@@ -583,8 +533,6 @@ function createSky(deps = {}) {
             hasAuthoredEnvironmentActive,
             restoreAuthoredEnvironmentAfterLocalHDRIChange,
             normalizeSkyParams,
-            buildSpectralGiSky,
-            syncSpectralGiSky,
             getSkySunDirectionWorld,
             isSkyLinkCandidateLight,
             getDirectionalLightSunVector,
@@ -594,7 +542,8 @@ function createSky(deps = {}) {
             refreshSkyAmbientLightProbeFromCurrentSky,
             applySky,
             removeSky,
-            refreshSkyForSpectralView,
+            refreshSkyForPathTracing,
+            withSunDiscHidden,
         };
 }
 

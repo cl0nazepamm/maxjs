@@ -20,6 +20,7 @@
         import { createSnapshotExport } from './snapshot_export.js';
         import { createPostFxGlue } from './postfx_glue.js';
         import { createPathTracingGlue } from './pathtracing_glue.js';
+        import { createPathTracer, normalizePathTracerSettings } from './path_tracer.js';
         import { createRenderCapture } from './render_capture.js';
         import { createRenderLoop } from './render_loop.js';
         import { createSceneLoadGate } from './scene_load_gate.js';
@@ -28,7 +29,7 @@
         import { createLights } from './lights.js';
         import { createEnvironment } from './environment.js';
         import { createSky } from './sky.js';
-        import { createGiVolumeGlue } from './gi_volume_glue.js';
+        import { createLightProbeGlue } from './light_probe_glue.js';
         import { getHostProfile } from '../host_profile.js';
         import {
             materialEnvIntensity,
@@ -59,7 +60,6 @@
         import { createPerfHud } from '../perf_hud.js';
         import { createMaxJSFxController } from '../maxjs_fx.js';
         import { createWebGLBasicFx } from '../webgl_basicfx.js';
-        import { createSpectralTracer } from 'speedball-gi/spectral-tracer';
         import { createLayerManager } from '../layer_manager.js';
         import { MAXJS_LAYER_SSR_EXCLUDE } from '../render_layers.js';
         import { createMaxJSAnimationSystem } from '../maxjs_animation.js';
@@ -241,42 +241,13 @@
         }
         let lastRenderTimestamp = 0;
 
-        const MAXJS_MODE_KEY = 'maxjs-render-mode';
-        // 'spectral' replaces the old 'studio' (Advanced) mode and absorbs the
-        // old top-level 'pathtracing' mode: the path tracer is now a live VIEW
-        // inside spectral mode (same spectral scene core as the probe GI).
-        const MAXJS_RENDER_MODES = ['standard', 'spectral'];
         const isHostedWebView = !!window.chrome?.webview?.postMessage;
         const pageParams = new URLSearchParams(window.location.search);
         const isProductionRenderPage = pageParams.has('productionRender');
         const shouldPreserveCanvasForCapture = isHostedWebView || isProductionRenderPage;
 
-        function readMaxjsRenderMode() {
-            if (isProductionRenderPage) return 'standard';
-            try {
-                let value = localStorage.getItem(MAXJS_MODE_KEY);
-                // migrate legacy tokens: Advanced ('studio') and the old
-                // top-level 'pathtracing' mode both fold into 'spectral'.
-                if (value === 'studio' || value === 'pathtracing') {
-                    value = 'spectral';
-                    try { localStorage.setItem(MAXJS_MODE_KEY, value); } catch {}
-                }
-                return MAXJS_RENDER_MODES.includes(value) ? value : 'standard';
-            } catch {
-                return 'standard';
-            }
-        }
-
-        const maxjsRenderMode = readMaxjsRenderMode();
-        // internal flag name kept ('studio') — it gates every advanced feature
-        // and renaming hundreds of references buys nothing. UI label: Spectral.
-        const isStudioMode = maxjsRenderMode === 'spectral';
-        // Spectral view: 'probes' = live DDGI probe GI (default), 'trace' =
-        // the spectral path tracer. Live-switchable WITHOUT reload — both run
-        // on the same spectral scene core. setSpectralView() flips it.
-        // Session-only by design: every viewer start begins in 'probes' (PT off)
-        // so a restart never boots straight into the tracer.
-        let spectralView = 'probes';
+        // Path tracing is a live view on the WebGPU backend (path_tracer.js).
+        // Session-only: every viewer start begins rasterized.
         let isPathTracingMode = false;
         document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
 
@@ -284,7 +255,6 @@
         let rendererBackendLabel = 'WebGPU';
         let lightLinkingRef = null;
         const rendererCore = createRendererCore({
-            MAXJS_MODE_KEY,
             getRenderOutputAspect,
             setRailButtonMeta: (...args) => setRailButtonMeta(...args),
             setViewportMenuItemHidden: (...args) => setViewportMenuItemHidden(...args),
@@ -305,7 +275,6 @@
             set lastRenderTimestamp(value) { lastRenderTimestamp = value; },
             get isProductionRenderPage() { return isProductionRenderPage; },
             get shouldPreserveCanvasForCapture() { return shouldPreserveCanvasForCapture; },
-            get isPathTracingMode() { return isPathTracingMode; },
             hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
         });
         const {
@@ -326,7 +295,6 @@
             createRenderer,
             isWgl2FallbackBackendActive,
             isWgl2BackendActive,
-            isSimpleWebGLPipelineActive,
             isWebGLPipelineActive,
             getRendererPipelineMode,
             syncRendererButtonUi,
@@ -354,41 +322,24 @@
         // everything below the compact-channel threshold instead.
         window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
 
-        // ── Render mode ───────────────────────────────────────
-        // MaxLightsNode is the adaptive factory in every node-renderer mode.
+        // ── Lighting ──────────────────────────────────────────
+        // MaxLightsNode is the adaptive lights factory on node renderers.
         // Unlinked lights stay on Three's own dynamic/native light nodes; only
         // a light with an explicit include/exclude mode enters the masked path.
-        // The same factory also carries the opt-in Speedball GI nodes, replacing the
-        // old Standard=GiLights / Spectral=MaxLights split.
-        // Pathtracing = isolated legacy WebGL2 progressive path tracer.
-        //               This is live-viewer only and is not exported to snapshots.
-        //
-        // Mode is frozen before renderer init; switching requires reload.
-        // Three caches lighting.createNode() per scene, so the adaptive factory
-        // must be installed before frame one; switching it when a checkbox is
-        // clicked is too late. Simple WGL2 has no node-lighting factory and is
-        // intentionally left on stock WebGLRenderer behavior.
+        // Three caches lighting.createNode() per scene, so the factory must be
+        // installed before frame one. The classic WebGLRenderer has no node-lighting
+        // factory and keeps stock behavior.
         installMaxLightsRenderer(renderer);
-
-        let giVolume = null;
-        let speedballGi = null; // Speedball GI BVH-traced DDGI probe field (opt-in; see init below)
-        // Speedball GI idle tracking: the probe field holds its synchronous BVH rebuild + GPU
-        // solve until the view rests (camera quiet, not playing, delta-sync settled), so
-        // a freeze can never land during interaction. Updated in the render loop.
-        let speedballGiLastInteractionMs = 0;
 
         // Scene load gate + long-task attribution (scene_load_gate.js,
         // long_task_monitor.js). Big scene syncs apply in time slices behind
         // the gate's overlay and warm their render pipelines before the first
-        // frame. The gate ends after that frame renders; stamping Speedball
-        // interaction there keeps its structural rebuild inside its own rest
-        // window instead of landing on the first frames the user sees.
+        // frame.
         const longTaskMonitor = createLongTaskMonitor({ isLogEnabled: () => debugMode });
         longTaskMonitor.start();
         window.maxjsLongTasks = longTaskMonitor; // console handle
         const sceneLoadGate = createSceneLoadGate({
             onEnd: ({ reason, elapsedMs }) => {
-                speedballGiLastInteractionMs = performance.now();
                 maxjsDebugLog(`max.js scene load: ${reason} after ${Math.round(elapsedMs)} ms`);
             },
         });
@@ -644,13 +595,8 @@
         // @basementstudio/shader-lab from esm.sh on first enable.
         const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
         maxjsFx.setShaderLabFx?.(shaderLabFx);
-        const pathTracingSettings = {
-            samplesPerFrame: 64,
-            giClamp: 8.0,
-            freezeSync: false,
-            paused: false,
-            sampleLimit: 0, // 0 = unlimited; >0 converges then stops (frees GPU)
-        };
+        // sampleLimit 0 = unlimited; >0 converges then stops (frees the GPU).
+        const pathTracingSettings = normalizePathTracerSettings();
         let ptPauseUiSync = null; // set when the PT pause toggle is created
 
         function beginTextureLoad() {
@@ -660,11 +606,10 @@
         function endTextureLoad() {
             pendingTextureLoads = Math.max(0, pendingTextureLoads - 1);
         }
-        const pathTracingFx = createSpectralTracer({
+        const pathTracingFx = createPathTracer({
             renderer,
             scene,
             camera,
-            enabled: isStudioMode, // spectral mode: view toggles live via setSpectralView()
             settings: pathTracingSettings,
             onStatus(message) {
                 perfHud.setStatus(message);
@@ -673,9 +618,6 @@
                 reportBridgeError('pathtracing', error);
             },
         });
-        if (isStudioMode || String(rendererBackendLabel || '') === 'WebGL Mode') {
-            pathTracingFx.preload?.();
-        }
         const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
         const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
         const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 64;
@@ -684,7 +626,7 @@
         let pathTracingRasterWarmupFrames = 0;
         let pathTracingWarmupStartedAt = 0;
         let pathTracingBridge = null;
-        let refreshSkyForSpectralViewNow = () => false;
+        let refreshSkyForPathTracingNow = () => false;
         const pathTracingGlue = createPathTracingGlue({
             PATH_TRACING_RASTER_WARMUP_FRAMES,
             PATH_TRACING_TEXTURE_WAIT_MS,
@@ -693,9 +635,6 @@
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             bridgeHasInitialSync: (...args) => bridgeHasInitialSync(...args),
             hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
-            get isStudioMode() { return isStudioMode; },
-            get spectralView() { return spectralView; },
-            set spectralView(value) { spectralView = value; },
             get isPathTracingMode() { return isPathTracingMode; },
             set isPathTracingMode(value) { isPathTracingMode = value; },
             get pathTracingFx() { return pathTracingFx; },
@@ -712,17 +651,18 @@
             get bridge() { return pathTracingBridge; },
             get perfHud() { return perfHud; },
             get ptPauseUiSync() { return ptPauseUiSync; },
-            refreshSkyForSpectralView: () => refreshSkyForSpectralViewNow(),
+            refreshSkyForPathTracing: () => refreshSkyForPathTracingNow(),
         });
         const {
             isPathTracingViewActive,
             leavePathTracingView,
-            setSpectralView,
+            setPathTracingActive,
             renderPathTracingLiveFrame,
             resetPathTracingStartupWarmup,
             canStartPathTracingNow,
             renderPathTracingFallbackFrame,
             markPathTracingSceneDirtyNow,
+            markPathTracingEnvironmentDirty,
             schedulePathTracingLiveRebuild,
             sendPathTracingRuntimeState,
             applyPathTracingSettings,
@@ -802,10 +742,7 @@
         let currentHdriProbeSignature = '';
         let currentEnvParams = null;
         let hasLightProbeData = false;
-        let lightProbeGrid = null;
-        let hasLightProbeGridData = false;
         let hdriLoadGeneration = 0;
-        let lightProbeRefreshTimer = 0;
 
         let localHdriFile = null;        // original picked/restored file for snapshot export
 
@@ -822,7 +759,9 @@
         let localHdriFlip = false;
         let localHdriReflectionOnly = false;
 
-        let notifySpeedballMaterialStructureChanged = () => {};
+        // Texture arrivals and material rebuilds change what probes and the path
+        // tracer see; wired once both exist.
+        let notifyMaterialStructureChanged = () => {};
         const texturePipeline = await createTexturePipeline({
             TSL,
             textureLoader,
@@ -843,7 +782,7 @@
             endTextureLoad,
             rememberMaterialEmissiveBase: (...args) => rememberMaterialEmissiveBase(...args),
             reapplyBakeOverridesToScene: () => reapplyBakeOverridesToScene(),
-            onMaterialStructureChanged: material => notifySpeedballMaterialStructureChanged(material),
+            onMaterialStructureChanged: () => notifyMaterialStructureChanged(),
             get renderer() { return renderer; },
             get rendererBackendLabel() { return rendererBackendLabel; },
             get bakeOverrides() { return bakeOverrides; },
@@ -977,12 +916,12 @@
             setDefaultLightsVisible: (...args) => setDefaultLightsVisible(...args),
             syncMaterialEnvMaps,
             clearLightProbe: (...args) => clearLightProbe(...args),
-            markLightProbeSceneDirty: (...args) => markLightProbeSceneDirty(...args),
             markLightProbeMaterialsDirty: (...args) => markLightProbeMaterialsDirty(...args),
             applyLightProbeState: (...args) => applyLightProbeState(...args),
+            isLightProbeGridActive: () => isLightProbeGridActive(),
             updateLightProbeFromHDRI: (...args) => updateLightProbeFromHDRI(...args),
             scheduleLightProbeFromCurrentScene: (...args) => scheduleLightProbeFromCurrentScene(...args),
-            markPathTracingSceneDirtyNow: (...args) => markPathTracingSceneDirtyNow(...args),
+            markPathTracingEnvironmentDirty: () => markPathTracingEnvironmentDirty(),
             setBackgroundColor,
             applyCoreToneMappingState: (options) => applyCoreToneMappingState(options),
             savePostFxState: () => savePostFxState(),
@@ -997,11 +936,8 @@
             get envVisible() { return envVisible; },
             get lightHandleMap() { return lightHandleMap; },
             get skyActive() { return skyActive; },
-            get isPathTracingMode() { return isPathTracingMode; },
             get lightProbeEnabled() { return lightProbeEnabled; },
             get hasLightProbeData() { return hasLightProbeData; },
-            get lightProbeRefreshTimer() { return lightProbeRefreshTimer; },
-            set lightProbeRefreshTimer(value) { lightProbeRefreshTimer = value; },
             get currentHdriUrl() { return currentHdriUrl; },
             set currentHdriUrl(value) { currentHdriUrl = value; },
             get currentHdriProbeSignature() { return currentHdriProbeSignature; },
@@ -1067,7 +1003,7 @@
             syncDefaultLightsVisibility,
             syncHdriPanel,
             loadHDRI,
-            get isStudioMode() { return isStudioMode; },
+            scheduleLightProbeFromCurrentScene: (...args) => scheduleLightProbeFromCurrentScene(...args),
             get renderer() { return renderer; },
             get rendererBackendLabel() { return rendererBackendLabel; },
             get scene() { return scene; },
@@ -1078,16 +1014,11 @@
             get lightProbe() { return lightProbe; },
             get lightHandleMap() { return lightHandleMap; },
             get isPathTracingMode() { return isPathTracingMode; },
-            get speedballGi() { return speedballGi; },
             get currentEnvParams() { return currentEnvParams; },
             get skyActive() { return skyActive; },
             set skyActive(value) { skyActive = value; },
-            get lightProbeGrid() { return lightProbeGrid; },
-            set lightProbeGrid(value) { lightProbeGrid = value; },
             get hasLightProbeData() { return hasLightProbeData; },
             set hasLightProbeData(value) { hasLightProbeData = value; },
-            get hasLightProbeGridData() { return hasLightProbeGridData; },
-            set hasLightProbeGridData(value) { hasLightProbeGridData = value; },
             get currentHdriUrl() { return currentHdriUrl; },
             set currentHdriUrl(value) { currentHdriUrl = value; },
             get currentHdriProbeSignature() { return currentHdriProbeSignature; },
@@ -1116,9 +1047,10 @@
             refreshSkyAmbientLightProbeFromCurrentSky,
             applySky,
             removeSky,
-            refreshSkyForSpectralView,
+            refreshSkyForPathTracing,
+            withSunDiscHidden,
         } = sky;
-        refreshSkyForSpectralViewNow = refreshSkyForSpectralView;
+        refreshSkyForPathTracingNow = refreshSkyForPathTracing;
 
         function materialListHasRawShader(material) {
             if (Array.isArray(material)) return material.some((entry) => entry?.isRawShaderMaterial);
@@ -1319,114 +1251,59 @@
             get readyConsumers() { return Number(relayState.readyConsumers) || 0; },
         });
 
-        const giVolumeGlue = createGiVolumeGlue({
-            pageParams,
+        const lightProbeGlue = createLightProbeGlue({
             maxTimeline,
-            hostBridge,
             bridge,
             relayEmit: data => relayFacade.emit(data),
             maxjsDebugWarn,
             savePostFxState: () => savePostFxState(),
-            bakeStateSignature: () => bakeStateSignature(),
-            isLocalHdriActive: () => isLocalHdriActive(),
             isHdriReflectionOnlyEffective: () => isHdriReflectionOnlyEffective(),
-            refreshSkyAmbientLightProbeFromCurrentSky: () => refreshSkyAmbientLightProbeFromCurrentSky(),
-            setSpectralSkyDiffuseOwnership(active) {
-                const next = active === true;
-                if ((scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse === true) === next) return;
-                scene.userData.maxjsSpectralSkyDdgiOwnsDiffuse = next;
-                applyHdriReflectionOnlyState({ markOutput: true });
+            onLightProbeGridActiveChanged: () => applyHdriReflectionOnlyState({ markOutput: true }),
+            setGiLightmaps: (...args) => setGiLightmaps(...args),
+            // Captures see the scene, not the editor: hide overlays, the sky's sun
+            // disc and the bounce already baked into GI lightmaps.
+            wrapCapture(fn) {
+                const overlaysVisible = overlayRoot.visible;
+                overlayRoot.visible = false;
+                try {
+                    return withGiLightmapsMuted(() => withSunDiscHidden(fn));
+                } finally {
+                    overlayRoot.visible = overlaysVisible;
+                }
             },
             get renderer() { return renderer; },
             get scene() { return scene; },
             get nodeMap() { return nodeMap; },
-            get defaultLights() { return defaultLights; },
-            get isStudioMode() { return isStudioMode; },
-            get isPathTracingMode() { return isPathTracingMode; },
-            get renderToImageActive() { return renderToImageActive; },
             get lightProbe() { return lightProbe; },
             get lightProbeEnabled() { return lightProbeEnabled; },
             get lightProbeIntensity() { return lightProbeIntensity; },
-            get lightProbeGrid() { return lightProbeGrid; },
-            set lightProbeGrid(value) { lightProbeGrid = value; },
             get hasLightProbeData() { return hasLightProbeData; },
             set hasLightProbeData(value) { hasLightProbeData = value; },
-            get hasLightProbeGridData() { return hasLightProbeGridData; },
-            set hasLightProbeGridData(value) { hasLightProbeGridData = value; },
-            get currentHdriUrl() { return currentHdriUrl; },
             get currentHdriProbeSignature() { return currentHdriProbeSignature; },
-            set currentHdriProbeSignature(value) { currentHdriProbeSignature = value; },
             get hdriLoadGeneration() { return hdriLoadGeneration; },
-            set hdriLoadGeneration(value) { hdriLoadGeneration = value; },
-            get lightProbeRefreshTimer() { return lightProbeRefreshTimer; },
-            set lightProbeRefreshTimer(value) { lightProbeRefreshTimer = value; },
-            get lastLightsSignature() { return lastLightsSignature; },
-            get giVolume() { return giVolume; },
-            set giVolume(value) { giVolume = value; },
-            get speedballGi() { return speedballGi; },
-            set speedballGi(value) { speedballGi = value; },
-            get speedballGiLastInteractionMs() { return speedballGiLastInteractionMs; },
-            set speedballGiLastInteractionMs(value) { speedballGiLastInteractionMs = value; },
         });
         const {
-            SPEEDBALL_GI_NUMERIC_CONTROLS,
-            GI_VOLUME_CAMERA_DEBOUNCE_MS,
+            lightProbes,
+            lightmapsSupported,
+            getLightmapCount,
+            isLightmapBakePending,
             serializeRelayProbeGrids,
-            getSpeedballGiSettings,
-            clampSpeedballGiNumber,
-            formatSpeedballGiValue,
-            normalizeSpeedballGiSettings,
-            applySpeedballGiTuning,
-            serializeSpeedballGiState,
-            applySpeedballGiState,
-            setSpeedballGiSetting,
-            resetSpeedballGiToDefaults,
-            shouldAutoStartStudioGiVolume,
-            ensureStudioGiVolume,
-            installStudioGiConsoleHandle,
+            isLightProbeGridActive,
             applyLightProbeState,
             clearLightProbe,
-            supportsWebGLLightProbeGrid,
-            computeLightProbeGridBounds,
-            chooseLightProbeGridResolution,
-            markLightProbeSceneDirty,
-            markLightProbeLightsDirty,
             markLightProbeMaterialsDirty,
-            markSpeedballTransformsDirty,
-            markSpeedballDeformsDirty,
-            markSpeedballMaterialsDirty,
-            markSpeedballTopologyDirty,
-            markSpeedballLightsDirty,
-            currentLightProbeSceneSignature,
-            updateLightProbeGridFromScene,
-            giVolumeNowMs,
-            giVolumeEase,
-            fadeGiVolumeTo,
-            hideGiVolumeForDebounce,
-            revealGiVolumeAfterDebounce,
-            startGiVolumeHiddenSolve,
-            clearGiVolumeNativeWait,
-            maybeStartGiVolumeAfterNativePacket,
-            requestNativeGiPackets,
-            runGiVolumeAfterDebounce,
-            syncGiVolumeActive,
-            updateGiVolumeFromScene,
-            scheduleGiVolumeFromCurrentScene,
-            updateGiVolumeIdleWork,
-            giVolumeCameraSignature,
-            noteGiVolumeCameraSync,
-            updateLightProbeFromCurrentScene,
+            rebakeLightProbes,
             scheduleLightProbeFromCurrentScene,
             updateLightProbeFromHDRI,
-            buildSpeedballProbeVolumes,
-            serializeSpeedballGiProbeVolumes,
-            syncSpeedballProbeVolumes,
-            disposeProbeHelpers,
-            updateProbeHelpers,
-            setProbeHelpersVisible,
-        } = giVolumeGlue;
-        notifySpeedballMaterialStructureChanged = material => markSpeedballMaterialsDirty(material ?? null);
-        if (skyActive) refreshSkyForSpectralView();
+            getLightProbeSettings,
+            applyLightProbeSettings,
+            serializeSnapshotLightProbes,
+            updateLightProbes,
+        } = lightProbeGlue;
+        notifyMaterialStructureChanged = () => {
+            scheduleLightProbeFromCurrentScene();
+            schedulePathTracingLiveRebuild('material');
+        };
 
         const SYNC_MODE_UI = {
             'live-fast': {
@@ -1515,8 +1392,8 @@
                     || !controller) return false;
                 controller.enable();
                 controller.emit({
-                    type: 'speedballGiSettings',
-                    settings: { ...getSpeedballGiSettings() },
+                    type: 'lightProbeSettings',
+                    settings: { ...getLightProbeSettings() },
                 });
                 controller.emit(serializeRelayProbeGrids());
                 return true;
@@ -1601,7 +1478,7 @@
 
         bridge.on('pathtracing_settings', msg => {
             applyPathTracingSettings({
-                samplesPerFrame: msg.samplesPerFrame,
+                bounces: msg.bounces,
                 giClamp: msg.giClamp,
                 freezeSync: msg.freezeSync,
             }, { notify: true });
@@ -1718,15 +1595,7 @@
             maxVertexColorAttributeName,
             resetPathTracingStartupWarmup: (...args) => resetPathTracingStartupWarmup(...args),
             markPathTracingSceneDirtyNow: (...args) => markPathTracingSceneDirtyNow(...args),
-            markLightProbeSceneDirty,
-            markLightProbeLightsDirty,
-            markSpeedballTransformsDirty,
-            markSpeedballDeformsDirty,
-            markSpeedballMaterialsDirty,
-            markSpeedballTopologyDirty,
-            markSpeedballLightsDirty,
             scheduleLightProbeFromCurrentScene,
-            syncSpeedballProbeVolumes,
             schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
             applyCamera: (...args) => applyCamera(...args),
             applySky: (...args) => applySky(...args),
@@ -1806,8 +1675,6 @@
             bridge,
             countMaterialTextureSlots,
             buildGeometry,
-            markLightProbeSceneDirty,
-            markSpeedballTopologyDirty,
             scheduleLightProbeFromCurrentScene,
             schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
             updateSyncHud,
@@ -1867,7 +1734,6 @@
             applyRenderViewportLayout,
             updateCameraProjectionForViewportRect,
             copyMaxArrayToWorld,
-            noteGiVolumeCameraSync,
             syncPostFxPanel: (...args) => syncPostFxPanel(...args),
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             maxjsDebugLog,
@@ -1959,8 +1825,6 @@
             disposeSceneMaterial,
             ensureSceneRenderableMaterial,
             stampSceneMaterial,
-            markLightProbeSceneDirty,
-            markSpeedballMaterialsDirty,
             scheduleLightProbeFromCurrentScene,
             requestHostAction,
             bytesToBase64,
@@ -2014,6 +1878,8 @@
             getBakeUv2RequirementStats,
             mutateLightmapBakeOnMaterial,
             reapplyBakeOverridesToScene,
+            setGiLightmaps,
+            withGiLightmapsMuted,
             applyBakeState,
             saveBakeState,
             restoreBakeState,
@@ -2041,7 +1907,6 @@
             if (msg.env) {
                 if (msg.env.sky) {
                     applySky(msg.env.sky);
-                    markLightProbeSceneDirty();
                     scheduleLightProbeFromCurrentScene();
                     pathTraceSceneChanged = true;
                 } else if (msg.env.hdri) {
@@ -2077,13 +1942,12 @@
             LIGHT_LINK_STORAGE_KEY,
             setObjectSelfVisibleLayer,
             syncDefaultLightsVisibility,
-            markLightProbeLightsDirty,
             scheduleLightProbeFromCurrentScene,
             refreshSkyFromLinkedSun,
             saveStudioState: (...args) => saveStudioState(...args),
-            isSimpleWebGLPipelineActive: (...args) => isSimpleWebGLPipelineActive(...args),
+            isWebGLPipelineActive: (...args) => isWebGLPipelineActive(...args),
             restartWithRendererBackend: (...args) => restartWithRendererBackend(...args),
-            setSpectralView: (...args) => setSpectralView(...args),
+            setPathTracingActive: (...args) => setPathTracingActive(...args),
             get isPathTracingMode() { return isPathTracingMode; },
             hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
             get defaultLights() { return defaultLights; },
@@ -2105,7 +1969,6 @@
             get camera() { return camera; },
             get maxjsFx() { return maxjsFx; },
             get layerManager() { return layerManager; },
-            get isStudioMode() { return isStudioMode; },
             get perfHud() { return perfHud; },
         });
         const {
@@ -2170,11 +2033,10 @@
             syncProjectPostFxState: (...args) => syncProjectPostFxState(...args),
             setLightHelpersVisible,
             applyPathTracingSettings: (...args) => applyPathTracingSettings(...args),
-            setSpectralView: (...args) => setSpectralView(...args),
+            setPathTracingActive: (...args) => setPathTracingActive(...args),
+            isPathTracingAvailable: () => pathTracingFx.supported,
             setLightLinkPanelVisible,
             rebuildLightLinkPanel,
-            MAXJS_MODE_KEY,
-            maxjsRenderMode,
             get renderer() { return renderer; },
             get scene() { return scene; },
             get controls() { return controls; },
@@ -2185,11 +2047,7 @@
             get bridge() { return bridge; },
             get lightLinking() { return lightLinking; },
             get lightLinkPanelVisible() { return lightLinkPanelVisible; },
-            get isStudioMode() { return isStudioMode; },
-            isSimpleWebGLPipelineActive: (...args) => isSimpleWebGLPipelineActive(...args),
             isWebGLPipelineActive: (...args) => isWebGLPipelineActive(...args),
-            isWgl2FallbackBackendActive: (...args) => isWgl2FallbackBackendActive(...args),
-            get spectralView() { return spectralView; },
             get isPathTracingMode() { return isPathTracingMode; },
             get pathTracingSettings() { return pathTracingSettings; },
             get ptPauseUiSync() { return ptPauseUiSync; },
@@ -2241,6 +2099,7 @@
             setRightDockWidth,
             clampDockWidth,
             btnLightProbe,
+            setLightProbesEnabled,
             btnPostFxPanel,
             rightDock,
             postPanel,
@@ -2349,33 +2208,35 @@
             bridge,
             onShaderLabSnapshotChange,
             applyCameraClipOverrides,
-            applySpeedballGiState,
             applyHdriReflectionOnlyState,
             applyLightProbeState,
             applyLocalHDRISettings,
             applyLocalHDRIToScene,
             applyRendererPerformanceSettings,
             clampDockWidth,
-            clampSpeedballGiNumber,
             clearLocalHDRI,
             computeVisibleSceneBounds,
             disposeMaxInstanceBuckets,
             disposeFlattenedGroups,
             enterAsciiMode,
             exitAsciiMode,
-            formatSpeedballGiValue,
             getEffectivePixelRatio,
             getEffectivePostFxResolutionScale,
-            getSpeedballGiSettings,
+            getLightProbeSettings,
+            applyLightProbeSettings,
+            rebakeLightProbes,
+            toggleLightProbes: () => setLightProbesEnabled(!lightProbeEnabled),
+            lightProbes,
+            lightmapsSupported,
+            getLightmapCount,
+            isLightmapBakePending,
             isLocalHdriActive,
             loadLocalHDRIFile,
             maxjsDebugWarn,
             rebuildAsciiEffect,
             refreshLightProbeFromCurrentHDRI,
             reportBridgeError,
-            resetSpeedballGiToDefaults,
             setBackgroundColor,
-            setSpeedballGiSetting,
             setRightDockWidth,
             setShaderLabSnapshot,
             syncCameraLockButtonUi,
@@ -2389,7 +2250,6 @@
             serializeSnapshotUiState: (...args) => serializeSnapshotUiState(...args),
             DEFAULT_CAMERA_NEAR,
             DEFAULT_TONE_MAPPING,
-            SPEEDBALL_GI_NUMERIC_CONTROLS,
             PERFORMANCE_DEFAULTS,
             toneMappingModes,
             btnLightProbe,
@@ -2415,7 +2275,6 @@
             set currentToneMapping(value) { currentToneMapping = value; },
             get envVisible() { return envVisible; },
             set envVisible(value) { envVisible = value; },
-            get isStudioMode() { return isStudioMode; },
             get lastRenderTimestamp() { return lastRenderTimestamp; },
             set lastRenderTimestamp(value) { lastRenderTimestamp = value; },
             get lightMode() { return lightMode; },
@@ -2494,7 +2353,7 @@
                     enabled: authoredEnvironmentActive ? false : localHdriEnabled,
                     fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
                 },
-                speedballGi: serializeSpeedballGiState(),
+                lightProbes: serializeSnapshotLightProbes(),
                 performance: {
                     fpsCap: performanceSettings.fpsCap,
                     renderScale: performanceSettings.renderScale,
@@ -2506,9 +2365,7 @@
                 cameraClip: { near: cameraClip.near, far: cameraClip.far },
                 ascii: { enabled: asciiActive, ...asciiSettings },
                 shaderLab: getShaderLabSnapshot(),
-                studio: (isStudioMode || lightLinking.hasPortableState())
-                    ? serializeStudioState()
-                    : null,
+                studio: lightLinking.hasPortableState() ? serializeStudioState() : null,
                 bake: serializeBakeState(),
                 timeline: {
                     fps: maxTimeline.fps(),
@@ -2630,10 +2487,12 @@
         })();
 
         const renderLoop = createRenderLoop({
-            GI_VOLUME_CAMERA_DEBOUNCE_MS,
             flushMaterialDisposals: (...args) => flushMaterialDisposals(...args),
             syncOrbitNavigationFeel: (...args) => syncOrbitNavigationFeel(...args),
-            scheduleGiVolumeFromCurrentScene: (...args) => scheduleGiVolumeFromCurrentScene(...args),
+            scheduleLightProbeFromCurrentScene,
+            updateLightProbes,
+            lightProbes,
+            isLightmapBakePending,
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             getActiveCameraWorldPosition: (...args) => getActiveCameraWorldPosition(...args),
             updateVolumeUniforms: (...args) => updateVolumeUniforms(...args),
@@ -2645,9 +2504,6 @@
             bridgeHasInitialSync: (...args) => bridgeHasInitialSync(...args),
             renderPathTracingLiveFrame: (...args) => renderPathTracingLiveFrame(...args),
             reportBridgeError: (...args) => reportBridgeError(...args),
-            updateGiVolumeIdleWork: (...args) => updateGiVolumeIdleWork(...args),
-            syncGiVolumeActive: (...args) => syncGiVolumeActive(...args),
-            updateProbeHelpers: (...args) => updateProbeHelpers(...args),
             renderCurrentFrameOnce: (...args) => renderCurrentFrameOnce(...args),
             sendCurrentCanvasRenderFile: (...args) => sendCurrentCanvasRenderFile(...args),
             syncPostFxPanel: (...args) => syncPostFxPanel(...args),
@@ -2684,9 +2540,7 @@
             set pathTracingRasterWarmupFrames(value) { pathTracingRasterWarmupFrames = value; },
             get asciiActive() { return asciiActive; },
             get asciiEffect() { return asciiEffect; },
-            get speedballGiLastInteractionMs() { return speedballGiLastInteractionMs; },
-            set speedballGiLastInteractionMs(value) { speedballGiLastInteractionMs = value; },
-            get speedballGi() { return speedballGi; },
+            get lightHandleMap() { return lightHandleMap; },
             get isPathTracingMode() { return isPathTracingMode; },
             get blobOverlayCtx() { return blobOverlayCtx; },
             get blobOverlayCvs() { return blobOverlayCvs; },
@@ -2709,8 +2563,6 @@
         let runtimeTransformRefreshQueued = false;
         let runtimeTransformLightsChanged = false;
         let runtimeTransformSurfacesChanged = false;
-        let runtimeTransformAllSurfacesChanged = false;
-        const runtimeTransformSurfaceTargets = new Set();
         const queueLightLinkSceneRefresh = () => {
             if (lightLinkSceneRefreshQueued) return;
             lightLinkSceneRefreshQueued = true;
@@ -2721,40 +2573,23 @@
         };
         const queueRuntimeTransformRefresh = (event) => {
             if (lightHandleMap.has(event?.handle)) runtimeTransformLightsChanged = true;
-            else {
-                runtimeTransformSurfacesChanged = true;
-                const target = nodeMap.get(event?.handle);
-                if (target?.geometry) runtimeTransformSurfaceTargets.add(target);
-                else runtimeTransformAllSurfacesChanged = true;
-            }
+            else runtimeTransformSurfacesChanged = true;
             if (runtimeTransformRefreshQueued) return;
             runtimeTransformRefreshQueued = true;
             queueMicrotask(() => {
                 runtimeTransformRefreshQueued = false;
                 const lightsChanged = runtimeTransformLightsChanged;
                 const surfacesChanged = runtimeTransformSurfacesChanged;
-                const allSurfacesChanged = runtimeTransformAllSurfacesChanged;
-                const surfaceTargets = new Set(runtimeTransformSurfaceTargets);
                 runtimeTransformLightsChanged = false;
                 runtimeTransformSurfacesChanged = false;
-                runtimeTransformAllSurfacesChanged = false;
-                runtimeTransformSurfaceTargets.clear();
 
                 // Runtime pose writes do not change mesh/material topology. In
                 // particular, markSceneChanged() refreshes SSR's scene-derived
                 // caches, so calling it for every animated node made scripted
-                // rigs hitch only while SSR was enabled. Keep the pose-aware GI
+                // rigs hitch only while SSR was enabled. Keep the pose-aware probe
                 // and PT invalidations, coalesced once per runtime update.
-                if (surfacesChanged) {
-                    markLightProbeSceneDirty();
-                    if (allSurfacesChanged) markSpeedballTransformsDirty();
-                    else markSpeedballTransformsDirty(surfaceTargets);
-                    schedulePathTracingLiveRebuild('transform');
-                }
-                if (lightsChanged) {
-                    markLightProbeLightsDirty();
-                    schedulePathTracingLiveRebuild('light');
-                }
+                if (surfacesChanged) schedulePathTracingLiveRebuild('transform');
+                if (lightsChanged) schedulePathTracingLiveRebuild('light');
                 if (surfacesChanged || lightsChanged) {
                     scheduleLightProbeFromCurrentScene({ delay: 350 });
                 }
@@ -2787,21 +2622,10 @@
                     queueRuntimeTransformRefresh(event);
                     return;
                 }
-                if (event?.type === 'spectralMaterial') {
-                    const targets = new Set();
-                    for (const handle of event.handles ?? []) {
-                        const target = nodeMap.get(handle);
-                        if (target) targets.add(target);
-                    }
-                    markSpeedballMaterialsDirty(targets.size > 0 ? targets : null);
-                } else {
-                    markSpeedballTopologyDirty();
-                }
                 queueLightLinkSceneRefresh();
                 maxjsFx.markSceneChanged?.();
-                markLightProbeSceneDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 350 });
-                schedulePathTracingLiveRebuild();
+                schedulePathTracingLiveRebuild(event?.type === 'spectralMaterial' ? 'material' : 'full');
             },
         });
         jsmodVisibilityOwnedByLayer = (handle) => layerManager.hasRuntimeVisibilityOverride(handle);
@@ -2818,13 +2642,15 @@
             buildGeometry,
             applyMaterialScalar,
             onSceneChange(change) {
-                if (change?.topology) markSpeedballTopologyDirty();
-                else {
-                    if (change?.transforms?.size) markSpeedballTransformsDirty(change.transforms);
-                    if (change?.materials?.size) markSpeedballMaterialsDirty(change.materials);
-                    if (change?.deform) markSpeedballDeformsDirty();
+                scheduleLightProbeFromCurrentScene();
+                if (change?.topology) {
+                    schedulePathTracingLiveRebuild('full');
+                    return;
                 }
-                if (change?.lights) markSpeedballLightsDirty();
+                if (change?.transforms?.size) schedulePathTracingLiveRebuild('transform');
+                if (change?.materials?.size) schedulePathTracingLiveRebuild('material');
+                if (change?.deform) schedulePathTracingLiveRebuild('deform');
+                if (change?.lights) schedulePathTracingLiveRebuild('light');
             },
         });
         audioSystem = createMaxJSAudioSystem({
@@ -2839,14 +2665,9 @@
             getBus: () => layerManager?.getBus?.(),
             debugWarn: maxjsDebugWarn,
             onSceneChange(change) {
-                if (change?.type === 'topology') {
-                    markSpeedballTopologyDirty();
-                    return;
-                }
-                if (change?.type === 'transform') {
-                    markSpeedballTransformsDirty(change.targets ?? null);
-                    if (change.deform === true) markSpeedballDeformsDirty();
-                }
+                scheduleLightProbeFromCurrentScene();
+                if (change?.type === 'topology') schedulePathTracingLiveRebuild('full');
+                else if (change?.type === 'transform') schedulePathTracingLiveRebuild(change.deform === true ? 'deform' : 'transform');
             },
         });
         layerManager.subscribe?.(() => {
@@ -2854,8 +2675,6 @@
             queueLightLinkSceneRefresh();
             // Layer mutations can add/remove meshes — cheap scene refresh.
             maxjsFx.markSceneChanged?.();
-            markLightProbeSceneDirty();
-            markSpeedballTopologyDirty();
             scheduleLightProbeFromCurrentScene({ delay: 350 });
             schedulePathTracingLiveRebuild();
         });

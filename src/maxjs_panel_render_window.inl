@@ -166,7 +166,7 @@
         wchar_t msg[384];
         swprintf_s(msg, L"{\"type\":\"render_to_image\",\"width\":%d,\"height\":%d,\"frame\":%d,\"fps\":%d,\"warmupMs\":%d,\"alpha\":%s,\"pathTracingSamples\":%d}",
                    width, height, frame, fps, warmupMs, wantsAlpha ? L"true" : L"false",
-                   pathTracingSamplesPerFrame_);
+                   pathTracingRenderSamples_);
 
         Interface* ip = GetCOREInterface();
         TimeValue previousTime = ip ? ip->GetTime() : t;
@@ -182,7 +182,7 @@
 
         const DWORD timeout = pathTracingViewerActive_
             ? static_cast<DWORD>(std::clamp(
-                pathTracingSamplesPerFrame_ * 1000,
+                pathTracingRenderSamples_ * 1000,
                 15000,
                 600000
             ))
@@ -382,7 +382,7 @@
             << L",\"fps\":" << fps
             << L",\"warmupMs\":" << warmupMs
             << L",\"alpha\":" << (renderSequenceAlpha_ ? L"true" : L"false")
-            << L",\"pathTracingSamples\":" << pathTracingSamplesPerFrame_
+            << L",\"pathTracingSamples\":" << pathTracingRenderSamples_
             << L",\"mime\":\"" << EscapeJson(renderSequenceMime_.c_str()) << L"\"}";
 
         webview_->PostWebMessageAsJson(msg.str().c_str());

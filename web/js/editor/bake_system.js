@@ -24,7 +24,6 @@ function createBakeSystem(deps = {}) {
             disposeSceneMaterial,
             ensureSceneRenderableMaterial,
             stampSceneMaterial,
-            markLightProbeSceneDirty,
             scheduleLightProbeFromCurrentScene,
             requestHostAction,
             bytesToBase64,
@@ -410,11 +409,43 @@ function createBakeSystem(deps = {}) {
             return { required, ready };
         }
 
+        // GI lightmaps baked from the probe grids (lightmap_baker.js): mesh -> texture.
+        // File lightmap overrides win while they are enabled.
+        let giLightmaps = new Map();
+        let giLightmapIntensity = 1;
+
+        function setGiLightmap(material, texture) {
+            const previous = material.lightMap;
+            if (previous === texture && material.lightMapIntensity === giLightmapIntensity) return false;
+            material.lightMap = texture;
+            material.lightMapIntensity = giLightmapIntensity;
+            material.userData ??= {};
+            material.userData.maxjsBakeOverride = 'gi';
+            if (!previous) material.needsUpdate = true;
+            return true;
+        }
+
+        function clearGiLightmap(material) {
+            if (material.userData?.maxjsBakeOverride !== 'gi') return false;
+            material.lightMap = null;
+            material.lightMapIntensity = 1.0;
+            delete material.userData.maxjsBakeOverride;
+            material.needsUpdate = true;
+            return true;
+        }
+
         function mutateLightmapBakeOnMaterial(material, nd, geom, mesh = null) {
             if (!material) return false;
             if (material.isLineBasicMaterial || material.isLineDashedMaterial) return false;
-            const wasOverride = material.userData?.maxjsBakeOverride;
             const shouldApply = deps.bakeOverrides.enabled && deps.bakeOverrides.mode === 'lightmap';
+            const giLightmap = mesh ? giLightmaps.get(mesh) : null;
+            if (giLightmap && !shouldApply) return setGiLightmap(material, giLightmap);
+            const giCleared = clearGiLightmap(material);
+            return mutateFileLightmapOnMaterial(material, nd, geom, mesh, shouldApply) || giCleared;
+        }
+
+        function mutateFileLightmapOnMaterial(material, nd, geom, mesh, shouldApply) {
+            const wasOverride = material.userData?.maxjsBakeOverride;
 
             if (!shouldApply) {
                 if (wasOverride === 'lightmap') {
@@ -514,11 +545,56 @@ function createBakeSystem(deps = {}) {
             if (changed) {
                 deps.maxjsFx.markSceneChanged?.();
                 deps.maxjsFx.markOutputChanged?.();
-                markLightProbeSceneDirty();
-                deps.markSpeedballMaterialsDirty();
                 scheduleLightProbeFromCurrentScene({ delay: 250 });
             }
             return changed;
+        }
+
+        // Swaps in a new set of GI lightmaps. Unlike reapplyBakeOverridesToScene this
+        // never reschedules the probes: the maps were baked from them.
+        function setGiLightmaps(maps, intensity = giLightmapIntensity) {
+            giLightmaps = maps ?? new Map();
+            giLightmapIntensity = intensity;
+            let changed = false;
+            for (const mesh of deps.nodeMap.values()) {
+                const nd = mesh?.userData?.maxjsLastNodePayload;
+                if (!mesh || !nd) continue;
+                const mats = Array.isArray(mesh.material) ? mesh.material : (mesh.material ? [mesh.material] : []);
+                const wanted = giLightmaps.has(mesh);
+                for (let materialIndex = 0; materialIndex < mats.length; materialIndex++) {
+                    let m = mats[materialIndex];
+                    if (!m || (!wanted && m.userData?.maxjsBakeOverride !== 'gi')) continue;
+                    const unique = ensureBakeOverrideMaterialInstance(m, nd, mesh);
+                    if (unique !== m) {
+                        if (Array.isArray(mesh.material)) mesh.material[materialIndex] = unique;
+                        else mesh.material = unique;
+                        deps.lightLinking?.replaceRenderableMaterial?.(m, mesh.material);
+                        disposeSceneMaterial(m);
+                        m = unique;
+                    }
+                    if (mutateLightmapBakeOnMaterial(m, nd, mesh.geometry, mesh)) changed = true;
+                }
+            }
+            if (changed) deps.maxjsFx.markOutputChanged?.();
+            return changed;
+        }
+
+        // Probe captures must not see baked bounce, or each rebake would add it again.
+        function withGiLightmapsMuted(fn) {
+            const muted = [];
+            for (const mesh of giLightmaps.keys()) {
+                const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+                for (const m of mats) {
+                    if (m?.userData?.maxjsBakeOverride !== 'gi') continue;
+                    muted.push([m, m.lightMapIntensity]);
+                    m.lightMapIntensity = 0;
+                }
+            }
+            try {
+                return fn();
+            } finally {
+                for (const [m, intensity] of muted) m.lightMapIntensity = intensity;
+            }
         }
 
         function applyBakeState(payload, { persist = false, rebuild = true, refreshPanel = true, force = false } = {}) {
@@ -1045,6 +1121,8 @@ function createBakeSystem(deps = {}) {
             getBakeUv2RequirementStats,
             mutateLightmapBakeOnMaterial,
             reapplyBakeOverridesToScene,
+            setGiLightmaps,
+            withGiLightmapsMuted,
             applyBakeState,
             saveBakeState,
             restoreBakeState,

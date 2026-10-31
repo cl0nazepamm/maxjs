@@ -315,8 +315,9 @@ function createLights(deps = {}) {
             target.updateMatrixWorld();
         }
 
-        // NIR emitter tagging for the spectral tracer (collectLights reads
-        // userData.emitterClass / userData.colorTemp). Two Max-side channels:
+        // Emitter tagging (userData.emitterClass / userData.colorTemp); IR
+        // illuminators light up under PowerShot NIR sensing (ir_emitters.js).
+        // Two Max-side channels:
         //   1. userProps string, if the sync carries it for lights:
         //      "emitterClass=ir" / "=led" / "=sodium" / "=incandescent",
         //      optional "colorTemp=2856".
@@ -565,7 +566,6 @@ function createLights(deps = {}) {
             if (deps.maxjsFx.setMainLight) {
                 deps.maxjsFx.setMainLight(mainDirectionalLight || (deps.defaultLights.visible ? deps.defaultKey : null));
             }
-            deps.markLightProbeLightsDirty();
             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
 
@@ -601,7 +601,6 @@ function createLights(deps = {}) {
             if (deps.maxjsFx.setMainLight) {
                 deps.maxjsFx.setMainLight(mainDirectionalLight || (deps.defaultLights.visible ? deps.defaultKey : null));
             }
-            deps.markLightProbeLightsDirty();
             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
         }
 
@@ -798,14 +797,14 @@ function createLights(deps = {}) {
                     sweepMaterialObservers(currentObserverMaterials);
                 }
                 specializedLightingActive = maskState.activeCount > 0;
-                if (specializedLightingActive && deps.isSimpleWebGLPipelineActive()) {
+                if (specializedLightingActive && deps.isWebGLPipelineActive()) {
                     deps.restartWithRendererBackend?.('webgl-fallback', {
                         reason: 'light-linking-restore',
                         prompt: false,
                     });
                 }
                 if (specializedLightingActive && deps.isPathTracingMode) {
-                    deps.setSpectralView?.('probes');
+                    deps.setPathTracingActive?.(false);
                 }
                 setLightLinkMaskDefaults(
                     deps.renderer,
@@ -814,7 +813,7 @@ function createLights(deps = {}) {
                     maskState.generation,
                 );
                 applyEnvIntensities();
-                window.__maxjsSyncSpectralViewUi?.();
+                window.__maxjsSyncPathTracingUi?.();
                 return { ...maskState, sceneTopologyChanged };
             }
 
@@ -1368,7 +1367,7 @@ function createLights(deps = {}) {
         }
 
         document.getElementById('btnLightLink')?.addEventListener('click', () => {
-            if (deps.isSimpleWebGLPipelineActive()) {
+            if (deps.isWebGLPipelineActive()) {
                 deps.restartWithRendererBackend?.('webgl-fallback', {
                     reason: 'light-linking',
                     confirmMessage: 'Light Linking uses the max.js TSL lighting path. Restart in TSL_GL now?',
@@ -1376,7 +1375,7 @@ function createLights(deps = {}) {
                 return;
             }
             if (deps.isPathTracingMode) {
-                deps.setSpectralView?.('probes');
+                deps.setPathTracingActive?.(false);
                 deps.perfHud.setStatus('max.js - switched to the raster view for Light Linking');
             }
             setLightLinkPanelVisible(!deps.lightLinkPanelVisible);
@@ -1411,7 +1410,6 @@ function createLights(deps = {}) {
                 deps.maxjsFx.setMainLight(mainDirectionalLight || (deps.defaultLights.visible ? deps.defaultKey : null));
             }
             deps.refreshSkyFromLinkedSun();
-            deps.markLightProbeLightsDirty();
             deps.scheduleLightProbeFromCurrentScene({ delay: 350 });
             return true;
         }

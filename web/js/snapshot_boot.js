@@ -68,11 +68,7 @@ import {
 } from './scene_init.js';
 import { applySceneBin } from './scene_applier.js';
 import { createInstanceBuckets } from './instance_buckets.js';
-import {
-    createSceneLights,
-    isIrEmitterClass,
-    resolveLightEmitterClass,
-} from './scene_lights.js';
+import { createSceneLights } from './scene_lights.js';
 import { createSnapshotEnvironment } from './snapshot_environment.js';
 import { createMaterialBuilder } from './material_builder.js';
 import {
@@ -84,6 +80,7 @@ import { copyMaxArrayToWorld, copyMaxComponentsToWorld } from './max_basis.js';
 import { binInRange, geometryFromNodeBinary, typedArrayCanStore } from './scene_binary.js';
 import { sceneSpace } from './max_basis.js';
 import { beginAsyncPipelineMode, warmRenderPipelines } from './pipeline_warmup.js';
+import { createIrEmitterGate } from './ir_emitters.js';
 // Optional modules — imported lazily inside Phase 5 once runtimeFeatures
 // declare them. Keep them out of the static import graph so Minimal mode
 // does not pay for what the scene does not use.
@@ -476,30 +473,6 @@ async function createRenderer(canvas, features, snapshotUi) {
     return renderer;
 }
 
-function snapshotHasIrEmitters(lights) {
-    return Array.isArray(lights)
-        && lights.some(light => isIrEmitterClass(resolveLightEmitterClass(light)));
-}
-
-async function installSnapshotIrLightGraph(renderer, lights) {
-    if (!snapshotHasIrEmitters(lights)) return false;
-    if (!renderer?.lighting?.createNode) {
-        console.warn('[snapshot_boot] IR lights require the WebGPU/TSL lighting graph');
-        return false;
-    }
-    try {
-        const { installMaxLightsRenderer } = await import('./max_lights_node.js');
-        const installed = installMaxLightsRenderer(renderer);
-        if (!installed) {
-            console.warn('[snapshot_boot] failed to install the IR-aware max.js lighting graph');
-        }
-        return installed;
-    } catch (error) {
-        console.warn('[snapshot_boot] IR-aware lighting graph unavailable', error);
-        return false;
-    }
-}
-
 // ─── Phase 3: scene + camera + controls ────────────────────────────────
 // Lives in js/scene_init.js. Returns the canonical scene topology
 // (scene + maxBasisRoot/maxRoot/jsRoot/overlayRoot), a perspective camera,
@@ -634,261 +607,40 @@ async function registerOptionalModules(features, ctx) {
     return modules;
 }
 
-const SNAPSHOT_SPEEDBALL_GI_DEFAULTS = Object.freeze({
-    enabled: false,
-    intensity: 10,
-    divisions: 16,
-    autoPadding: 1,
-    rays: 64,
-    cascades: 1,
-    continuous: true,
-    jitterMode: 'gated',
-    reflectionQuality: 'off',
-    hysteresis: 0.9,
-    hysteresisNormalize: true,
-    normalBias: 1.75,
-    radianceClamp: 8,
-    depthSharpness: 40,
-    cheby: 0.5,
-    classify: 0,
-    filter: 1,
-    smoothness: 1,
-    detail: 1,
-    roughReflections: false,
-    reflectionIntensity: 1.0,
-    changeThreshold: 2.5,
-    snapAmount: 0.30,
-    fireflyClamp: 6.0,
-    volumes: [],
-});
-
-function numOrFallback(value, fallback, min = -Infinity, max = Infinity) {
-    const n = Number(value);
-    if (!Number.isFinite(n)) return fallback;
-    return Math.max(min, Math.min(max, n));
-}
-
-function normalizeSnapshotSpeedballGiState(snapshotUi) {
-    const source = snapshotUi?.speedballGi;
-    if (!source || typeof source !== 'object') return null;
-    const hysteresis = numOrFallback(source.hysteresis, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.hysteresis, 0, 0.99);
-    return {
-        enabled: source.enabled === true,
-        intensity: numOrFallback(source.intensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.intensity, 0, 32),
-        divisions: Math.round(numOrFallback(source.divisions, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.divisions, 2, 32)),
-        autoPadding: numOrFallback(source.autoPadding, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.autoPadding, 0, 4),
-        rays: Math.round(numOrFallback(source.rays, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.rays, 32, 256) / 16) * 16,
-        cascades: Math.round(Number(source.cascades)) === 2 ? 2 : 1,
-        continuous: source.continuous !== false,
-        jitterMode: source.jitterMode === 'montecarlo' ? 'montecarlo' : 'gated',
-        reflectionQuality: ['off', 'rough', 'high', 'ultra'].includes(source.reflectionQuality)
-            ? source.reflectionQuality : (source.roughReflections === true ? 'ultra' : 'off'),
-        hysteresis,
-        // Absent in pre-normalization exports — default ON to match the field.
-        hysteresisNormalize: source.hysteresisNormalize !== false,
-        normalBias: numOrFallback(source.normalBias, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.normalBias, 0, 8),
-        radianceClamp: numOrFallback(source.radianceClamp, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.radianceClamp, 0, 64),
-        depthSharpness: numOrFallback(source.depthSharpness, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.depthSharpness, 1, 200),
-        cheby: numOrFallback(source.cheby, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.cheby, 0, 1),
-        classify: numOrFallback(source.classify, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.classify, 0, 1),
-        filter: numOrFallback(source.filter, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.filter, 0, 1),
-        smoothness: numOrFallback(source.smoothness, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.smoothness, 0, 1),
-        detail: numOrFallback(source.detail, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.detail, 0, 1),
-        roughReflections: source.roughReflections === true,
-        reflectionIntensity: numOrFallback(source.reflectionIntensity, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.reflectionIntensity, 0, 1),
-        changeThreshold: numOrFallback(source.changeThreshold, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.changeThreshold, 0.5, 8),
-        snapAmount: Math.min(numOrFallback(source.snapAmount, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.snapAmount, 0, 0.9), Math.max(0, Math.round((hysteresis - 0.55) * 100) / 100)),
-        fireflyClamp: numOrFallback(source.fireflyClamp, SNAPSHOT_SPEEDBALL_GI_DEFAULTS.fireflyClamp, 1, 20),
-        volumes: Array.isArray(source.volumes) ? source.volumes : [],
-    };
-}
-
-function snapshotSpeedballVolumeBoxes(volumes) {
-    const out = [];
-    for (const entry of Array.isArray(volumes) ? volumes : []) {
-        if (!entry || !Array.isArray(entry.min) || !Array.isArray(entry.max)) continue;
-        const min = new THREE.Vector3(
-            Number(entry.min[0]), Number(entry.min[1]), Number(entry.min[2]),
-        );
-        const max = new THREE.Vector3(
-            Number(entry.max[0]), Number(entry.max[1]), Number(entry.max[2]),
-        );
-        if (!Number.isFinite(min.x) || !Number.isFinite(min.y) || !Number.isFinite(min.z)
-            || !Number.isFinite(max.x) || !Number.isFinite(max.y) || !Number.isFinite(max.z)) {
-            continue;
-        }
-        const box = new THREE.Box3(min, max);
-        if (box.isEmpty()) continue;
-        if (Array.isArray(entry.res) && entry.res.length >= 3) {
-            const res = new THREE.Vector3(
-                Math.round(Number(entry.res[0])),
-                Math.round(Number(entry.res[1])),
-                Math.round(Number(entry.res[2])),
-            );
-            if (Number.isFinite(res.x) && Number.isFinite(res.y) && Number.isFinite(res.z)) {
-                out.push({ box, res });
-                continue;
-            }
-        }
-        out.push(box);
+// Probe grids rebake at boot from the exported settings and world-space volumes
+// (light_probes.js), like the editor. While a grid lights the scene it owns the
+// HDRI's diffuse irradiance, which it captured with occlusion.
+async function createSnapshotLightProbes({ renderer, scene, snapshotUi } = {}) {
+    const exported = snapshotUi?.lightProbes;
+    if (snapshotUi?.lightProbeEnabled === false || !Array.isArray(exported?.volumes) || exported.volumes.length === 0) {
+        return null;
     }
-    return out;
-}
-
-function markSnapshotSpeedballGiMaterialsDirty(scene) {
-    const seen = new WeakSet();
-    const mark = (material) => {
-        if (!material || seen.has(material)) return;
-        seen.add(material);
-        if (material.isMeshBasicMaterial || material.isLineBasicMaterial || material.isLineDashedMaterial) return;
-        material.dispose?.();
-        material.needsUpdate = true;
-    };
-    scene.traverse((object) => {
-        const material = object?.material;
-        if (!material) return;
-        if (Array.isArray(material)) material.forEach(mark);
-        else mark(material);
-    });
-}
-
-function applySnapshotSpeedballGiSettings(field, settings) {
-    field.setIntensity?.(settings.intensity);
-    field.setDivisions?.(settings.divisions);
-    field.setAutoPadding?.(settings.autoPadding);
-    field.setRays?.(settings.rays);
-    field.setCascades?.(settings.cascades);
-    field.setContinuous?.(settings.continuous);
-    field.setJitterMode?.(settings.jitterMode);
-    field.setHysteresis?.(settings.hysteresis);
-    field.setHysteresisNormalization?.(settings.hysteresisNormalize);
-    field.setNormalBias?.(settings.normalBias);
-    field.setRadianceClamp?.(settings.radianceClamp);
-    field.setDepthSharpness?.(settings.depthSharpness);
-    field.setChebyStrength?.(settings.cheby);
-    field.setClassifyStrength?.(settings.classify);
-    field.setFilterStrength?.(settings.filter);
-    field.setSmoothness?.(settings.smoothness);
-    // The probe-field wrapper names this setNormalDetail (it forwards to the
-    // node's setDetailStrength) — the old optional-chained name was a no-op.
-    (field.setNormalDetail ?? field.setDetailStrength)?.call(field, settings.detail);
-    field.setReflectionIntensity?.(settings.reflectionIntensity);
-    field.setChangeThreshold?.(settings.changeThreshold);
-    field.setSnapAmount?.(settings.snapAmount);
-    field.setFireflyClamp?.(settings.fireflyClamp);
-}
-
-async function createSnapshotSpeedballGi({ renderer, scene, snapshotUi } = {}) {
-    const settings = normalizeSnapshotSpeedballGiState(snapshotUi);
-    if (!settings?.enabled) return null;
-    const backend = renderer?.backend;
-    if (!(backend?.isWebGPUBackend || backend?.isWebGLBackend) || !renderer?.lighting?.createNode) return null;
     try {
-        // Live max.js always compiles through MaxLightsNode. Snapshot parity must
-        // use that same lighting graph even when the portable Studio block has no
-        // active links/paint; Speedball's generic GiLightsNode is intentionally a
-        // library fallback, not the max.js runtime contract. This still lands
-        // before the snapshot's first scene render/compile.
-        if (renderer.lighting.createNode?.maxjsAdaptiveLighting !== true) {
-            const { installMaxLightsRenderer } = await import('./max_lights_node.js');
-            if (!installMaxLightsRenderer(renderer)) {
-                console.warn('[snapshot_boot] Speedball GI needs the max.js node lighting graph');
-                return null;
-            }
-        }
-
-        const { createProbeField } = await import('speedball-gi');
-        const field = createProbeField({
+        const [{ createLightProbeSystem }, { installHdriDiffuseSplit }] = await Promise.all([
+            import('./light_probes.js'),
+            renderer.isWebGPURenderer ? import('./environment_lighting.js') : Promise.resolve({}),
+        ]);
+        const hdriDiffuse = renderer.isWebGPURenderer ? THREE.TSL.uniform(1.0) : null;
+        if (hdriDiffuse) installHdriDiffuseSplit(hdriDiffuse);
+        const probes = createLightProbeSystem({
             renderer,
             scene,
-            intensity: settings.intensity,
-            hysteresis: settings.hysteresis,
-            jitterMode: settings.jitterMode,
-            reflectionQuality: settings.reflectionQuality,
-            divisions: settings.divisions,
-            autoPadding: settings.autoPadding,
-            roughReflections: settings.roughReflections,
-            reflectionIntensity: settings.reflectionIntensity,
-            onRebuilt: () => markSnapshotSpeedballGiMaterialsDirty(scene),
+            getBakeBackground: () => (scene.background ? null : scene.environment ?? null),
+            onUpdated: (grids) => {
+                if (hdriDiffuse) hdriDiffuse.value = grids.length > 0 ? 0 : 1;
+            },
         });
-        applySnapshotSpeedballGiSettings(field, settings);
-        const volumes = snapshotSpeedballVolumeBoxes(settings.volumes);
-        if (volumes.length) field.setVolumes(volumes);
-        field.setEnabled(true);
-        field.markTopologyDirty?.();
-        let warmupPasses = 0;
-        let tickPending = false;
-        let updateFailureWarned = false;
-        // Each accepted tick blends only (1 - hysteresis) of its solve into the
-        // probe atlas, so "cascades + 1" passes leaves the field at a few
-        // percent of its converged radiance — the snapshot rendered as if GI
-        // (and the rough-reflection composite, filled by the same ticks) were
-        // off. The editor only looks right because it keeps ticking while
-        // idle; an auto-playing snapshot timeline never grants that idle, so
-        // warm up until the exponential blend has actually converged (~97%)
-        // before handing control to the editor-parity idle/playing gate.
-        const warmupHysteresis = Math.min(0.99, Math.max(0.5, settings.hysteresis));
-        const requiredWarmupPasses = Math.max(
-            (settings.cascades === 2 ? 2 : 1) + 1,
-            Math.min(240, Math.ceil(Math.log(0.03) / Math.log(warmupHysteresis))),
-        );
-
-        // Texture-late retrace: the warmup above can converge against a scene
-        // whose material maps are still streaming — the trace then bounces off
-        // untextured (bright) surfaces, and once the timeline gate takes over
-        // the probes hold that washed-out field forever ("snapshot GI is
-        // flat"). Every time the shared loader queue drains, re-trace and
-        // re-run the warmup so the converged field reflects the textured
-        // scene. Fires rarely (queue drains are coarse) and each pass rides
-        // the same warmup path, so this never churns a settled field.
-        const loadingManager = THREE.DefaultLoadingManager;
-        const priorOnLoad = loadingManager.onLoad;
-        let loadHookInstalled = true;
-        const onTexturesSettled = () => {
-            if (typeof priorOnLoad === 'function') priorOnLoad();
-            warmupPasses = 0;
-            field.markTopologyDirty?.();
-        };
-        loadingManager.onLoad = onTexturesSettled;
-
+        probes.setSettings(exported.settings);
+        probes.setVolumes(exported.volumes);
+        await probes.bakeNow();
         return {
-            field,
-            settings,
-            update() {
-                if (!field.isSupported?.() || tickPending) return;
-                const nowMs = performance.now();
-                const timelineUpdateMs = maxTimeline.lastUpdateMs?.();
-                const timelineIdleMs = Number.isFinite(timelineUpdateMs) && timelineUpdateMs > 0
-                    ? nowMs - timelineUpdateMs
-                    : Number.POSITIVE_INFINITY;
-                const warmingUp = warmupPasses < requiredWarmupPasses;
-                tickPending = true;
-                void field.tick({
-                    idleMs: warmingUp ? Number.POSITIVE_INFINITY : timelineIdleMs,
-                    playing: !warmingUp && maxTimeline.playing?.() === true,
-                }).then(() => {
-                    if (field.hasData?.() && warmupPasses < requiredWarmupPasses) warmupPasses += 1;
-                }).catch((error) => {
-                    if (updateFailureWarned) return;
-                    updateFailureWarned = true;
-                    console.warn('[snapshot_boot] Speedball GI update failed', error);
-                }).finally(() => {
-                    tickPending = false;
-                });
-            },
-            requestRebuild() {
-                field.markTopologyDirty?.();
-            },
-            dispose() {
-                if (loadHookInstalled && loadingManager.onLoad === onTexturesSettled) {
-                    loadingManager.onLoad = priorOnLoad ?? undefined;
-                }
-                loadHookInstalled = false;
-                try { field.dispose?.(); } catch {}
-            },
+            system: probes,
+            requestBake: () => probes.requestBake(),
+            update: () => probes.update(),
+            dispose: () => probes.dispose(),
         };
     } catch (error) {
-        console.warn('[snapshot_boot] Speedball GI snapshot replay failed', error);
+        console.warn('[snapshot_boot] light probes unavailable', error);
         return null;
     }
 }
@@ -1957,37 +1709,16 @@ async function bindLayerProject(root, meta, layerManager, runtimeState) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-async function createSnapshotNirSensingController({
-    maxjsFx,
-    layerManager,
-    speedballGi,
-} = {}) {
-    // Keep Speedball out of minimal snapshot startup. PowerShot and/or the
-    // probe field are the only standalone consumers of its shared IR gates.
-    if (typeof maxjsFx?.getPowerShotOptions !== 'function' && !speedballGi?.field) {
-        return { sync() {}, dispose() {} };
-    }
-
-    let setNirDirectSensing = null;
-    let setNirIlluminatorGain = null;
-    try {
-        ({ setNirDirectSensing, setNirIlluminatorGain } = await import('speedball-gi'));
-    } catch (error) {
-        console.warn('[snapshot_boot] NIR sensing controls unavailable', error);
-    }
-
-    let disposed = false;
+// PowerShot infrared / NightShot sense NIR: IR illuminators light up and
+// ctx.spectral materials swap to their NIR albedo (ir_emitters.js).
+function createSnapshotNirSensingController({ maxjsFx, layerManager, lights, onIrChange } = {}) {
+    const syncIrEmitters = createIrEmitterGate();
     const apply = (sensing, gain) => {
-        setNirDirectSensing?.(sensing);
-        setNirIlluminatorGain?.(gain);
-        speedballGi?.field?.setNirSensing?.(sensing);
-        speedballGi?.field?.setNirGain?.(gain);
+        if (syncIrEmitters(lights(), sensing, gain)) onIrChange?.();
         layerManager?.setSpectralRasterSensing?.(sensing);
     };
-
     return {
         sync() {
-            if (disposed) return;
             const powerShot = maxjsFx?.getPowerShotOptions?.() ?? {};
             const sensing = maxjsFx?.isPowerShotEnabled?.() === true
                 && (powerShot.mode === 'infrared' || powerShot.mode === 'nightshot');
@@ -1995,10 +1726,6 @@ async function createSnapshotNirSensingController({
             apply(sensing, Number.isFinite(rawGain) ? Math.max(0, rawGain) : 1);
         },
         dispose() {
-            if (disposed) return;
-            disposed = true;
-            // These are module-shared uniforms. Reset them so disposing one
-            // player cannot leak NIR state into a later snapshot on the page.
             apply(false, 1);
         },
     };
@@ -2021,15 +1748,16 @@ async function startRenderLoop({
     studioLighting,
     enforceHiddenSources,
     fpsCap,
+    lights,
 }) {
-    const nirSensing = await createSnapshotNirSensingController({
+    const nirSensing = createSnapshotNirSensingController({
         maxjsFx,
         layerManager,
-        speedballGi: optionalModules?.speedballGi,
+        lights,
+        onIrChange: () => optionalModules?.lightProbes?.requestBake(),
     });
-    // Set the sensed band before the shadow warmup render and pipeline warm-up.
-    // Otherwise true IR lights are correctly black in RGB and the first
-    // standalone frame compiles/renders as an unilluminated visible scene.
+    // Set the sensed band before the shadow warmup render and pipeline warm-up,
+    // so the first frame is lit by the IR illuminators the imager sees.
     nirSensing.sync();
     let lastTimeMs = performance.now();
     let elapsed = 0;
@@ -2135,11 +1863,6 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
 
     // Phase 2: renderer
     const renderer = await createRenderer(canvas, features, meta.snapshotUi);
-    // True IR emitters are deliberately black in RGB. Install the sensed-band
-    // light graph whenever the payload declares one, independent of GI/Studio;
-    // PowerShot's NIR gate then reveals it only in infrared/nightshot modes.
-    // This must happen before scene materials see their first lighting compile.
-    await installSnapshotIrLightGraph(renderer, meta.lights);
     let studioModule = null;
     if (meta.snapshotUi?.studio) {
         try {
@@ -2361,12 +2084,12 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
     (optionalModules.maxjsFx ?? optionalModules.ssgiFx)?.notifyEnvironmentChanged?.();
     syncDefaultLights();
 
-    const snapshotSpeedballGi = await createSnapshotSpeedballGi({
+    const snapshotLightProbes = await createSnapshotLightProbes({
         renderer,
         scene,
         snapshotUi: meta.snapshotUi,
     });
-    if (snapshotSpeedballGi) optionalModules.speedballGi = snapshotSpeedballGi;
+    if (snapshotLightProbes) optionalModules.lightProbes = snapshotLightProbes;
 
     // Phase 7b: top-level camera state. Lives at meta.camera independently
     // of snapshotUi (which is gated by the "Viewer UI State" export toggle
@@ -2466,6 +2189,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);
         },
         fpsCap: meta.snapshotUi?.performance?.fpsCap,
+        lights: () => lightHandleMap.values(),
     });
 
     return {
@@ -2481,8 +2205,8 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
         // options apply live, so site-side motion (zoom focus pulls) can drive
         // them per frame without touching the pipeline.
         postFx: optionalModules.maxjsFx ?? optionalModules.ssgiFx ?? null,
-        // Runtime games use the existing field for material/transform change packets.
-        speedballGi: optionalModules.speedballGi?.field ?? null,
+        // Probe grids rebake on rebuild requests; runtime games can call it after edits.
+        lightProbes: optionalModules.lightProbes?.system ?? null,
         animationSystem, maxTimeline,
         resize,
         // Re-run the async pipeline warm-up against the live loop (see
@@ -2493,7 +2217,7 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             enforceRuntimeHiddenSources(runtimeSceneState.hiddenSourceHandles, nodeMap);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
-            optionalModules.speedballGi?.requestRebuild?.();
+            optionalModules.lightProbes?.requestBake();
             return result;
         },
         applyLights: (lightsData) => {
@@ -2501,23 +2225,23 @@ export async function boot({ root = '.', canvas, options = {} } = {}) {
             authoredLightCount = countVisibleLightPayload(lightsData);
             studioLighting?.refreshSceneBindings?.();
             syncDefaultLights();
-            optionalModules.speedballGi?.requestRebuild?.();
+            optionalModules.lightProbes?.requestBake();
             return r;
         },
         setEnvironmentEnabled: (enabled) => {
             const state = snapshotEnvironment.setEnabled(enabled);
             syncDefaultLights();
-            optionalModules.speedballGi?.requestRebuild?.();
+            optionalModules.lightProbes?.requestBake();
             return state;
         },
         setEnvironmentVisible: (visible) => {
             const state = snapshotEnvironment.setBackgroundVisible(visible);
-            optionalModules.speedballGi?.requestRebuild?.();
+            optionalModules.lightProbes?.requestBake();
             return state;
         },
         setEnvironmentBackgroundVisible: (visible) => {
             const state = snapshotEnvironment.setBackgroundVisible(visible);
-            optionalModules.speedballGi?.requestRebuild?.();
+            optionalModules.lightProbes?.requestBake();
             return state;
         },
         dispose() {

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { INFRARED_PRESETS, INFRARED_PRESET_KEYS } from '../web/vendor/powershot-threejs/infrared.js';
 
 const sourceUrl = new URL('../web/js/editor/postfx_glue.js', import.meta.url);
 const source = await readFile(sourceUrl, 'utf8');
@@ -52,17 +53,7 @@ const makeNormalizer = new Function(
     `${normalizerSource.replace('export function', 'function')}
     return normalizePowerShotInfraredPreset;`,
 );
-const normalizeInfraredPreset = makeNormalizer({
-    white_phosphor: { input_mode: 'rgb' },
-    white_phosphor_nir: { input_mode: 'nir' },
-    gen3_white_phosphor: { input_mode: 'rgb' },
-    gen3_white_phosphor_nir: { input_mode: 'nir' },
-}, [
-    'white_phosphor',
-    'white_phosphor_nir',
-    'gen3_white_phosphor',
-    'gen3_white_phosphor_nir',
-]);
+const normalizeInfraredPreset = makeNormalizer(INFRARED_PRESETS, INFRARED_PRESET_KEYS);
 assert.equal(
     normalizeInfraredPreset('white_phosphor'),
     'gen3_white_phosphor_nir',
@@ -84,6 +75,18 @@ assert.doesNotMatch(
     'restore stays free of one-off legacy infrared migration branches',
 );
 
+assert.equal(normalizeInfraredPreset('aura_nir'), 'aura_nir', 'Aura survives host normalization');
+assert.equal(normalizeInfraredPreset('oculography'), 'oculography', 'Oculography remains selectable');
+assert.equal(normalizeInfraredPreset('aura'), 'gen3_white_phosphor_nir', 'RGB Aura is not fed true NIR');
+
+const listSource = adapterSource.match(/export function listPowerShotInfraredPresets\(\)[\s\S]+?^}/m)?.[0];
+assert.ok(listSource, 'profile menu function remains testable');
+const listProfiles = new Function('POWERSHOT_INFRARED_PRESETS', 'POWERSHOT_INFRARED_PRESET_KEYS',
+    `${listSource.replace('export function', 'function')} return listPowerShotInfraredPresets();`);
+const profiles = listProfiles(INFRARED_PRESETS, INFRARED_PRESET_KEYS);
+assert.ok(profiles.some(p => p.key === 'aura_nir' && p.label === 'Aura · Lavender Pearl'));
+assert.ok(profiles.some(p => p.key === 'oculography'));
+assert.ok(profiles.every(p => INFRARED_PRESETS[p.key].input_mode === 'nir'));
 const exposureHelpersSource = adapterSource.match(
     /function exposureLinearToStops[\s\S]+?(?=\r?\nexport function normalizePowerShotPreset)/,
 )?.[0];
@@ -216,7 +219,7 @@ const powershot = {
     filmWeave: 0.44,
     filmFlicker: 0.15,
     filmNegative: true,
-    infraredPreset: 'gen3_white_phosphor_nir',
+    infraredPreset: 'aura_nir',
     irIlluminator: 1.35,
     irExposure: -0.55,
     irInputGamma: 1.13,

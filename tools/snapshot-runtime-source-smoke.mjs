@@ -121,8 +121,12 @@ assert.match(nirSensingReplay, /createIrEmitterGate\(\)/,
     'snapshot NIR replay gates IR illuminators like the editor');
 assert.match(nirSensingReplay, /powerShot\.mode === 'infrared'.*powerShot\.mode === 'nightshot'/s,
     'standalone sensing follows the same PowerShot imager modes as the editor');
-assert.match(nirSensingReplay, /\bsetSpectralRasterSensing\b/,
-    'snapshot NIR replay drives ctx.spectral raster sensing');
+assert.match(nirSensingReplay, /import\('\.\/nir_band_view\.js'\)/,
+    'snapshot NIR replay loads the NIR band view on first use');
+assert.match(nirSensingReplay, /renderer\?\.isWebGPURenderer !== true/,
+    'the band view runs on node renderers only');
+assert.match(nirSensingReplay, /setPowerShotNirBands\?\.\(active\)[\s\S]*setSuspended\?\.\(active\)/,
+    'band rendering switches the imager to band input and suspends visible-band probe GI');
 assert.match(snapshotFxSource, /getPowerShotOptions\(\)\s*\{\s*return state\.powershot;/,
     'snapshot PowerShot exposes its active imager state to the frame driver');
 const snapshotLoop = functionBody('async function startRenderLoop(');

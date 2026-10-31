@@ -88,15 +88,16 @@ function createRenderLoop(deps = {}) {
             if (perfHudActive) deps.perfHud.updateLayers(deps.layerManager.getStats());
             deps.maxjsFx.applySharedSceneEffects?.();
             deps.removeWebGPUIncompatibleSceneMaterials();
-            // PowerShot infrared / NightShot sense NIR: IR illuminators light up and
-            // ctx.spectral materials swap to their NIR albedo. Re-applied every frame
-            // because light sync rewrites colors; a sensed change rebakes the probes.
+            // PowerShot infrared / NightShot sense NIR: IR illuminators light up and,
+            // on node renderers, the scene renders as three NIR bands for the imager
+            // (nir_band_view.js). Re-applied every frame because light sync rewrites
+            // colors; a sensed change rebakes the probes.
             const psOptions = deps.maxjsFx.getPowerShotOptions?.();
             const nirSensing = deps.maxjsFx.isPowerShotEnabled?.() === true
                 && (psOptions?.mode === 'infrared' || psOptions?.mode === 'nightshot');
             const irGain = Number.isFinite(Number(psOptions?.irIlluminator)) ? Number(psOptions.irIlluminator) : 1;
             if (syncIrEmitters(deps.lightHandleMap.values(), nirSensing, irGain)) deps.scheduleLightProbeFromCurrentScene();
-            deps.layerManager?.setSpectralRasterSensing?.(nirSensing);
+            deps.nirBandView.setActive(nirSensing && deps.renderer.isWebGPURenderer === true && !deps.isPathTracingViewActive());
             // Probe bakes render the scene, so they run before this frame's draw.
             if (!deps.isPathTracingViewActive()) deps.updateLightProbes();
             const renderStart = performance.now();
@@ -105,6 +106,7 @@ function createRenderLoop(deps = {}) {
             // draw, restored after draw so authored state is what the rest of
             // the system sees between frames.
             deps.layerManager.beforeRender?.(frameElapsed);
+            deps.nirBandView.beforeRender();
             // Pipeline active → analytic mask (occluder meshes hidden);
             try {
                 if (deps.isPathTracingViewActive() && (!deps.renderToImageActive || deps.pendingRenderToImage?.pathTracing)) {
@@ -165,6 +167,7 @@ function createRenderLoop(deps = {}) {
             } catch (error) {
                 deps.reportBridgeError('runtime error', error);
             } finally {
+                deps.nirBandView.afterRender();
                 deps.layerManager.afterRender?.(frameElapsed);
             }
             if (gateFirstFrame) sceneLoadGate.end('rendered');

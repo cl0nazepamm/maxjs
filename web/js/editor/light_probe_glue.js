@@ -28,6 +28,7 @@ function createLightProbeGlue(deps = {}) {
     let settings = normalizeLightProbeSettings();
     let rebakeTimer = 0;
     let gridActive = false;
+    let suspended = false;
     let lightmapBaker = null;
     let lightmapBakerPromise = null;
     let lightmapCount = 0;
@@ -120,7 +121,7 @@ function createLightProbeGlue(deps = {}) {
     }
 
     function applyLightProbeState() {
-        const enabled = deps.lightProbeEnabled && !deps.isHdriReflectionOnlyEffective();
+        const enabled = deps.lightProbeEnabled && !deps.isHdriReflectionOnlyEffective() && !suspended;
         probes.setEnabled(enabled);
         const nextGridActive = enabled && probes.grids.length > 0;
         deps.lightProbe.intensity = enabled && !nextGridActive ? deps.lightProbeIntensity : 0;
@@ -129,6 +130,15 @@ function createLightProbeGlue(deps = {}) {
             deps.onLightProbeGridActiveChanged?.(gridActive);
             startLightmapBake();
         }
+    }
+
+    // The NIR band view suspends probe GI: grids and GI lightmaps hold light
+    // baked in the visible band. The user's toggle is untouched.
+    function setLightProbesSuspended(on) {
+        const next = on === true;
+        if (next === suspended) return;
+        suspended = next;
+        applyLightProbeState();
     }
 
     function clearLightProbe() {
@@ -267,6 +277,7 @@ function createLightProbeGlue(deps = {}) {
         serializeRelayProbeGrids,
         isLightProbeGridActive,
         applyLightProbeState,
+        setLightProbesSuspended,
         clearLightProbe,
         markLightProbeMaterialsDirty,
         rebakeLightProbes,

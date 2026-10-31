@@ -1,5 +1,6 @@
         import * as THREE from 'three';
         import { installHdriDiffuseSplit } from '../environment_lighting.js';
+        import { createNirBandView } from '../nir_band_view.js';
         import * as THREE_STD from 'three-std';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
         import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
@@ -1267,6 +1268,7 @@
             serializeRelayProbeGrids,
             isLightProbeGridActive,
             applyLightProbeState,
+            setLightProbesSuspended,
             clearLightProbe,
             markLightProbeMaterialsDirty,
             rebakeLightProbes,
@@ -1277,6 +1279,15 @@
             serializeSnapshotLightProbes,
             updateLightProbes,
         } = lightProbeGlue;
+        // While PowerShot infrared / NightShot sense NIR the scene renders as three
+        // NIR bands; probe GI baked in visible light sits out.
+        const nirBandView = createNirBandView({
+            scene,
+            onActiveChange: (active) => {
+                maxjsFx.setPowerShotNirBands(active);
+                setLightProbesSuspended(active);
+            },
+        });
         notifyMaterialStructureChanged = () => {
             scheduleLightProbeFromCurrentScene();
             schedulePathTracingLiveRebuild('material');
@@ -2464,6 +2475,7 @@
         })();
 
         const renderLoop = createRenderLoop({
+            nirBandView,
             flushMaterialDisposals: (...args) => flushMaterialDisposals(...args),
             syncOrbitNavigationFeel: (...args) => syncOrbitNavigationFeel(...args),
             scheduleLightProbeFromCurrentScene,

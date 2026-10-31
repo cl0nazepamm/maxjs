@@ -1215,6 +1215,10 @@ export function createMaxJSFxController({
         isPowerShotEnabled() {
             return state.powershot.enabled;
         },
+        // The scene renders as three NIR bands (nir_band_view.js); the imager collapses them.
+        setPowerShotNirBands(on) {
+            powerShotFinal.setNirBands(on);
+        },
         setPowerShotEnabled(enabled) {
             if (enabled && isShaderLabEnabled()) {
                 lastError = 'PowerShot is unavailable while Shader Lab is active.';

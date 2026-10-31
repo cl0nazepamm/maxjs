@@ -2020,7 +2020,6 @@ export function createLayerManager({
         afterRender,
         // Raster NV band swap for ctx.spectral tags (see layer_spectral.js) —
         // render loop drives this from the white-phosphor sensing state.
-        setSpectralRasterSensing: (on) => spectralMaterialSystem.setRasterSensing(on),
         getLayerCode,
         serializeSnapshot,
         restoreTransformOverrides: restoreRuntimeTransformOverrides,

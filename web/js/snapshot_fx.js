@@ -64,6 +64,7 @@ export async function createSnapshotFx({
     let shaderLabFx = null;
     let shaderLabFinal = null;
     let powerShotFinal = null;
+    let powerShotNirBands = false; // applied once the final stage exists
 
     function isShaderLabEnabled() {
         return !!shaderLabFinal?.isEnabled();
@@ -115,6 +116,7 @@ export async function createSnapshotFx({
                     ? core.ctx.scenePass?.getTexture?.('depth') || null
                     : null),
             });
+            powerShotFinal.setNirBands(powerShotNirBands);
         } catch (error) {
             console.warn('[snapshot_fx] PowerShot module init failed', error);
         }
@@ -351,6 +353,11 @@ export async function createSnapshotFx({
         // the same sensed band before it renders.
         getPowerShotOptions() {
             return state.powershot;
+        },
+        // The scene renders as three NIR bands (nir_band_view.js); the imager collapses them.
+        setPowerShotNirBands(on) {
+            powerShotNirBands = on === true;
+            powerShotFinal?.setNirBands(powerShotNirBands);
         },
         setEnvironmentVisible(visible) {
             envVisible = visible !== false;

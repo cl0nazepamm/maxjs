@@ -378,11 +378,17 @@ still one Three.js material, so its NIR value changes everywhere it is used.
 Material name selectors check both the current Three material name and the
 original Max material name retained by baked/runtime replacements.
 
-While PowerShot infrared or NightShot senses NIR, a tagged material's diffuse
-color becomes grey at its `nirAlbedo` level; a TSL material can instead provide
-`userData.maxjsNirColorNode` / `maxjsNirEmissiveNode` for the NIR pass. Lights
-whose `emitterClass` marks them as IR illuminators stay black until then and
-light at white × the PowerShot illuminator gain.
+While PowerShot infrared or NightShot senses NIR, node renderers draw the scene
+as three NIR bands (`web/js/nir_band_view.js`, PowerShot's `createNirBand`) and
+the imager collapses them (`setNirBands`). Each material keeps its colour and
+maps up to the red edge and takes its `nirAlbedo` level past it; an untagged
+material falls back to `classifyNir`, then to the Jakob-Hanika extrapolation of
+its colour. A TSL material can give per-pixel levels as
+`userData.maxjsNirColorNode` (reflectance) / `maxjsNirEmissiveNode` (emission).
+Lights, HDRI light, the background and fog take their band spectra, and probe GI
+baked in visible light is suspended. Lights whose `emitterClass` marks them as
+IR illuminators stay black until then and light the 850 nm band at the
+PowerShot illuminator gain.
 
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 

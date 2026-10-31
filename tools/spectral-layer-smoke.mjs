@@ -55,16 +55,17 @@ const system = createSpectralMaterialSystem({
 });
 const spectral = system.createLayerFacade('test', getAdapter);
 
+// Tags only write userData.nirAlbedo; the NIR band view (nir_band_view.js)
+// reads it, and the per-pixel maxjsNir*Node overrides, while the imager senses NIR.
 const eyeNir = spectral.setNirAlbedo({ materials: 'Procedural Eye Ultimate' }, 0.42);
-system.setRasterSensing(true);
-assert.equal(eye.colorNode, nirEyeColorNode);
-assert.equal(eye.emissiveNode, nirEyeEmissiveNode);
-assert.equal(eye.color.value, 0.25, 'a procedural NIR color node must bypass scalar grey');
-assert.equal(eye.needsUpdate, true);
-system.setRasterSensing(false);
-assert.equal(eye.colorNode, visibleEyeColorNode);
+assert.equal(eye.userData.nirAlbedo, 0.42);
+assert.equal(eye.colorNode, visibleEyeColorNode, 'tags never touch the visible nodes');
 assert.equal(eye.emissiveNode, visibleEyeEmissiveNode);
+assert.equal(eye.userData.maxjsNirColorNode, nirEyeColorNode);
+assert.equal(eye.userData.maxjsNirEmissiveNode, nirEyeEmissiveNode);
+assert.equal(eye.color.value, 0.25);
 eyeNir.dispose();
+assert.equal('nirAlbedo' in eye.userData, false, 'disposing restores the untagged material');
 
 const hot = material('Hot_NIR');
 hot.color = color(0.2);
@@ -72,13 +73,10 @@ nodeMap.set(7, object('Hot_Main', 7, 0, hot));
 const hotNir = spectral.setNirAlbedo('Hot*', 2, { max: 8 });
 assert.equal(hotNir.value, 2);
 assert.equal(hotNir.max, 8);
-assert.equal(hot.userData.nirAlbedo, 2);
-system.setRasterSensing(true);
-assert.equal(hot.color.value, 2, 'opt-in HDR NIR must reach the raster material');
+assert.equal(hot.userData.nirAlbedo, 2, 'opt-in HDR NIR reaches the material');
 hotNir.set(20);
 assert.equal(hotNir.value, 8);
-assert.equal(hot.color.value, 8);
-system.setRasterSensing(false);
+assert.equal(hot.userData.nirAlbedo, 8);
 assert.equal(hot.color.value, 0.2);
 hotNir.dispose();
 

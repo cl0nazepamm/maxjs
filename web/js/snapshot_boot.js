@@ -622,12 +622,18 @@ async function createSnapshotLightProbes({ renderer, scene, snapshotUi } = {}) {
         ]);
         const hdriDiffuse = renderer.isWebGPURenderer ? THREE.TSL.uniform(1.0) : null;
         if (hdriDiffuse) installHdriDiffuseSplit(hdriDiffuse);
+        let gridCount = 0;
+        let suspended = false;
+        const syncHdriDiffuse = () => {
+            if (hdriDiffuse) hdriDiffuse.value = gridCount > 0 && !suspended ? 0 : 1;
+        };
         const probes = createLightProbeSystem({
             renderer,
             scene,
             getBakeBackground: () => (scene.background ? null : scene.environment ?? null),
             onUpdated: (grids) => {
-                if (hdriDiffuse) hdriDiffuse.value = grids.length > 0 ? 0 : 1;
+                gridCount = grids.length;
+                syncHdriDiffuse();
             },
         });
         probes.setSettings(exported.settings);
@@ -637,6 +643,12 @@ async function createSnapshotLightProbes({ renderer, scene, snapshotUi } = {}) {
             system: probes,
             requestBake: () => probes.requestBake(),
             update: () => probes.update(),
+            // The NIR band view suspends grids baked in the visible band.
+            setSuspended(on) {
+                suspended = on === true;
+                probes.setEnabled(!suspended);
+                syncHdriDiffuse();
+            },
             dispose: () => probes.dispose(),
         };
     } catch (error) {
@@ -1709,15 +1721,39 @@ async function bindLayerProject(root, meta, layerManager, runtimeState) {
 }
 
 // ─── Phase 10: render loop ────────────────────────────────────────────
-// PowerShot infrared / NightShot sense NIR: IR illuminators light up and
-// ctx.spectral materials swap to their NIR albedo (ir_emitters.js).
-function createSnapshotNirSensingController({ maxjsFx, layerManager, lights, onIrChange } = {}) {
+// PowerShot infrared / NightShot sense NIR: IR illuminators light up
+// (ir_emitters.js) and, on node renderers, the scene renders as three NIR bands
+// for the imager (nir_band_view.js, loaded on first use).
+function createSnapshotNirSensingController({ maxjsFx, renderer, scene, lights, onIrChange, getLightProbes } = {}) {
     const syncIrEmitters = createIrEmitterGate();
-    const apply = (sensing, gain) => {
-        if (syncIrEmitters(lights(), sensing, gain)) onIrChange?.();
-        layerManager?.setSpectralRasterSensing?.(sensing);
+    let sensing = false;
+    let bandView = null;
+    let bandViewLoading = null;
+    const syncBandView = () => {
+        if (bandView) {
+            bandView.setActive(sensing);
+            return;
+        }
+        if (!sensing || renderer?.isWebGPURenderer !== true) return;
+        bandViewLoading ??= import('./nir_band_view.js').then(({ createNirBandView }) => {
+            bandView = createNirBandView({
+                scene,
+                onActiveChange: (active) => {
+                    maxjsFx?.setPowerShotNirBands?.(active);
+                    getLightProbes?.()?.setSuspended?.(active);
+                },
+            });
+            bandView.setActive(sensing);
+        }).catch((error) => console.warn('[snapshot_boot] NIR band view unavailable', error));
+    };
+    const apply = (next, gain) => {
+        sensing = next;
+        if (syncIrEmitters(lights(), next, gain)) onIrChange?.();
+        syncBandView();
     };
     return {
+        beforeRender: () => bandView?.beforeRender(),
+        afterRender: () => bandView?.afterRender(),
         sync() {
             const powerShot = maxjsFx?.getPowerShotOptions?.() ?? {};
             const sensing = maxjsFx?.isPowerShotEnabled?.() === true
@@ -1727,6 +1763,7 @@ function createSnapshotNirSensingController({ maxjsFx, layerManager, lights, onI
         },
         dispose() {
             apply(false, 1);
+            bandView?.dispose();
         },
     };
 }
@@ -1752,9 +1789,11 @@ async function startRenderLoop({
 }) {
     const nirSensing = createSnapshotNirSensingController({
         maxjsFx,
-        layerManager,
+        renderer,
+        scene,
         lights,
         onIrChange: () => optionalModules?.lightProbes?.requestBake(),
+        getLightProbes: () => optionalModules?.lightProbes,
     });
     // Set the sensed band before the shadow warmup render and pipeline warm-up,
     // so the first frame is lit by the IR illuminators the imager sees.
@@ -1792,6 +1831,7 @@ async function startRenderLoop({
         nirSensing.sync();
 
         layerManager?.beforeRender?.(elapsed);
+        nirSensing.beforeRender();
         try {
             // Snapshot boot keeps the conservative FX gate; advanced live-viewer
             // post stacks are intentionally not replayed in deploy snapshots.
@@ -1801,6 +1841,7 @@ async function startRenderLoop({
                 renderer.render(scene, camera);
             }
         } finally {
+            nirSensing.afterRender();
             layerManager?.afterRender?.(elapsed);
         }
     };

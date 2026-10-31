@@ -227,6 +227,8 @@ export function createPowerShotFinal({
     let infraredPipeline = null;
     let infraredProfileKey = null;
     let nightshotPipeline = null;
+    // The scene arrives as three NIR bands (nir_band_view.js) while the imager senses NIR.
+    let nirBands = false;
     let flarePipeline = null;
     let flareProfilePromise = null;
     let flareTarget = null;
@@ -494,6 +496,7 @@ export function createPowerShotFinal({
         I.exposure.value = p.irExposure;
         I.inputGamma.value = p.irInputGamma;
         infraredPipeline.setInputResponse(p.irResponse, preset.flux_scale ?? 1.0);
+        infraredPipeline.setNirBands(nirBands);
         I.localGain.value = p.irLocalGain;
         I.glowStrength.value = p.irGlow;
         I.glowThreshold.value = p.irGlowThreshold;
@@ -522,6 +525,7 @@ export function createPowerShotFinal({
             p.irResponse,
             POWERSHOT_NIGHTSHOT_PRESETS.nightshot_plus.ir.flux_scale ?? 1.0,
         );
+        nightshotPipeline.ir.setNirBands(nirBands);
         I.noiseAmount.value = p.irNoise;
         // PowerShot <=0.6.1 added the NightShot hotspot as constant green
         // emission, lifting black across most of the frame. Newer pipelines
@@ -744,6 +748,11 @@ export function createPowerShotFinal({
         syncPipeline,
         renderFinal,
         hasPipeline: () => !!powerShotPipeline || !!filmPipeline || !!infraredPipeline || !!nightshotPipeline,
+        setNirBands(on) {
+            nirBands = on === true;
+            infraredPipeline?.setNirBands(nirBands);
+            nightshotPipeline?.ir.setNirBands(nirBands);
+        },
         dispose() {
             disposePipelines();
             powerShotFrame = 0;

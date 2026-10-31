@@ -5,11 +5,6 @@ import { freezePlainObject } from './layer_utils.js';
 
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
-const RASTER_NIR_NODE_BINDINGS = Object.freeze([
-    ['colorNode', 'maxjsNirColorNode'],
-    ['emissiveNode', 'maxjsNirEmissiveNode'],
-]);
-
 function materialsOf(mesh) {
     return Array.isArray(mesh?.material) ? mesh.material : (mesh?.material ? [mesh.material] : []);
 }
@@ -103,62 +98,6 @@ export function createSpectralMaterialSystem({
     let nextEntryId = 1;
     let nextOrder = 1;
     let nextScanAt = 0;
-    // Raster NV band swap: while the imager senses NIR, a TAGGED material's
-    // diffuse scalar becomes grey at its authored NIR level. TSL materials may
-    // additionally provide per-pixel `userData.maxjsNirColorNode` and
-    // `maxjsNirEmissiveNode`; those replace the visible nodes only for the NIR
-    // pass.
-    let rasterSensing = false;
-
-    function applyRasterSwap(material, state, value) {
-        const hasScalarColor = material?.color?.isColor === true;
-        const hasNodeOverride = RASTER_NIR_NODE_BINDINGS.some(([, userDataKey]) =>
-            material?.userData?.[userDataKey] != null);
-        if (!hasScalarColor && !hasNodeOverride) return;
-        if (!state.rasterSaved) {
-            state.rasterSaved = true;
-            state.savedColor = hasScalarColor ? material.color.clone() : null;
-        }
-
-        state.savedRasterNodes ??= {};
-        let nodeChanged = false;
-        let hasNirColorNode = false;
-        for (const [materialKey, userDataKey] of RASTER_NIR_NODE_BINDINGS) {
-            const nirNode = material.userData?.[userDataKey];
-            if (nirNode == null) continue;
-            if (materialKey === 'colorNode') hasNirColorNode = true;
-            if (!hasOwn(state.savedRasterNodes, materialKey)) {
-                state.savedRasterNodes[materialKey] = material[materialKey];
-            }
-            if (material[materialKey] === nirNode) continue;
-            material[materialKey] = nirNode;
-            nodeChanged = true;
-        }
-        if (nodeChanged) material.needsUpdate = true;
-        if (!hasNirColorNode && hasScalarColor) {
-            // Entries default to physical 0..1 reflectance, but an explicit
-            // options.max may opt into artistic HDR NIR response.
-            material.color.setScalar(Math.max(0, value));
-        }
-    }
-
-    function clearRasterSwap(material, state) {
-        if (!state?.rasterSaved) return;
-        state.rasterSaved = false;
-        let nodeChanged = false;
-        for (const [materialKey] of RASTER_NIR_NODE_BINDINGS) {
-            if (!hasOwn(state.savedRasterNodes ?? {}, materialKey)) continue;
-            if (material?.[materialKey] !== state.savedRasterNodes[materialKey]) {
-                material[materialKey] = state.savedRasterNodes[materialKey];
-                nodeChanged = true;
-            }
-        }
-        if (nodeChanged && material) material.needsUpdate = true;
-        if (material?.color?.isColor && state.savedColor) material.color.copy(state.savedColor);
-        state.savedColor = null;
-        state.savedRasterNodes = null;
-    }
-
     function nodeSpecMatches(spec, handle, object, getAdapter) {
         if (!spec) return true;
         switch (spec.kind) {
@@ -227,12 +166,10 @@ export function createSpectralMaterialSystem({
         }
         material.userData ??= {};
         if (winner) {
-            if (rasterSensing) applyRasterSwap(material, state, winner.value);
             if (material.userData.nirAlbedo === winner.value) return false;
             material.userData.nirAlbedo = winner.value;
             return true;
         }
-        clearRasterSwap(material, state);
         let changed = false;
         if (state.hadOwn) {
             changed = material.userData.nirAlbedo !== state.baseline;
@@ -425,36 +362,6 @@ export function createSpectralMaterialSystem({
         }
     }
 
-    // Flip the raster band swap for every currently-tagged material. Driven
-    // per-frame by the render loop from the NV sensing state — cheap no-op
-    // when unchanged. Winner resolution matches applyMaterialState (highest
-    // order wins), so overlapping entries swap to the same value they tag.
-    function setRasterSensing(on) {
-        const next = on === true;
-        if (next === rasterSensing) return false;
-        rasterSensing = next;
-        const seen = new Set();
-        for (const entry of entries.values()) {
-            if (entry.disposed) continue;
-            for (const material of entry.materialCounts.keys()) {
-                if (seen.has(material)) continue;
-                seen.add(material);
-                const state = materialStates.get(material);
-                if (!state) continue;
-                if (next) {
-                    let winner = null;
-                    for (const a of state.assignments.values()) {
-                        if (!winner || a.order > winner.order) winner = a;
-                    }
-                    if (winner) applyRasterSwap(material, state, winner.value);
-                } else {
-                    clearRasterSwap(material, state);
-                }
-            }
-        }
-        return true;
-    }
-
     function createLayerFacade(layerId, getAdapter, isActive = () => true) {
         return freezePlainObject({
             setNirAlbedo(selector, value, options = {}) {
@@ -480,5 +387,5 @@ export function createSpectralMaterialSystem({
         });
     }
 
-    return { createLayerFacade, update, disposeLayer, setRasterSensing };
+    return { createLayerFacade, update, disposeLayer };
 }

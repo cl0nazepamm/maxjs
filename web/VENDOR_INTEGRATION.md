@@ -3,7 +3,7 @@
 - Three.js: `0.187.0` in `vendor/three-r187` (stock build; four addon patches listed in `THREE_MIGRATION.md`).
 - three-gpu-pathtracer: `main` at `1df8ec7b8a` (unreleased r187 port) in `vendor/three-gpu-pathtracer`; the editor's path tracing view only. `src/` is upstream except that `webgpu/nodes/aux.wgsl.js` is renamed `auxBuffers.wgsl.js` (imports updated): `aux` is a reserved Windows device name, which Git for Windows refuses to add or check out.
 - three-mesh-bvh: `0.9.17` from `web/node_modules` (the path tracer's peer; also mapped for runtime layers in snapshots).
-- PowerShot: `0.10.0`; runtime modules and the flare atlas match `PowerShot-threejs/src`, including its uncommitted Aura infrared profile and the NIR band model moved there from Speedball: `nir_band.js`, `nir_spectral.js` (Jakob-Hanika upsampler, photocathode band, `classifyNir`) and the lazily loaded `srgb_lut.js` (~0.9 MB, fetched only by `createNirBand()`), re-exported from `infrared.js`.
+- PowerShot: `0.10.0`; runtime modules and the flare atlas match `PowerShot-threejs/src` (unreleased: the Aura infrared profile, `setNirBands`, and the NIR band model moved there from Speedball): `nir_band.js` (band integrals and the per-texel band LUT nodes, `createRasterNodes`), `nir_spectral.js` (Jakob-Hanika upsampler, photocathode band, `classifyNir`) and the lazily loaded `srgb_lut.js` (~0.9 MB, fetched only by `createNirBand()`), re-exported from `infrared.js`. `js/nir_band_view.js` renders the three bands while the imager senses NIR.
 - Sigils is a standalone package/demo, not a max.js runtime dependency.
 
 Global illumination is stock three.js: `LightProbeGrid` / `LightProbeGridWebGL`

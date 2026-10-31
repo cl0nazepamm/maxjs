@@ -20,14 +20,18 @@ const spotBatch = readFileSync(
 
 assert.match(
     vendoredThree,
-    /lightNode\.light\.distance === undefined/,
+    /lightNode\.isAnalyticLightNode !== true \|\| lightNode\.light\.distance === undefined/,
     'the upstream volume model guard changed; re-evaluate this compatibility fix',
 );
 assert.match(pointBatch, /lightNode:\s*\{\s*light:\s*\{\}/s);
 assert.match(spotBatch, /lightNode:\s*\{\s*light:\s*\{\}/s);
 
 assert.doesNotMatch(volumetric, /\.lightsNode\s*=/);
-assert.match(maxLights, /const FINITE_DISTANCE_LIGHT_NODE/);
+assert.match(
+    maxLights,
+    /const FINITE_DISTANCE_LIGHT_NODE = Object\.freeze\(\{\s*isAnalyticLightNode: true,\s*light: Object\.freeze\(\{ distance: 0 \}\)/,
+    'the batched point/spot marker must pass the volume model guard',
+);
 assert.match(maxLights, /class FinitePointLightDataNode extends PointLightDataNode/);
 assert.match(maxLights, /class FiniteSpotLightDataNode extends SpotLightDataNode/);
 assert.match(maxLights, /PointLight:\s*FinitePointLightDataNode/);

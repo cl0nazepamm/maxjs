@@ -59,7 +59,7 @@ export function setLightLinkMaskDefaults(renderer, lo = 0xFFFFFFFF, hi = 0xFFFFF
     return true;
 }
 
-// Three r185's NodeMaterialObserver only scans direct material node fields. It
+// Three's NodeMaterialObserver (r185 through r187) only scans direct material node fields. It
 // cannot see userData() nodes nested inside a custom LightsNode, so without a
 // marker it may skip per-object mask uniform refreshes after the first linked
 // frame. This no-op node keeps object refreshes enabled only while specialized
@@ -143,18 +143,19 @@ function writeIds(target, lights, maxCount) {
     }
 }
 
-// VolumeNodeMaterial ignores direct-light nodes whose backing light does not
-// expose a `distance` member. Three's r185 point/spot batch nodes use a
-// synthetic `{ light: {} }`, so installing DynamicLightsNode globally makes
-// those finite lights disappear from volumetric scattering. The value is only
-// a type marker here; attenuation still comes from each batch's cutoff array.
+// VolumeNodeMaterial only scatters analytic light nodes whose backing light
+// exposes a `distance` member. Three's point/spot batch nodes pass a synthetic
+// `{ light: {} }`, so installing DynamicLightsNode globally makes those finite
+// lights disappear from volumetric scattering. The value is only a type marker
+// here; attenuation still comes from each batch's cutoff array.
 const FINITE_DISTANCE_LIGHT_NODE = Object.freeze({
+    isAnalyticLightNode: true,
     light: Object.freeze({ distance: 0 }),
     shadowNode: null,
 });
 
 // ── Unlinked point / spot ───────────────────────────────
-// These are otherwise verbatim r185 data nodes. Supplying the finite-light
+// These are otherwise verbatim r187 data nodes. Supplying the finite-light
 // marker preserves the stock batched path for regular materials and restores
 // VolumeNodeMaterial compatibility.
 class FinitePointLightDataNode extends PointLightDataNode {

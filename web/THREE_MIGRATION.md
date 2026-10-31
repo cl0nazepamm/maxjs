@@ -25,7 +25,9 @@ build patches are gone: the `ContextNode.setup()` backport (#34531) and the
 `getSharedContext()` loop-state deletes (#34650) ship in r187, and the shadow
 pipeline churn patch (#34647) was closed upstream in favor of #35232, which ships
 in r187 (the source material is now part of override-pass render object keys).
-The DREAM `Plane001` churn has not been re-measured on r187.
+DREAM on stock r187 (native WebGPU, snapshot player): 2 synchronous and 38 async
+render pipelines during load, then none in the following 10 s, matching the
+patched r186 result (unpatched r186: 492 synchronous per load, then ~120/s).
 
 Upstream `examples/jsm` is stored as `examples` to preserve max.js import-map
 layout, plus the `examples/materialx` regression fixtures. Libraries npm does not
@@ -51,30 +53,39 @@ the r186 way). It peers on `three-mesh-bvh` `0.9.17` from `web/node_modules`.
 
 ## App-side safeguards still present
 
-Carried over from the r186 audit; not re-audited for r187 unless noted.
+Each was re-checked against the r187 source; the r187 code that still needs it is
+named below.
 
 | Area | Why retained |
 | --- | --- |
-| `js/fx/viewport_registry.js` | Per-render-target viewport texture clones still require explicit eviction. |
-| `js/fx/core.js` | Retire the whole pipeline on graph changes; retain the stale-graph safeguard and detached temporal-texture cleanup. |
-| `js/fx/effects/ssgi.js` | Retain the `rg11b10ufloat-renderable` device check for the GI target. |
-| `js/editor/renderer_core.js` | Request supported device limits needed by large scenes. |
-| `js/gpu_normals.js` | Keep compute normals disabled while storage-buffer preparation mutates itemSize-3 attributes. |
-| `js/editor/boot.js` | Keep per-material environment intensity policy and asynchronous Inspector detach/timestamp shutdown. |
-| `js/max_lights_node.js` | Keep observer/light-linking markers, finite point/spot handling and volumetric link bypass. |
-| `js/environment_lighting.js` | HDRI diffuse split hook; audited against r187 `EnvironmentNode.setup()`, now on both node backends. |
-| Material/environment loaders | Keep pending-texture binding guards, PMREM render-target ownership wrappers, and EXR `m44f` warning filtering. |
+| `js/fx/viewport_registry.js` | `ViewportTextureNode` still clones a framebuffer texture per render target into a `WeakMap` and never disposes the clones. |
+| `js/fx/core.js` | Retire the whole pipeline on graph changes: `RenderPipeline` is unchanged and its `dispose()` frees only the quad material. The detached temporal-texture reaper is removed: nothing calls `getPreviousTexture()`, and `getTexture()` adds every MRT output to the render target, whose `dispose()` frees it. |
+| `js/fx/effects/ssgi.js` | `SSGINode` still allocates an `UnsignedInt101111Type` target unconditionally; keep the `rg11b10ufloat-renderable` device check. r187 adds `SSGINode.resolutionScale`, so the post FX resolution scale now applies to SSGI too (it was ignored before): cheaper, noisier below 1. |
+| `js/webgpu_limits.js` | `WebGPURenderer` still defaults `requiredLimits` to `{}` (spec minimums). Mirrors the adapter limits for the editor and, new with this migration, the WebGPU snapshot player, whose materials now also sample probe grid textures. |
+| `js/gpu_normals.js` | Keep compute normals disabled: the backend still pads itemSize-3 storage attributes by rewriting `itemSize` and `array` in place. |
+| `js/editor/boot.js` | `materialEnvIntensity` still drops `envMapIntensity` without a per-material `envMap`; the Inspector still leaves `backend.trackTimestamp` on after detach. |
+| `js/max_lights_node.js` | `NodeMaterialObserver.containsNode` still scans only direct material fields (light-link marker). The batched point/spot marker now sets `isAnalyticLightNode`: r186's VolumetricLightingModel began requiring it, so non-shadowing point/spot lights had stopped scattering in volumetric fog (`tools/volumetric-batched-light.playwright.js`). Volumetric link bypass is max.js behaviour. |
+| `js/environment_lighting.js` | `EnvironmentNode.setup()` still feeds HDRI diffuse into `iblIrradiance` in one step; the hook mutes it while a probe grid supplies diffuse (it also dims HDRI multi-scatter and sheen, which read the same term). |
+| `js/pmrem_texture.js` | PMREM returns a render target, and three attaches no dispose listener to render-target textures; the wrapper makes `envMap.dispose()` free the target. One module for the editor, snapshot and layer facades (was three copies). |
+| `js/exr_warnings.js` | EXRLoader still has no `m44f` parser and warns per attribute. One helper (was three copies). |
+| Material loaders | Pending-texture binding guards: `null` images still reach the backend's `image.complete` read. |
+
+Not re-measured: the stale-graph safeguard for an initially empty scene in
+`fx/core.js` (r187 `PassNode` renders every frame, so its premise may no longer
+hold) and `MaxLightsNode`'s renderer-shared data nodes (r187 creates one lights
+node per scene, so sharing now mostly spans scenes).
 
 ## Verification
 
 - Build `maxjs` Release (`build.bat 2027` here; Max 2026 is not installed on this machine).
 - `node tools/check_esm_graph.mjs` and the node smokes in `tools/*-smoke.mjs`.
-- Browser regressions: start `node tools/split_smoke_server.mjs 8901`, open it with `playwright-cli`, then `run-code --filename=` each of `tools/three-r187.playwright.js`, `tools/three-r187-materialx.playwright.js`, `tools/temporal-resize.playwright.js`, `tools/light-probes.playwright.js` and `tools/lightmap-pathtracer.playwright.js`.
+- Browser regressions: start `node tools/split_smoke_server.mjs 8901`, open it with `playwright-cli`, then `run-code --filename=` each of `tools/three-r187.playwright.js`, `tools/three-r187-materialx.playwright.js`, `tools/temporal-resize.playwright.js`, `tools/light-probes.playwright.js`, `tools/lightmap-pathtracer.playwright.js` and `tools/volumetric-batched-light.playwright.js`.
 
 The browser checks render retroreflection, clouds and sun shadows on WebGPU, TSL_GL
 and classic WebGL; exercise SSR/SSGI/GTAO/DOF/TRAA and SSR denoising on both node
 backends, also while resizing at a reduced resolution scale; compile the MaterialX
 fixtures per node backend with Max-export pixel comparisons; bake probe grids on all
 three backends (bounce reaches an unlit wall, staged swap, disable); bake GI lightmaps
-on both node backends; and accumulate, update and capture the path tracer on WebGPU.
+on both node backends; accumulate, update and capture the path tracer on WebGPU; and
+scatter batched and shadowed point lights in a volume on both node backends.
 They do not replace a long-running GPU-memory soak.

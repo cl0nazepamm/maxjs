@@ -71,7 +71,9 @@ export function createNirBandView({ scene, onActiveChange = () => {} }) {
         } else if (state.authored != null) {
             bands = withAuthoredLevel(nodes.reflectance(visible.rgb), state.authored);
         } else {
-            bands = nodes.tagged(visible.rgb, state.nirAlbedo, state.flat);
+            // Normalized per texel: a mapped material (usually white times its
+            // map) takes its tag's level past the red edge, like a plain one.
+            bands = nodes.tagged(visible.rgb, state.nirAlbedo, nodes.reflectance(visible.rgb));
         }
         return vec4(bands, visible.a);
     }
@@ -92,8 +94,6 @@ export function createNirBandView({ scene, onActiveChange = () => {} }) {
                 colorNode: material.colorNode,
                 emissiveNode: material.emissiveNode,
                 nirAlbedo: uniform(-1),
-                flat: uniform(new THREE.Vector3(1, 1, 1)),
-                flatKey: '',
                 tagKey: '',
             };
             materials.set(material, state);
@@ -121,14 +121,9 @@ export function createNirBandView({ scene, onActiveChange = () => {} }) {
         material.needsUpdate = true;
     }
 
-    // NIR level and the map-free colour's bands, recomputed only on change.
+    // NIR level: the tag, else the classifier, recomputed only on change.
     function updateTags(material, state) {
         const c = material.color?.isColor ? material.color : WHITE;
-        const flatKey = `${c.r},${c.g},${c.b}`;
-        if (flatKey !== state.flatKey) {
-            state.flatKey = flatKey;
-            state.flat.value.set(...band.colorBands(c.r, c.g, c.b));
-        }
         const tag = material.userData?.nirAlbedo;
         if (Number.isFinite(tag)) {
             state.nirAlbedo.value = Math.max(0, tag);
@@ -138,7 +133,7 @@ export function createNirBandView({ scene, onActiveChange = () => {} }) {
         const roughness = num(material.roughness, 1);
         const metalness = num(material.metalness, 0);
         const transmission = num(material.transmission, 0);
-        const tagKey = `${material.name}|${flatKey}|${roughness}|${metalness}|${transmission}`;
+        const tagKey = `${material.name}|${c.r},${c.g},${c.b}|${roughness}|${metalness}|${transmission}`;
         if (tagKey !== state.tagKey) {
             state.tagKey = tagKey;
             state.nirAlbedo.value = classifyNir(material.name, c.r, c.g, c.b, roughness, metalness, transmission);

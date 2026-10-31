@@ -49,9 +49,10 @@ async page => {
                     plane.position.x = -1.5 + i;
                     scene.add(plane);
                 });
-                const white = new THREE.PointLight(0xffffff, 6, 0, 2);
+                // Directional, so every plane sees the same light.
+                const white = new THREE.DirectionalLight(0xffffff, 0.7);
                 white.position.set(0, 0, 3);
-                const ir = new THREE.PointLight(0x000000, 30, 0, 2);
+                const ir = new THREE.DirectionalLight(0x000000, 3.5);
                 ir.position.set(0, 0, 3);
                 ir.userData.emitterClass = 'ir';
                 scene.add(white, ir);

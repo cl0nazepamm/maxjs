@@ -6,36 +6,14 @@
 import * as THREE from 'three';
 import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+import { retainPMREMTexture } from './pmrem_texture.js';
+import { suppressKnownExrMetadataWarnings } from './exr_warnings.js';
 
 const FALLBACK_BG = 0x353535;
 const HDR_EXTS = new Set(['hdr', 'exr']);
 
 function colorSpaceForEnvironmentTexture(ext) {
     return HDR_EXTS.has(ext) ? THREE.LinearSRGBColorSpace : THREE.SRGBColorSpace;
-}
-
-function suppressKnownExrMetadataWarnings(loader) {
-    if (!loader || loader.userData?.maxjsQuietM44fHeader) return loader;
-    const originalParse = typeof loader.parse === 'function' ? loader.parse.bind(loader) : null;
-    if (!originalParse) return loader;
-    loader.parse = (...args) => {
-        const previousWarn = console.warn;
-        console.warn = (...warnArgs) => {
-            const msg = String(warnArgs?.[0] ?? '');
-            if (msg.includes('THREE.EXRLoader: Skipped unknown header attribute type') &&
-                msg.includes('m44f')) {
-                return;
-            }
-            previousWarn.apply(console, warnArgs);
-        };
-        try {
-            return originalParse(...args);
-        } finally {
-            console.warn = previousWarn;
-        }
-    };
-    loader.userData = { ...(loader.userData || {}), maxjsQuietM44fHeader: true };
-    return loader;
 }
 
 function cloneBackground(background) {
@@ -83,33 +61,6 @@ function createPMREMGenerator(renderer) {
     // after the host resizes, making later render passes invalid. The first
     // fromEquirectangular() call compiles at the renderer's current size.
     return new THREE.PMREMGenerator(renderer);
-}
-
-function retainPMREMTexture(renderTarget) {
-    const texture = renderTarget?.texture ?? null;
-    if (!texture) {
-        renderTarget?.dispose?.();
-        return null;
-    }
-    texture.userData ??= {};
-    if (!texture.userData.maxjsPMREMDisposeWrapped) {
-        let disposed = false;
-        const originalDispose = texture.dispose?.bind(texture);
-        texture.dispose = () => {
-            if (disposed) return;
-            disposed = true;
-            const target = texture.userData?.maxjsPMREMRenderTarget;
-            if (target) target.dispose?.();
-            else originalDispose?.();
-            if (texture.userData) {
-                delete texture.userData.maxjsPMREMRenderTarget;
-                delete texture.userData.maxjsPMREMDisposeWrapped;
-            }
-        };
-        texture.userData.maxjsPMREMDisposeWrapped = true;
-    }
-    texture.userData.maxjsPMREMRenderTarget = renderTarget;
-    return texture;
 }
 
 function normalizeEnv(env, snapshotUi) {

@@ -25,6 +25,7 @@
         import { createRenderLoop } from './render_loop.js';
         import { createSceneLoadGate } from './scene_load_gate.js';
         import { createLongTaskMonitor } from '../long_task_monitor.js';
+        import { suppressKnownExrMetadataWarnings } from '../exr_warnings.js';
         import { createPanelsMisc } from './panels_misc.js';
         import { createLights } from './lights.js';
         import { createEnvironment } from './environment.js';
@@ -51,7 +52,7 @@
             return materialIntensity * sceneIntensity;
         });
 
-        // Preserve upstream r186 retroreflection while applying max.js HDRI policy.
+        // Preserve upstream r187 retroreflection while applying max.js HDRI policy.
         installHdriDiffuseSplit(maxjsHdriDiffuseIntensity);
         import { maxTimeline } from '../maxjs_timeline.js';
         import { createHostBridge } from './host_bridge.js';
@@ -317,7 +318,7 @@
         // true the C++ fast lane streams positions only (all mesh sizes) and
         // gpu_normals.js recomputes normals per update in a compute pass.
         // Announced false while the GPU path is hard-disabled (see
-        // gpu_normals.js — three r185 mutates itemSize-3 storage attributes,
+        // gpu_normals.js — three (r185 through r187) mutates itemSize-3 storage attributes,
         // which corrupts live-streamed geometry). CPU normal streaming covers
         // everything below the compact-channel threshold instead.
         window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
@@ -446,30 +447,6 @@
             return hdrTextureExtensions.has(ext) && requestedColorSpace === THREE.SRGBColorSpace
                 ? THREE.LinearSRGBColorSpace
                 : requestedColorSpace;
-        }
-
-        function suppressKnownExrMetadataWarnings(loader) {
-            if (!loader || loader.userData?.maxjsQuietM44fHeader) return loader;
-            const originalParse = typeof loader.parse === 'function' ? loader.parse.bind(loader) : null;
-            if (!originalParse) return loader;
-            loader.parse = (...args) => {
-                const previousWarn = console.warn;
-                console.warn = (...warnArgs) => {
-                    const msg = String(warnArgs?.[0] ?? '');
-                    if (msg.includes('THREE.EXRLoader: Skipped unknown header attribute type') &&
-                        msg.includes('m44f')) {
-                        return;
-                    }
-                    previousWarn.apply(console, warnArgs);
-                };
-                try {
-                    return originalParse(...args);
-                } finally {
-                    console.warn = previousWarn;
-                }
-            };
-            loader.userData = { ...(loader.userData || {}), maxjsQuietM44fHeader: true };
-            return loader;
         }
 
         const browserTextureExtensions = new Set([
@@ -2773,7 +2750,7 @@
 
         // ── Build mode / Standalone / Debug ──
         // buildMode / isStandalone / urlMode are initialized near perfHud (early).
-        // three.js r185 Inspector — lazily created, gated by debug mode.
+        // three.js Inspector — lazily created, gated by debug mode.
         const passiveRendererInspector = renderer.inspector;
         let threeInspector = null;
         let inspectorSyncGeneration = 0;

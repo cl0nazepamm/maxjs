@@ -359,14 +359,6 @@ export function createFxCore({
         }
     }
 
-    function disposeResourceMap(map, seen) {
-        if (!map) return;
-        const values = map instanceof Map ? map.values() : Object.values(map);
-        for (const value of values) {
-            disposeResource(value, seen);
-        }
-    }
-
     function retirePostPipeline({ recreate = true } = {}) {
         // Retire the ENTIRE pipeline object, not just its node graph. Swapping
         // outputNode on a reused quad is not enough on the WebGPU backend
@@ -404,18 +396,13 @@ export function createFxCore({
         retirePostPipeline({ recreate: true });
     }
 
-    // r186 PassNode/RTTNode dispose their targets and RTT quad material.
-    // PassNode still omits detached temporal textures. Reap only those;
-    // do not double-dispose resources now owned by upstream dispose().
+    // r187 PassNode/RTTNode dispose their own targets, including every MRT
+    // output (getTexture() adds each to renderTarget.textures), and the RTT
+    // quad material. Then drop the retired node's references so a retained
+    // closure cannot keep its scene, camera or textures alive.
     function disposeNodeDeep(node, seen) {
         if (!node) return;
         try {
-            disposeResourceMap(node._previousTextures, seen);
-            const attachments = new Set(node.renderTarget?.textures || []);
-            if (node.renderTarget?.depthTexture) attachments.add(node.renderTarget.depthTexture);
-            for (const texture of Object.values(node._textures || {})) {
-                if (!attachments.has(texture)) disposeResource(texture, seen);
-            }
             disposeResource(node, seen);
 
             node.scene = null;

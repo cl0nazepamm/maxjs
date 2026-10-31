@@ -1,4 +1,4 @@
-// Viewport-texture clone reaper. r185 ViewportTextureNode keeps a
+// Viewport-texture clone reaper. ViewportTextureNode (r185 through r187) keeps a
 // WeakMap<RenderTarget, FramebufferTexture> and silently clones a full-res
 // framebuffer copy for EVERY render target it is sampled in — but never
 // disposes the clones. Every pipeline rebuild retires the pre/scene pass

@@ -11,23 +11,8 @@ import { select, uniform, vec3 } from 'three/tsl';
 import { LightMapper } from 'three/addons/lighting/LightMapper.js';
 import { lightProbeGridIrradiance } from 'three/addons/tsl/lighting/LightProbeGridNode.js';
 
-export const LIGHTMAP_DEFAULTS = Object.freeze({
-    resolution: 256,
-    samples: 16,
-});
-
-export const LIGHTMAP_RESOLUTIONS = Object.freeze([64, 128, 256, 512, 1024]);
 const MIN_SIZE = 16;
-
-export function normalizeLightmapSettings(input = {}, base = LIGHTMAP_DEFAULTS) {
-    const source = input && typeof input === 'object' ? input : {};
-    const resolution = Math.round(Number(source.resolution ?? base.resolution));
-    const samples = Math.round(Number(source.samples ?? base.samples));
-    return {
-        resolution: LIGHTMAP_RESOLUTIONS.includes(resolution) ? resolution : LIGHTMAP_DEFAULTS.resolution,
-        samples: Number.isFinite(samples) ? Math.min(256, Math.max(1, samples)) : LIGHTMAP_DEFAULTS.samples,
-    };
-}
+const SAMPLES_PER_UPDATE = 16;
 
 // A mesh can take a GI lightmap when it is a plain static mesh with a lit
 // material and a Max channel 2 UV set.
@@ -62,7 +47,7 @@ function worldSurfaceArea(mesh) {
 // Irradiance from every grid at unit intensity (materials scale it with
 // lightMapIntensity); where grids overlap the highest priority wins, on ties the
 // newest, matching LightProbeGridNode.
-export function probeGridIrradiance(grids) {
+function probeGridIrradiance(grids) {
     const ordered = [...grids].sort((a, b) => a.priority - b.priority || a.id - b.id);
     return (position, normal) => {
         let irradiance = vec3(0);
@@ -129,8 +114,8 @@ export function createLightmapBaker({ renderer }) {
         get baking() { return job !== null; },
 
         // Starts a bake of `meshes` from `grids`; `update()` advances it.
-        start(grids, meshes, settings) {
-            const { resolution, samples } = normalizeLightmapSettings(settings);
+        // `resolution` is the light probe settings' normalized lightmapResolution.
+        start(grids, meshes, { resolution, samples = SAMPLES_PER_UPDATE }) {
             disposeMappers();
             const candidates = meshes.filter(isLightmapCandidate);
             if (!grids.length || !candidates.length) {

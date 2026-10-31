@@ -1,5 +1,6 @@
 // environment.js - HDRI/environment texture loading and local HDRI state.
 import * as THREE from 'three';
+import { retainPMREMTexture } from '../pmrem_texture.js';
 
 function createEnvironment(deps = {}) {
         let currentHdriEnvMap = null;
@@ -9,33 +10,6 @@ function createEnvironment(deps = {}) {
         let localHdriObjectUrl = null;   // file loaded in memory
         let localHdriEnvMap = null;      // cached PMREM texture
         let localHdriRawTexture = null;  // equirect source for pathtracing
-
-        function retainPMREMTexture(renderTarget) {
-            const texture = renderTarget?.texture ?? null;
-            if (!texture) {
-                renderTarget?.dispose?.();
-                return null;
-            }
-            texture.userData ??= {};
-            if (!texture.userData.maxjsPMREMDisposeWrapped) {
-                let disposed = false;
-                const originalDispose = texture.dispose?.bind(texture);
-                texture.dispose = () => {
-                    if (disposed) return;
-                    disposed = true;
-                    const target = texture.userData?.maxjsPMREMRenderTarget;
-                    if (target) target.dispose?.();
-                    else originalDispose?.();
-                    if (texture.userData) {
-                        delete texture.userData.maxjsPMREMRenderTarget;
-                        delete texture.userData.maxjsPMREMDisposeWrapped;
-                    }
-                };
-                texture.userData.maxjsPMREMDisposeWrapped = true;
-            }
-            texture.userData.maxjsPMREMRenderTarget = renderTarget;
-            return texture;
-        }
 
         function loadEnvironmentTexture(url, sourceName, onLoad, onProgress, onError) {
             const ext = deps.getTextureExtension(sourceName || url);

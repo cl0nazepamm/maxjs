@@ -1,6 +1,7 @@
 // Small facades exposed on layer contexts.
 
 import { freezePlainObject } from './layer_utils.js';
+import { retainPMREMTexture } from './pmrem_texture.js';
 
 function createNodeMapFacade(nodeMap, getAdapter) {
     const facade = {
@@ -431,33 +432,6 @@ function createRendererFacade(
             pmremGenerator.compileCubemapShader?.();
         }
         return pmremGenerator;
-    }
-
-    function retainPMREMTexture(renderTarget) {
-        const texture = renderTarget?.texture ?? null;
-        if (!texture) {
-            renderTarget?.dispose?.();
-            return null;
-        }
-        texture.userData ??= {};
-        if (!texture.userData.maxjsPMREMDisposeWrapped) {
-            let disposed = false;
-            const originalDispose = texture.dispose?.bind(texture);
-            texture.dispose = () => {
-                if (disposed) return;
-                disposed = true;
-                const target = texture.userData?.maxjsPMREMRenderTarget;
-                if (target) target.dispose?.();
-                else originalDispose?.();
-                if (texture.userData) {
-                    delete texture.userData.maxjsPMREMRenderTarget;
-                    delete texture.userData.maxjsPMREMDisposeWrapped;
-                }
-            };
-            texture.userData.maxjsPMREMDisposeWrapped = true;
-        }
-        texture.userData.maxjsPMREMRenderTarget = renderTarget;
-        return texture;
     }
 
     function pmremFromScene(sceneOrObj, sigma = 0, near = 0.1, far = 1_000_000) {

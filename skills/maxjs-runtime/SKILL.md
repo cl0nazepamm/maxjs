@@ -18,7 +18,7 @@ max.js runs Three.js code against scene data synced from 3ds Max. Treat 3ds Max 
 - Read authored Max data through `ctx.maxScene` / node adapters.
 - Add JS-owned runtime objects through `ctx.js`.
 - Move authored synced objects only through `node.transform.*`; fastsync will overwrite raw `.position` / `.quaternion` edits.
-- Prefer scene-local files: `scripts/*.js` for auto-discovered layers, or `project.maxjs.json` for explicit project layers.
+- Put layers in the scene-local `scripts/` folder next to the `.max` (see Scene-Local Layers and Modules). The `layers` array in `project.maxjs.json` is ignored by the live editor; the snapshot player reads it only as a fallback when `runtimeScene.layers` is empty.
 
 ## Layer Entry Shape
 
@@ -29,11 +29,15 @@ export default function layer(ctx, THREE) {
     const group = ctx.js.createGroup('fx');
 
     return {
-        update(ctx, dt) {},
+        update(ctx, dt, elapsed) {},
         dispose() {}
     };
 }
 ```
+
+Other accepted shapes: top-level `export function init/update/dispose` (the module namespace is the hooks object), or a `default`/`createLayer`/`mount` export that is either the factory `(ctx, THREE, extra)` or a plain hooks object. A static `export const parameters` (or `params`) is passed to `ctx.params.define` before the factory runs. `extra.layer` differs between editor and snapshot; rely only on `extra.layer.id` and `extra.layer.name`. After 60 consecutive `update` throws the layer is deactivated.
+
+Render hooks `onBeforeRender(ctx, elapsed)` / `onAfterRender(ctx, elapsed)` run after all updates and camera sync, right around the live draw. They do **not** run for Render to Image / Render Sequence output, so anything that must appear in rendered frames (camera shake, sim state) belongs in `update`.
 
 The editor and snapshot player wait for their initial scene-ready signal before
 running a layer factory. Nodes can still appear, disappear, or rebuild later, so
@@ -53,6 +57,27 @@ return {
         if (!bee) return;
     }
 };
+```
+
+## Scene-Local Layers and Modules
+
+Discovery is a host-side folder scan of `<sceneDir>\scripts\` (legacy `inlines\` only when `scripts\` has no layers), polled periodically:
+
+- The scan is **recursive**, and **every `*.js` is a layer** (`*.js.disabled` = disabled layer). `scripts/sim/bag.js` mounts as layer `sim/bag`. There is no ignore list.
+- Helper modules must not end in `.js`: name them `*.mjs`. They are served as JavaScript, resolved by relative imports, and copied into snapshots. Alternatively bundle the layer into one file.
+- An `NN_` filename prefix sets priority (lower mounts first; default 100) and strips it from the display name: `10_bag.js` → `bag`.
+- Any edit under `scripts/` changes a recursive directory stamp, which remounts **all** layers.
+- Layers are imported from a real URL (`https://maxjs-assets.local/<abs path>/scripts/<id>.js?v=n`), so relative `import`s and `new URL('./file', import.meta.url)` work, live and in snapshots. Snapshot export copies the whole `scripts/` tree file by file (no bundling, `*.js.disabled` skipped). Nothing outside `scripts/` is exported.
+- Only the entry URL is cache-busted. An edited helper keeps its first-loaded code (and module-level state) until the viewer page reloads. Keep mutable state inside the factory.
+- `import * as THREE from 'three'` resolves to the same instance as the factory's `THREE` (the WebGPU build: `three.webgpu.js`). TSL: `import * as TSL from 'three/tsl'`, or `THREE.TSL`. There is no `ctx.TSL`. In a classic-WebGL snapshot (`snapshot.html`) node materials and `THREE.TSL` do not exist and `'three/tsl'` loads a second three copy, so gate on `typeof THREE.WebGPURenderer === 'function'` and fall back.
+
+```text
+scene.max
+project.maxjs.json      host-written: { "name", "pollMs", "layers": [] }
+settings.maxjs.json     host-written: runtimeLayerParams.layers["<folder/id>"] = { param: value }
+scripts/
+  10_bag_sim.js         the only layer entry
+  lib/world.mjs         helper, imported as './lib/world.mjs'
 ```
 
 ## How Scene Data Is Accessed
@@ -264,7 +289,8 @@ This is the preferred API for light cookies/gobos, runtime-only texture slots, a
 
 ```js
 const spot = ctx.maxScene.findOne('TJS_Spot');
-const texture = ctx.js.own(new THREE.TextureLoader().load('./scripts/cookie.png'));
+// resolve next to the layer file: a bare './scripts/…' resolves against the editor page and 404s live
+const texture = ctx.js.own(new THREE.TextureLoader().load(new URL('./cookie.png', import.meta.url).href));
 texture.colorSpace = THREE.SRGBColorSpace;
 
 spot.overrides.setProperty('map', texture, {
@@ -358,11 +384,11 @@ band gate changes.
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 
 - `ctx.camera.raw` returns the underlying Three.js camera for last-mile render offsets such as handheld shake. This does not claim script ownership by itself.
-- `ctx.camera.target` / `ctx.camera.getTarget(out)` returns the viewer look-at point, not the Max camera target node. Max target nodes are exposed as regular transform-only scene graph nodes; use `ctx.camera.findSceneCamera(...).targetHandle` with `ctx.maxScene.getNode(handle)` to script them.
+- `ctx.camera.target` / `ctx.camera.getTarget(out)` returns the viewer look-at point, not the Max camera target node. It differs by host: the editor returns the target of the last Max camera packet (stale while a layer owns the camera), the snapshot returns `OrbitControls.target`. Pass explicit targets to `lookAtTarget` / `setPositionKeepingTarget` when live and snapshot must match. Max target nodes are exposed as regular transform-only scene graph nodes; use `ctx.camera.findSceneCamera(...).targetHandle` with `ctx.maxScene.getNode(handle)` to script them.
 - Moving a Max camera target node should not dirty camera sync directly. Camera sync follows the Max camera transform; target nodes are regular scene graph data.
 - `ctx.camera.setPositionKeepingTarget(positionOrX, y, z, target?)` moves the layer-owned camera and re-aims it at the current target, or at an explicit target if supplied.
 - Camera near/far clipping may come from Max camera manual clipping, render `ViewParams`, or viewer UI overrides. Snapshot UI state persists camera clip overrides.
-- `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n, targetHandle, targetName }`.
+- `ctx.camera.listSceneCameras()` returns synced scene cameras as `{ handle, h, name, n, targetHandle, targetName, targetH, targetN, active, hasSnapshotState }`.
 - `ctx.camera.findSceneCamera(name, { exact })` searches the scene camera list. Do this for Physical Cameras; `ctx.maxScene.findByName()` only searches synced meshes/lights.
 - `ctx.camera.usePhysicalCamera(handleOrEntry)` / `ctx.camera.usePhysicalCameraByName(name, { exact })` locks the viewer to a Max camera object while still allowing a layer to apply a post-sync camera offset through `ctx.camera.raw`.
 
@@ -382,6 +408,81 @@ Check `entry.state` before using `entry.root` or `entry.clips`.
 - A group handle exposes `key`, `count`, `raw` (the `InstancedMesh`), `getMatrixAt(i, out?)`, `setMatrixAt(i, m)`, `getPositionAt(i, out?)`, `setPositionAt(i, x, y, z | vec)`, `forEach((i, matrix) => …)`, and `flush()`. The set/move helpers flag the GPU upload automatically; call `flush()` only if you wrote `raw.instanceMatrix` yourself.
 - Groups are keyed by their baked source (`userData.maxjsSource`), currently derived from a `Mesh*` pointer C++-side — stable WITHIN one exported snapshot but not reproducible across re-exports. For code that must survive a re-export, resolve by iteration/index rather than a hard-coded key.
 - `InstancedMesh` count is fixed at allocation: moving, hiding (scale-to-zero), or re-transforming existing instances is free; adding instances beyond the exported count needs a rebuild. All instances in a group share one geometry + material, so a single instance's model cannot be swapped in place.
+
+## Camera Ownership (script mode)
+
+A layer can drive the viewer camera without any Max camera. The adapter is frozen and its `fov`/`near`/`far`/`position`/`quaternion`/`target` are getters: `ctx.camera.fov = 40` throws in module strict mode. Use the setters.
+
+- Claim: `ctx.camera.takeOver({ controls })` → `boolean` (there is no `claim()`); `useScriptMode({ controls, enableOrbitControls })`; `release()`. `controls`: `'viewer' | 'orbit' | true` keeps the user's OrbitControls, `'none' | false | 'manual'` disables them (default `'none'`). Any setter implicitly claims script mode with `'none'` if nobody owns the camera. A non-owner cannot steal or release. Release or layer removal restores the captured pose and controls.
+- State: `mode` (`'viewport' | 'physical' | 'script'`), `isScriptMode`, `isOwnedByMe`, `getState()`, `getForward/getRight/getUp(out?)`, `controls` (owner only), `setControlsEnabled(bool)`.
+- Setters (all return `boolean`, all update `matrixWorld`): `setPosition(x,y,z)`, `setPositionVec(v)`, `setQuaternion(x,y,z,w)`, `setQuaternionVec(q)`, `setRotationEuler(x,y,z, order='YXZ')`, `lookAt(x,y,z | vec | [x,y,z])` (also writes `OrbitControls.target`), `lookAtTarget(target?)`, `setPositionAndLookAt(px,py,pz, tx,ty,tz)`, `setPositionKeepingTarget(...)`, `setTransform(px,py,pz, qx,qy,qz,qw)`, `setMatrix(m)`, `setFov(deg)` (three's **vertical** fov; Max sync converts Max's horizontal fov), `setNearFar(near, far)` (cm), `orbit(dAz, dPolar, target?)`, `dolly(delta, target?)`, `pan(dx, dy)`.
+- In script mode, Max viewport/camera packets are ignored (including the Render Sequence camera), so a Max camera is at most an authoring reference.
+- `controls.update()` still runs every frame **before** layer `update` and re-aims at `controls.target`. Set the full pose every frame; `lookAt` keeps `controls.target` in sync, then `setQuaternionVec` can add roll/shake.
+- The viewer's clip-override UI can rewrite near/far; re-assert if it matters.
+- Exported active-camera animation runs after layer `update` with no script-mode guard: don't export Camera Animation for a scene whose camera a layer drives.
+
+```js
+export default function layer(ctx, THREE) {
+    const rig = new THREE.PerspectiveCamera(30, 4 / 3, 5, 6000); // private pose source, cm
+    return {
+        update(ctx, dt, elapsed) {
+            if (!ctx.camera.isOwnedByMe && !ctx.camera.takeOver({ controls: 'none' })) return;
+            // ...move rig...
+            ctx.camera.setPosition(rig.position.x, rig.position.y, rig.position.z);
+            ctx.camera.lookAt(0, 100, 0);
+            ctx.camera.setQuaternionVec(rig.quaternion);
+            ctx.camera.setFov(rig.fov);
+        },
+        dispose() { if (ctx.camera.isOwnedByMe) ctx.camera.release(); },
+    };
+}
+```
+
+## Input
+
+`ctx.input` is `{ element, document, on(target, type, fn, opts), dispose() }`. `element` is the viewer canvas; `on` accepts any EventTarget (`element`, `window`, `document`) and returns nothing. All listeners are removed when the layer unmounts. There are no NDC or picking helpers: compute NDC from `element.getBoundingClientRect()` (the canvas sits inside the viewport/safe-frame rect), and raycast runtime objects yourself (`ctx.maxScene.raycast` only hits synced Max meshes). OrbitControls listens on the same canvas; with `controls: 'none'` its handlers exit early.
+
+```js
+const el = ctx.input.element, ndc = new THREE.Vector2(), ray = new THREE.Raycaster();
+ctx.input.on(el, 'pointerdown', (e) => {
+    const r = el.getBoundingClientRect();
+    ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(ndc, ctx.camera.raw);
+    const hit = ray.intersectObjects(ctx.js.root.children, true)[0];
+});
+ctx.input.on(window, 'keydown', (e) => { if (e.key === 'r') reset(); });
+```
+
+## Time and Rendered Output
+
+- Live editor: `update(ctx, dt, elapsed)` gets the unclamped `THREE.Timer` delta; `ctx.clock` / `ctx.runtime.dt|elapsed` hold the same values. Snapshot: dt clamped to 0.25 s, 60 fps cap.
+- **Render to Image / Render Sequence call `update` with `dt = 0` and `elapsed = frame / fps`**, several times per output frame during warm-up. A sim that integrates `dt` freezes in rendered output, and `elapsed` jumps backwards when a sequence starts.
+- `ctx.maxTime` `{ seconds, frame, fps, playing, source }`: live it extrapolates between Max pushes while playing; in snapshots it is a local clock from `startFrame` that auto-plays without looping.
+- There is no fixed-step helper (only `ctx.deform`'s `timeMode: 'timeline'`). For stateful sims, seed every RNG and replay at a fixed step when `dt === 0`:
+
+```js
+const STEP = 1 / 60;
+let replayT = -1;                         // -1 while running live
+function replayTo(t) {
+    if (replayT < 0 || t < replayT - 1e-6) { resetSim(SEED); replayT = 0; }  // fresh, seeded
+    while (replayT + STEP <= t + 1e-9) { sim.step(STEP); replayT += STEP; }
+}
+// update(ctx, dt, elapsed): dt > 0 ? (replayT = -1, sim.step(Math.min(dt, 0.05))) : replayTo(elapsed)
+// Guard: a live frame can rarely report dt = 0 at the live elapsed; skip the replay in that case.
+```
+
+## Renderer, Shadows and Environment
+
+- Editor default is `THREE.WebGPURenderer` on WebGPU, falling back to `forceWebGL` ("TSL_GL"); a stored `webgl2` preference uses the classic `WebGLRenderer`. Snapshots follow the exported backend (`snapshot_webgpu.html` by default). `ctx.runtime.isWebGPU` reports `true` for classic WebGL too; test `typeof THREE.WebGPURenderer === 'function'` for node-material support.
+- `material.onBeforeCompile` does nothing on WebGPU/TSL_GL. Use node materials and TSL nodes (`colorNode`, `positionNode`, …) for runtime meshes, `ctx.deform` for synced meshes, or plain `BufferAttribute` writes + `computeVertexNormals()` for CPU-deformed geometry. GLSL `ShaderMaterial` does not compile on WebGPU, and objects using `RawShaderMaterial` are removed every frame there. Node materials multiply `instanceColor` **after** `colorNode`.
+- Runtime objects get no shadow flags: set `castShadow` / `receiveShadow` yourself. Synced Max lights cast shadows when their Max shadow is on.
+- The directional shadow frustum fits the bounds of visible **synced Max meshes** only, so runtime meshes outside them are clipped and a large set spreads the map thin. A Max helper named `ShadowMapOrigin` (radius in the name, cm: `ShadowMapOrigin_r500`) pins the frustum center and radius.
+- max.js lights (`Directional_lightlight`, `Hemisphere_Light`, `Point_Light`, `Spot_Light`, `Rect_Area_Light`, `Ambient_Light`) aim along the node's local **−Y**. Their colors reach `light.color.setRGB()` unconverted, so a Max swatch is read as linear.
+- Background/environment are read-only to layers (`ctx.maxScene.background|environment|fog`). Raw writes to `ctx.renderer.sceneRoot` are overwritten by host environment sync. Author the environment in Max, or use a runtime sky mesh. `ctx.renderer.pmremFromScene()` / `pmremFromEquirectangular()` return untracked textures: `ctx.js.own()` them.
+
+## PowerShot
+
+PowerShot is the final post-processing stage: an ISP/camera-look pipeline (`web/js/fx/final/powershot.js`, vendor `powershot-threejs`) with `digital`, `analog` (VHS/camcorder), `film`, `infrared` and `nightshot` modes plus an optional Solar Flare pass. It renders the scene untone-mapped into a half-float target at `resolutionScale` and needs a node renderer (WebGPU or TSL_GL). It does not control layer time: its grain advances per rendered frame unless Freeze Noise is on, so layer motion must follow the rendered-output rules above to be repeatable. A `DirectionalLight` with `userData.solarFlareSun = true` is preferred as the flare sun.
 
 ## `ctx.deform` — GPU Vertex Deformation
 
@@ -424,7 +525,7 @@ Rules and behavior:
 - Returned handle: `fx.params`, `fx.uniform(name)`, `fx.matched` (handles), `fx.active`, `fx.dispose()` (restores the original material nodes). Disposal is automatic on layer dispose/hot reload.
 - Deformation binds per material: meshes sharing one Max material deform together. Assign a unique material in Max to isolate one object.
 - Geometry stays at rest on the CPU — `ctx.maxScene.raycast` and `sampleSurface` read undeformed positions.
-- TSL nodes must follow the three.js `0.185.0` chaining rules (see TSL Material Snippets below).
+- TSL nodes must follow the three.js r186 chaining rules (see TSL Material Snippets below).
 - The three.js Deform modifier flag is NOT required for `ctx.deform.attach`. Use the flag as the authoring marker (`n => n.jsmod` / `listJsmodNodes()`); it IS mandatory for `ctx.deform.simulate` and any other buffer-writing deformation because it stops fastsync geometry rebuilds from stomping the buffers.
 
 ### `ctx.deform.simulate` — Stateful Compute Simulation
@@ -487,7 +588,7 @@ Parameter comments create uniforms available through `params.name`. Keep paramet
 
 ### Unit scale (cm)
 
-max.js scenes sync from 3ds Max in **centimeters** (`ctx.space.units` is `'cm'`; world transforms, camera clips, and raycasts all assume cm). **TSL materials and textures must be authored to match this scale** — do not tune parallax, displacement, noise tiling, or effect strength as if the scene were meters.
+max.js scenes sync from 3ds Max in **centimeters** (`ctx.runtime.units` is `'cm'`; there is no `ctx.space`, the space helpers are `ctx.runtime.space`; world transforms, camera clips, and raycasts all assume cm). **TSL materials and textures must be authored to match this scale** — do not tune parallax, displacement, noise tiling, or effect strength as if the scene were meters.
 
 - Prefer **cm-native `@param` names** when a value is physical (`openingWidthCm`, `virtualDepthCm`, `displacementCm`) rather than abstract UV magic numbers.
 - When UV size maps to a real opening, expose the mesh width/height in cm and **normalize** procedural density, parallax reach, and glitter pitch against it (e.g. reference width **80 cm** for a typical porthole/panel).
@@ -519,7 +620,7 @@ material.alphaTestNode = ...;
 material.positionNode = ...; // vertex displacement
 ```
 
-TSL in this repo is Three.js `0.185.0`. Use method chaining, not JS infix operators:
+TSL in this repo is Three.js r186 (`web/vendor/three-r186`). Use method chaining, not JS infix operators:
 
 ```js
 const t = TSL.time.mul(params.strength);
@@ -569,5 +670,5 @@ Before shipping runtime code:
 - Does it read through `ctx.maxScene` and write through `ctx.js` or `node.transform`?
 - Are all runtime objects tracked/owned for cleanup and snapshot export?
 - Are TSL parameters declared with stable `// @param` names?
-- Are TSL nodes valid for Three.js `0.185.0`?
+- Are TSL nodes valid for Three.js r186 (`web/vendor/three-r186`)?
 - Do TSL defaults and physical params match **max.js cm unit scale** (not meter-based Three.js example values)?

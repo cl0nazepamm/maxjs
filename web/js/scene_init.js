@@ -15,6 +15,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
 import { copyMaxComponentsToWorld } from './max_basis.js';
+import { resolveWebGPULimits } from './webgpu_limits.js';
 
 // ─── Renderer ─────────────────────────────────────────────────────────
 
@@ -156,7 +157,8 @@ async function createWebGpuRenderer(canvas) {
             'Open snapshot.html for the WebGL deploy target instead.',
         );
     }
-    return new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true });
+    const requiredLimits = await resolveWebGPULimits();
+    return new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true, requiredLimits });
 }
 
 // ─── Scene + groups + cameras + controls ──────────────────────────────

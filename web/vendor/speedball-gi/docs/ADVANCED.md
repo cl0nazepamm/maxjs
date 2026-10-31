@@ -1,0 +1,256 @@
+# Advanced integration
+
+This document covers engine-level Speedball GI integration and the package's
+lower-level light-transport surfaces. The normal application path is the concise
+`installSpeedballGI()` example in the project README.
+
+## Renderer backends
+
+DDGI supports Three r185 through r187 `WebGPURenderer` with either its WebGPU backend or its
+WebGL2 fallback (`forceWebGL: true`). Call `renderer.init()` before checking
+`gi.isSupported()`. WebGL2 requires `EXT_color_buffer_float`; classic
+`WebGLRenderer` does not provide the required node-material integration.
+
+Both paths share BVH traversal, texture/alpha sampling, direct and emissive
+lighting, multibounce, sky injection, temporal filtering, probe classification,
+cascades, and all reflection tiers. WebGL uses integer/float data textures and
+fragment passes with separate read/write history. Atlas bindings remain stable
+through solves and compatible rebuilds. It performs no CPU readback during solving.
+It has extra history-copy bandwidth and lacks compute workgroup sharing, so tune
+ray budget and grid density for the target device.
+
+With `clusteredLighting` on WebGL, direct lighting uses the regular batched lights
+node and its configured `lights` caps. The GI light selection still uses the
+importance budget but traverses that list without compute-built cell lists.
+Forward+ raster clustering, spectral path tracing, and photon caustics remain
+WebGPU features.
+
+To verify both backends locally, install the peer dependencies, serve the repo
+with `python -m http.server 8778`, and run:
+
+```sh
+node --test tests/*.test.mjs
+playwright-cli open http://127.0.0.1:8778/tests/fixtures/gi-backends.html
+playwright-cli run-code --filename=tests/gi-backends.playwright.js
+```
+
+The browser checks compare probe values across backends for each reflection
+tier, then exercise textured emitters, live edits, sparse updates, and disposal.
+They require a browser/device supporting both WebGPU and WebGL2 float targets.
+
+## Installer ownership and lifecycle
+
+Call `installSpeedballGI()` before the first render. It installs the renderer's
+GI-aware lights-node factory and owns that hook together with the probe field.
+Always call the installer handle's `dispose()` before disposing renderer or scene
+resources.
+
+The stable handle exposes lifecycle, tuning, scene-dirty notifications, field
+queries, and reflections. Raw probe-node access, manual ticking,
+rebuild controls, pacing controls, and GPU diagnostics live under `gi.advanced`.
+That namespace is intentionally unstable and intended for adapters and test
+harnesses. Integrations that need complete ownership can instead import
+`createProbeField()` and `giLights` directly.
+
+Asynchronous field failures do not reject the render loop. Pass `onError(error)`
+to route them into host telemetry; it fires once per uninterrupted failure streak.
+
+Creation-time structural options include `divisions`, `rays`, `cascades`,
+`reflectionQuality`, and `clusteredLighting`. Grid, ray, and cascade changes also
+have rebuild-gated setters. Reflection quality and clustered lighting remain
+creation-time-only because they change GPU bindings and material graphs.
+
+## Hysteresis and sampling modes
+
+Hysteresis is the main stability/convergence control. It is normalized by default
+over each cascade's accepted solve cadence and fractional round-robin revisit
+interval. One sparse update never blends in more noise than the selected value
+admits at 60 Hz. At higher refresh rates, wall-time decay remains rate-invariant.
+
+The two supported sampling profiles are:
+
+- **Gated** holds its ray and emitter-visibility basis indefinitely. Its default
+  hysteresis is `0.60` for low-latency, mostly flicker-free lighting.
+- **Monte Carlo** re-jitters every accepted solve. Its default hysteresis is
+  `0.90` to absorb the fresh sample set.
+
+`setJitterMode()` remembers explicit hysteresis overrides independently for each
+mode. `setHysteresisNormalization(false)` exposes the raw per-update behavior.
+
+## Explicit scene changes
+
+Event-complete hosts should install with `autoDetectChanges: false`. Explicit
+packets continue to run during motion while compatibility scene-signature scans
+are skipped.
+
+```js
+gi.markTransformsDirty(mesh);
+gi.markTransformsDirty({ object: crowd, instanceIndex: 37 });
+gi.markDeformsDirty(streamedMesh);
+gi.markMaterialValuesDirty(material);
+gi.notifySceneChange({ type: 'transform', object: mesh });
+gi.notifySceneChange({ type: 'deform', object: streamedMesh });
+gi.notifySceneChange({ type: 'material', material });
+gi.notifySceneChange({ type: 'topology' });
+```
+
+Transform packets are coalesced during continuous motion. A traced object rewrites
+only its stable instance records and unique TLAS ancestor chain. Cameras, helpers,
+excluded objects, and other untraced targets are cheap no-ops.
+
+`InstancedMesh` allocation capacity is reserved in the TLAS at build time. Changes
+within `instanceMatrix.count` need only `markTransformsDirty()`. Capacity growth,
+new or removed geometry, connectivity changes, and material reassignment are
+structural and require `markTopologyDirty()`.
+
+Use `forceLightingRefresh()` for known light changes. Use
+`markMaterialValuesDirty()` for scalar/color material edits that keep the same
+material and texture bindings.
+
+## BLAS cache and off-thread builds
+
+A structural rebuild traces one BLAS per unique geometry. Two mechanisms keep
+that from hitching:
+
+- **Cross-rebuild cache.** Every field caches built BLASes by geometry
+  fingerprint, so a topology change pays only for the geometries it touched.
+  Hosts that switch scenes or recreate fields should own the cache:
+
+  ```js
+  import { createBlasCache, createProbeField } from 'speedball-gi';
+  const blasCache = createBlasCache({ maxTriangles: 4_000_000 });
+  const field = createProbeField({ renderer, scene, blasCache });
+  ```
+
+  By default the fingerprint is the `BufferGeometry` identity plus attribute
+  identity/version, so a reload misses. Stamp
+  `geometry.userData.speedballGeometryKey` with a content hash (string or
+  number) and identical meshes hit across reloads and across geometry
+  objects. The host owns invalidation: clear or re-stamp the key whenever it
+  writes position, normal, uv or index arrays in place. Attribute versions
+  are folded in as a second line of defence, and note that three's
+  `BufferGeometry.copy()` shares `userData` between a geometry and its clone.
+
+- **Off-thread builds.** Cache misses are built in a module-worker pool that
+  runs three-mesh-bvh's packed-tree builder (`js/blas_worker.js`) and returns
+  a tree byte-identical to a main-thread `MeshBVH`. `createProbeField({
+  blasWorkers })` takes `'auto'` (default: workers when the page can run
+  them), `false` (synchronous), a pool size, or `{ count, buildTreeUrl }` to
+  pin the builder URL when `import.meta.resolve('three-mesh-bvh')` does not
+  land on the package's `src/` or `build/` entry. Any init failure disables
+  workers for the session and builds synchronously. Soup gathering, tree
+  flattening and pool assembly stay on the main thread.
+
+`_debugState().blasCache` reports hits/misses/entries; `blasWorkers` reports
+the pool state and, when disabled, why.
+
+## Helpers
+
+- `excludeFromGI(object)` excludes an object and its subtree from tracing and
+  automatic bounds.
+- `prepareMaterialsForGI(scene)` can normalize an imported all-metal scene so it
+  contributes diffuse bounce. It mutates materials and is opt-in; the installer
+  also accepts `prepareMaterials: true`.
+- `autoPadding` / `setAutoPadding(scale)` scales the automatic safety border: `0` fits traced bounds, `1` preserves the default margin (20% per side, at least one cell), and `2` doubles it. Range: 0–4. Changes reuse the cached scene build; explicit bounds/volumes stay exact.
+- `setBounds(box)` overrides automatic field bounds.
+- `setVolumes(volumes)` supplies curated volume data to the low-level field.
+
+## Local DDGI reflections
+
+Choose `reflectionQuality` at creation. Reflection lobes reuse DDGI rays and add
+no reflection BVH traversal:
+
+- `off` allocates no reflection buffers, atlases, compute, or receiver sampling.
+- `rough` enables the compact stable rough lobe.
+- `high` adds an 8x8 glossy cache and continuous eight-probe gather. Complete tiles update together on every probe visit to avoid temporal striping.
+- `ultra` uses the legacy 16x16, full-rate glossy path.
+
+The legacy `roughReflections: false` and `true` values map to `off` and `ultra`.
+A named quality tier takes precedence.
+
+Local reflections use Three's native `context.radiance` path, leaving Standard
+and Physical BRDF, metallic F0, Fresnel, and DFG to Three. The receiver applies
+probe visibility and depth-moment parallax correction. Runtime controls include
+`setReflectionIntensity()` and `setRoughnessLimit()`.
+
+Set `material.userData.speedballReflections = false` before material compilation
+for a zero-sampling material opt-out. Recompile the material if this flag changes
+later.
+
+Reflection ownership remains composable:
+
+1. `scene.environment` or `material.envMap` supplies distant radiance.
+2. Speedball composites local DDGI coverage over it.
+3. SSR can overlay screen-space hits afterward.
+
+Probe-ray misses preserve the prior radiance by default. In a scene with an
+explicit Speedball sky but no environment map, enable `reflectionSkyFallback` to
+fill misses from the same SH-9 sky. Keep it disabled when PMREM or another system
+owns distant reflections.
+
+## Clustered lighting
+
+`clusteredLighting: true` replaces the batched dynamic raster lights node with
+Three's Forward+ clustered node. It is intended for many non-shadowed point lights;
+directional, spot, and shadow-casting lights retain their stock paths.
+
+The GI lane keeps a fixed 64-light arena and selects the most important records by
+power, spot solid angle, and proximity to the probe volume. Light-count changes
+rewrite the arena and count uniform without rebuilding the BVH.
+
+```js
+const gi = installSpeedballGI({
+  renderer,
+  scene,
+  camera,
+  clusteredLighting: {
+    maxLights: 1024,
+    tileSize: 32,
+    zSlices: 24,
+    maxLightsPerCluster: 64,
+  },
+});
+```
+
+## Additional package surfaces
+
+Speedball also ships lower-level light-transport entry points:
+
+- `speedball-gi/spectral-scene` and `speedball-gi/spectral-traverse` expose the
+  shared flattened scene, BVH, materials, lights, and traversal foundation.
+- `speedball-gi/caustics` exports `createCausticEngine` and receiver/caster presets.
+
+The caustic engine supports analytic and mesh emission, rigid caster updates with
+`setCasterTransform()`, and procedural deformation through `setCasterMesh(mesh,
+{ shaper })`. Refraction mode uses BVH-accelerated through-mesh Snell traversal
+and Cauchy-style chromatic R/G/B grids. Response controls include
+`setLightIntensity`, `setLightColor`, `setReceiverAlbedo`, `setStrength`, and
+`setLightCone(direction, angleRadians, penumbra)`.
+
+Plain CDN import maps can use:
+
+```text
+https://cdn.jsdelivr.net/npm/speedball-gi@0.7.0/js/index.js
+```
+
+Packed light records use 17 floats; slot 16 is reserved. Material records use 28
+floats; slot 25 is reserved and slot 26 stores traversal flags.
+
+Band-specific emitters such as IR illuminators are ordinary lights: a black
+light emits nothing, so gate one through its colour (max.js lights IR
+illuminators only while PowerShot senses NIR).
+
+## Limitations
+
+- `WebGPURenderer` only (WebGPU or WebGL2 backend).
+- Tested against Three r186 and r187 (`>=0.185.0 <0.188.0`); WebGPU/TSL and
+  cleanup code touches revision-specific renderer APIs.
+- One active probe field per module instance.
+- Standard/Physical-style materials are the target. Exotic node graphs,
+  transmission, alpha edge cases, and tiny normal-map detail remain approximate.
+- Probe reflections are stable and parallax-corrected, but are not pixel-accurate
+  mirrors or transmission. Use SSR for exact specular detail.
+- Large worlds and separated islands can waste probes without curated bounds.
+- Two-cascade mode currently targets Chromium WebGPU and needs more rays than one
+  grid for comparable smoothness.
+- Convergence is temporal; scene and light changes fade into the field.

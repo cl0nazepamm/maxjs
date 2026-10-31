@@ -1251,6 +1251,7 @@
             },
             get renderer() { return renderer; },
             get scene() { return scene; },
+            get camera() { return camera; },
             get nodeMap() { return nodeMap; },
             get lightProbe() { return lightProbe; },
             get lightProbeEnabled() { return lightProbeEnabled; },
@@ -1263,6 +1264,7 @@
         const {
             lightProbes,
             lightmapsSupported,
+            getSpeedballStatus,
             getLightmapCount,
             isLightmapBakePending,
             serializeRelayProbeGrids,
@@ -2216,6 +2218,7 @@
             toggleLightProbes: () => setLightProbesEnabled(!lightProbeEnabled),
             lightProbes,
             lightmapsSupported,
+            getSpeedballStatus,
             getLightmapCount,
             isLightmapBakePending,
             isLocalHdriActive,

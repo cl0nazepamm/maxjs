@@ -7,6 +7,11 @@
 // (lightmap_baker.js) for meshes with a Max channel 2 UV set. Until the first grid is
 // baked, and whenever probes are disabled, the ambient THREE.LightProbe carries the
 // HDRI or sky irradiance as before.
+//
+// The 'speedball' probe mode replaces the grids with Speedball GI's live traced
+// probes (speedball_probes.js, loaded on first use, node renderers only) in the
+// same helper volumes, or fitted to the scene. It adds bounce on top of the
+// HDRI, so it never owns the HDRI diffuse, and bakes no lightmaps.
 import * as THREE from 'three';
 import * as THREE_STD from 'three-std';
 import { LightProbeGenerator } from 'three/addons/lights/LightProbeGenerator.js';
@@ -33,6 +38,12 @@ function createLightProbeGlue(deps = {}) {
     let lightmapBakerPromise = null;
     let lightmapCount = 0;
     const lightmapsSupported = deps.renderer?.isWebGPURenderer === true;
+    let speedball = null;
+    let speedballLoading = null;
+    let speedballWanted = false;
+    let speedballHadData = false;
+    // Set when this renderer cannot run Speedball; the grids light the scene instead.
+    let speedballFailed = deps.renderer?.isWebGPURenderer !== true;
 
     const probes = createLightProbeSystem({
         renderer: deps.renderer,
@@ -71,7 +82,72 @@ function createLightProbeGlue(deps = {}) {
         }).catch((error) => deps.maxjsDebugWarn('max.js GI lightmaps unavailable:', error));
     }
 
+    function usingSpeedball() {
+        return settings.mode === 'speedball' && !speedballFailed;
+    }
+
+    // Speedball runs while wanted, pauses when not, and is released when the
+    // mode leaves it.
+    function syncSpeedball(on) {
+        if (!usingSpeedball()) {
+            speedballWanted = false;
+            speedball?.dispose();
+            speedball = null;
+            return;
+        }
+        speedballWanted = on;
+        if (speedball) {
+            speedball.setEnabled(on);
+            return;
+        }
+        if (!on || speedballLoading) return;
+        speedballLoading = import('../speedball_probes.js')
+            .then(({ createSpeedballProbes }) => createSpeedballProbes({
+                renderer: deps.renderer,
+                scene: deps.scene,
+                settings: settings.speedball,
+            }))
+            .then((created) => {
+                if (!created) throw new Error('needs WebGPU or WebGL2 with float render targets');
+                if (!usingSpeedball()) {
+                    created.dispose();
+                    return;
+                }
+                speedball = created;
+                speedball.setSettings(settings.speedball);
+                speedball.setVolumes(helperVolumes());
+                speedball.setEnabled(speedballWanted);
+            })
+            .catch((error) => {
+                deps.maxjsDebugWarn('max.js Speedball GI unavailable:', error);
+                speedballFailed = true;
+                applyLightProbeState();
+                scheduleLightProbeFromCurrentScene({ delay: 0 });
+            })
+            .finally(() => {
+                speedballLoading = null;
+                window.__maxjsSyncProbesPanel?.();
+            });
+    }
+
+    function getSpeedballStatus() {
+        if (settings.mode !== 'speedball') return null;
+        if (speedballFailed) return 'Speedball needs the WebGPU renderer; using grids';
+        if (!speedball) return speedballLoading ? 'Loading Speedball...' : 'Speedball off';
+        if (!speedball.enabled) return 'Speedball paused';
+        const stats = speedball.getStats();
+        return `Speedball: ${stats.probes} probes, ${stats.rays} rays${speedball.hasData() ? '' : ' (tracing...)'}`;
+    }
+
     function updateLightProbes() {
+        if (speedball) {
+            speedball.update({ camera: deps.camera, playing: deps.maxTimeline?.playing?.() === true });
+            const hasData = speedball.hasData();
+            if (hasData !== speedballHadData) {
+                speedballHadData = hasData;
+                window.__maxjsSyncProbesPanel?.();
+            }
+        }
         probes.update();
         if (!lightmapBaker?.baking) return;
         const done = lightmapBaker.update(LIGHTMAP_MESHES_PER_FRAME);
@@ -102,13 +178,18 @@ function createLightProbeGlue(deps = {}) {
         return target;
     }
 
-    function currentVolumes() {
+    function helperVolumes() {
         const volumes = [];
         for (const [handle, data] of probeGridData) {
             if (!data.enabled || !data.size || !data.div) continue;
             const helper = deps.nodeMap.get(handle);
             if (helper) volumes.push(volumeFromHelper(helper, data.size, data.div));
         }
+        return volumes;
+    }
+
+    function currentVolumes() {
+        const volumes = helperVolumes();
         if (volumes.length) return volumes;
         const bounds = sceneMeshBounds();
         return bounds.isEmpty() ? [] : [autoVolume(bounds, settings.density)];
@@ -122,8 +203,11 @@ function createLightProbeGlue(deps = {}) {
 
     function applyLightProbeState() {
         const enabled = deps.lightProbeEnabled && !deps.isHdriReflectionOnlyEffective() && !suspended;
-        probes.setEnabled(enabled);
-        const nextGridActive = enabled && probes.grids.length > 0;
+        // Speedball holds no HDRI light, so reflection-only HDRI keeps it.
+        syncSpeedball(deps.lightProbeEnabled && !suspended);
+        const grids = enabled && !usingSpeedball();
+        probes.setEnabled(grids);
+        const nextGridActive = grids && probes.grids.length > 0;
         deps.lightProbe.intensity = enabled && !nextGridActive ? deps.lightProbeIntensity : 0;
         if (nextGridActive !== gridActive) {
             gridActive = nextGridActive;
@@ -132,8 +216,8 @@ function createLightProbeGlue(deps = {}) {
         }
     }
 
-    // The NIR band view suspends probe GI: grids and GI lightmaps hold light
-    // baked in the visible band. The user's toggle is untouched.
+    // The NIR band view suspends probe GI: grids, GI lightmaps and Speedball's
+    // probes hold visible-band light. The user's toggle is untouched.
     function setLightProbesSuspended(on) {
         const next = on === true;
         if (next === suspended) return;
@@ -168,18 +252,25 @@ function createLightProbeGlue(deps = {}) {
         if (lightmapsSupported && settings.lightmaps) deps.bridge.send?.('sync_lightmap_uvs', { reason: 'gi-lightmaps' });
     }
 
-    function rebakeLightProbes({ refreshLightmapUvs = false } = {}) {
+    // Speedball finds scene edits itself; it re-traces on `retrace` (Rebake).
+    function rebakeLightProbes({ refreshLightmapUvs = false, retrace = true } = {}) {
         if (rebakeTimer) {
             clearTimeout(rebakeTimer);
             rebakeTimer = 0;
         }
         if (!deps.lightProbeEnabled) return;
-        if (refreshLightmapUvs) requestLightmapUvs();
         deps.scene.updateMatrixWorld(true);
+        if (usingSpeedball()) {
+            speedball?.setVolumes(helperVolumes());
+            if (retrace) speedball?.retrace();
+            return;
+        }
+        if (refreshLightmapUvs) requestLightmapUvs();
         if (!probes.setVolumes(currentVolumes())) probes.requestBake();
     }
 
-    // Scene, light and environment edits rebake the grids once the scene rests.
+    // Scene, light and environment edits rebake the grids once the scene rests,
+    // and move Speedball's volumes with their helpers.
     function scheduleLightProbeFromCurrentScene({ force = false, delay = SCENE_REBAKE_DELAY_MS } = {}) {
         if (!deps.lightProbeEnabled && !force) return;
         if (rebakeTimer) clearTimeout(rebakeTimer);
@@ -189,7 +280,7 @@ function createLightProbeGlue(deps = {}) {
                 return;
             }
             rebakeTimer = 0;
-            rebakeLightProbes();
+            rebakeLightProbes({ retrace: false });
         }, delay);
     }
 
@@ -227,6 +318,11 @@ function createLightProbeGlue(deps = {}) {
     function applyLightProbeSettings(next = {}, { persist = false } = {}) {
         const previous = settings;
         settings = probes.setSettings(next);
+        if (settings.mode !== previous.mode) {
+            applyLightProbeState();
+            if (settings.mode === 'grid') scheduleLightProbeFromCurrentScene({ delay: 0 });
+        }
+        speedball?.setSettings(settings.speedball);
         if (Number(next.density) && probeGridData.size === 0) scheduleLightProbeFromCurrentScene({ delay: 0 });
         if (settings.lightmaps !== previous.lightmaps || settings.lightmapResolution !== previous.lightmapResolution) {
             if (settings.lightmaps && !previous.lightmaps) requestLightmapUvs();
@@ -240,10 +336,11 @@ function createLightProbeGlue(deps = {}) {
     }
 
     // Settings persist with the post FX state; snapshots also carry the volumes.
+    // Speedball carries only helper volumes and fits the scene itself without one.
     function serializeSnapshotLightProbes() {
         return {
             settings: { ...settings, showProbes: false },
-            volumes: currentVolumes(),
+            volumes: settings.mode === 'speedball' ? helperVolumes() : currentVolumes(),
         };
     }
 
@@ -266,12 +363,14 @@ function createLightProbeGlue(deps = {}) {
         get baking() { return probes.baking; },
         get lightmaps() { return lightmapCount; },
         get settings() { return settings; },
+        get speedball() { return speedball; },
         setSettings: (next) => applyLightProbeSettings(next, { persist: true }),
     };
 
     return {
         lightProbes: probes,
         lightmapsSupported,
+        getSpeedballStatus,
         getLightmapCount: () => lightmapCount,
         isLightmapBakePending: () => lightmapBaker?.baking === true,
         serializeRelayProbeGrids,

@@ -2,7 +2,13 @@
 import * as THREE from 'three';
 import { powerShotInfraredPresetUiDefaults } from '../fx/final/powershot.js';
 import { getHostProfile } from '../host_profile.js';
-import { LIGHT_PROBE_DEFAULTS, LIGHT_PROBE_LIMITS } from '../light_probes.js';
+import {
+    LIGHT_PROBE_DEFAULTS,
+    LIGHT_PROBE_LIMITS,
+    SPEEDBALL_DEFAULTS,
+    SPEEDBALL_LIMITS,
+    lightProbesFromLegacySpeedballGi,
+} from '../light_probes.js';
 
 const LIGHT_PROBE_CONTROLS = Object.freeze([
     { key: 'intensity', label: 'Intensity', step: 0.05, format: (v) => v.toFixed(2) },
@@ -10,6 +16,15 @@ const LIGHT_PROBE_CONTROLS = Object.freeze([
     { key: 'density', label: 'Auto density', step: 1, format: String, hint: 'Probes along the longest scene axis when no Light Probe Grid helper is placed.' },
     { key: 'probesPerFrame', label: 'Probes / frame', step: 8, format: String, hint: 'Bake budget per frame. Higher finishes sooner and stutters more.' },
 ].map((control) => ({ ...control, min: LIGHT_PROBE_LIMITS[control.key][0], max: LIGHT_PROBE_LIMITS[control.key][1] })));
+
+// Speedball mode's everyday controls; the rest of its tuning rides the saved
+// settings (maxjsLightProbes.setSettings({ speedball: { ... } })).
+const SPEEDBALL_PROBE_CONTROLS = Object.freeze([
+    { key: 'intensity', label: 'Intensity', step: 0.05, format: (v) => v.toFixed(2) },
+    { key: 'divisions', label: 'Divisions', step: 1, format: String, hint: 'Probes along the longest scene axis when no Light Probe Grid helper is placed.' },
+    { key: 'rays', label: 'Rays / probe', step: 16, format: String, hint: 'Rays traced per probe each solve. More is smoother and slower.' },
+    { key: 'hysteresis', label: 'Hysteresis', step: 0.01, format: (v) => v.toFixed(2), hint: 'History kept per update. Higher is steadier and slower to follow changes.' },
+].map((control) => ({ ...control, min: SPEEDBALL_LIMITS[control.key][0], max: SPEEDBALL_LIMITS[control.key][1] })));
 
 function createPostFxGlue(deps = {}) {
         let syncClonePanelFn = null;
@@ -1021,12 +1036,33 @@ function createPostFxGlue(deps = {}) {
                         </div>
                         <div class="fx-note" id="fx-probes-status" style="margin:0;padding:2px 0;color:#666;font-size:9px">Irradiance probe grids. Light Probe Grid helpers set the volumes; without one the grid fits the scene.</div>
                         <div class="fx-grid">
+                            <label class="fx-control" for="fx-probes-mode" title="Grid bakes three.js irradiance grids. Speedball traces live probes every frame (WebGPU renderer).">
+                                <div class="fx-control-head"><span>Mode</span></div>
+                                <select id="fx-probes-mode" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
+                                    <option value="grid">Grid</option>
+                                    <option value="speedball">Speedball</option>
+                                </select>
+                            </label>
+                            ${SPEEDBALL_PROBE_CONTROLS.map(control => `
+                            <label class="fx-control" for="fx-probes-sb-${control.key}" data-probe-mode="speedball">
+                                <div class="fx-control-head"><span title="${control.hint || ''}">${control.label}</span><span class="fx-value" id="fx-probes-sb-${control.key}-val"></span></div>
+                                <input class="fx-range" id="fx-probes-sb-${control.key}" title="${control.hint || ''}" type="range" min="${control.min}" max="${control.max}" step="${control.step}">
+                            </label>`).join('')}
+                            <label class="fx-control" for="fx-probes-sb-reflections" data-probe-mode="speedball" title="Local reflections from the probes. Changing it rebuilds the field.">
+                                <div class="fx-control-head"><span>Reflections</span></div>
+                                <select id="fx-probes-sb-reflections" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
+                                    <option value="off">Off</option>
+                                    <option value="rough">Rough</option>
+                                    <option value="high">High</option>
+                                    <option value="ultra">Ultra</option>
+                                </select>
+                            </label>
                             ${LIGHT_PROBE_CONTROLS.map(control => `
-                            <label class="fx-control" for="fx-probes-${control.key}">
+                            <label class="fx-control" for="fx-probes-${control.key}" data-probe-mode="grid">
                                 <div class="fx-control-head"><span title="${control.hint || ''}">${control.label}</span><span class="fx-value" id="fx-probes-${control.key}-val"></span></div>
                                 <input class="fx-range" id="fx-probes-${control.key}" title="${control.hint || ''}" type="range" min="${control.min}" max="${control.max}" step="${control.step}">
                             </label>`).join('')}
-                            <label class="fx-control" for="fx-probes-cubemap" title="Capture resolution of each probe face. Higher is sharper and slower to bake.">
+                            <label class="fx-control" for="fx-probes-cubemap" data-probe-mode="grid" title="Capture resolution of each probe face. Higher is sharper and slower to bake.">
                                 <div class="fx-control-head"><span>Capture size</span></div>
                                 <select id="fx-probes-cubemap" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
                                     <option value="8">8</option>
@@ -1034,9 +1070,9 @@ function createPostFxGlue(deps = {}) {
                                     <option value="32">32</option>
                                 </select>
                             </label>
-                            <label class="fx-check" for="fx-probes-show"><span>Show probes</span><input id="fx-probes-show" type="checkbox"></label>
-                            <label class="fx-check" for="fx-probes-lightmaps" title="Bake the probe irradiance into lightmaps on meshes with a Max map channel 2 UV set. WebGPU renderer only."><span>GI lightmaps</span><input id="fx-probes-lightmaps" type="checkbox"></label>
-                            <label class="fx-control" for="fx-probes-lightmap-size" title="Lightmap size of the largest surface; smaller surfaces scale down by area.">
+                            <label class="fx-check" for="fx-probes-show" data-probe-mode="grid"><span>Show probes</span><input id="fx-probes-show" type="checkbox"></label>
+                            <label class="fx-check" for="fx-probes-lightmaps" data-probe-mode="grid" title="Bake the probe irradiance into lightmaps on meshes with a Max map channel 2 UV set. WebGPU renderer only."><span>GI lightmaps</span><input id="fx-probes-lightmaps" type="checkbox"></label>
+                            <label class="fx-control" for="fx-probes-lightmap-size" data-probe-mode="grid" title="Lightmap size of the largest surface; smaller surfaces scale down by area.">
                                 <div class="fx-control-head"><span>Lightmap size</span></div>
                                 <select id="fx-probes-lightmap-size" style="background:#222;color:#aaa;border:1px solid #444;padding:3px 6px;font:10px 'Segoe UI',system-ui,sans-serif;width:100%">
                                     <option value="64">64</option>
@@ -1547,9 +1583,22 @@ function createPostFxGlue(deps = {}) {
                 const probesShow = document.getElementById('fx-probes-show');
                 const probesLightmaps = document.getElementById('fx-probes-lightmaps');
                 const probesLightmapSize = document.getElementById('fx-probes-lightmap-size');
+                const probesMode = document.getElementById('fx-probes-mode');
+                const probesReflections = document.getElementById('fx-probes-sb-reflections');
                 const syncProbesPanel = () => {
                     const settings = deps.getLightProbeSettings();
                     const on = deps.lightProbeEnabled === true;
+                    if (probesMode && document.activeElement !== probesMode) probesMode.value = settings.mode;
+                    for (const element of document.querySelectorAll('[data-probe-mode]')) {
+                        element.style.display = element.dataset.probeMode === settings.mode ? '' : 'none';
+                    }
+                    for (const control of SPEEDBALL_PROBE_CONTROLS) {
+                        const input = document.getElementById(`fx-probes-sb-${control.key}`);
+                        const val = document.getElementById(`fx-probes-sb-${control.key}-val`);
+                        if (input && document.activeElement !== input) input.value = String(settings.speedball[control.key]);
+                        if (val) val.textContent = control.format(settings.speedball[control.key]);
+                    }
+                    if (probesReflections && document.activeElement !== probesReflections) probesReflections.value = settings.speedball.reflectionQuality;
                     if (probesToggle) {
                         probesToggle.textContent = on ? 'On' : 'Off';
                         probesToggle.classList.toggle('active', on);
@@ -1571,7 +1620,10 @@ function createPostFxGlue(deps = {}) {
                         probesLightmapSize.disabled = !deps.lightmapsSupported || !settings.lightmaps;
                         if (document.activeElement !== probesLightmapSize) probesLightmapSize.value = String(settings.lightmapResolution);
                     }
-                    if (probesStatus) {
+                    const speedballStatus = deps.getSpeedballStatus();
+                    if (probesStatus && speedballStatus) {
+                        probesStatus.textContent = speedballStatus;
+                    } else if (probesStatus) {
                         const grids = deps.lightProbes.grids;
                         const count = grids.reduce((sum, g) => sum + g.resolution.x * g.resolution.y * g.resolution.z, 0);
                         const lightmaps = deps.getLightmapCount();
@@ -1609,6 +1661,19 @@ function createPostFxGlue(deps = {}) {
                 if (probesShow) probesShow.onchange = () => applyProbeSetting('showProbes', probesShow.checked, true);
                 if (probesLightmaps) probesLightmaps.onchange = () => applyProbeSetting('lightmaps', probesLightmaps.checked, true);
                 if (probesLightmapSize) probesLightmapSize.onchange = () => applyProbeSetting('lightmapResolution', Number(probesLightmapSize.value), true);
+                if (probesMode) probesMode.onchange = () => applyProbeSetting('mode', probesMode.value, true);
+                const applySpeedballSetting = (key, value, persist) => applyProbeSetting('speedball', { [key]: value }, persist);
+                for (const control of SPEEDBALL_PROBE_CONTROLS) {
+                    const input = document.getElementById(`fx-probes-sb-${control.key}`);
+                    if (!input) continue;
+                    input.oninput = () => applySpeedballSetting(control.key, Number(input.value), false);
+                    input.onchange = () => applySpeedballSetting(control.key, Number(input.value), true);
+                    bindRangeReset(input, {
+                        defaultValue: SPEEDBALL_DEFAULTS[control.key],
+                        apply: (raw) => applySpeedballSetting(control.key, Number(raw), true),
+                    });
+                }
+                if (probesReflections) probesReflections.onchange = () => applySpeedballSetting('reflectionQuality', probesReflections.value, true);
                 syncProbesPanel();
             }
 
@@ -2177,8 +2242,12 @@ function createPostFxGlue(deps = {}) {
                     deps.cameraClip.far = Number.isFinite(saved.cameraClip.far) && saved.cameraClip.far > 0 ? saved.cameraClip.far : null;
                     deps.applyCameraClipOverrides(deps.camera);
                 }
+                // Scenes saved before Speedball became a probe mode carry speedballGi.
+                const legacyProbes = saved.lightProbes?.settings ? null : lightProbesFromLegacySpeedballGi(saved.speedballGi);
                 if (saved.lightProbes?.settings) {
                     deps.applyLightProbeSettings(saved.lightProbes.settings);
+                } else if (legacyProbes?.enabled) {
+                    deps.applyLightProbeSettings(legacyProbes.settings);
                 }
                 if (saved.performance) {
                     if (Number.isFinite(saved.performance.fpsCap)) {

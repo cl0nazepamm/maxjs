@@ -7,10 +7,105 @@
 // A bake renders into staging grids that stay out of the scene, a few probes per
 // frame, and swaps them in once every bounce pass is done. The live grids are
 // hidden during each capture so their previous result never feeds the new one.
+//
+// The probe settings also choose the mode: 'grid' (these grids) or 'speedball'
+// (Speedball GI's live traced probes, speedball_probes.js, node renderers only).
 
 import * as THREE from 'three';
 
+// Speedball GI tuning (mode 'speedball'). Same keys as the speedballGi block
+// older max.js scenes and snapshots carry.
+export const SPEEDBALL_DEFAULTS = Object.freeze({
+    intensity: 10,
+    divisions: 16,
+    autoPadding: 1,
+    rays: 64,
+    cascades: 1,
+    continuous: true,
+    jitterMode: 'gated',
+    reflectionQuality: 'off',
+    hysteresis: 0.9,
+    hysteresisNormalize: true,
+    normalBias: 1.75,
+    radianceClamp: 8,
+    depthSharpness: 40,
+    cheby: 0.5,
+    classify: 0,
+    filter: 1,
+    smoothness: 1,
+    detail: 1,
+    reflectionIntensity: 1,
+    changeThreshold: 2.5,
+    snapAmount: 0.3,
+    fireflyClamp: 6,
+});
+
+export const SPEEDBALL_LIMITS = Object.freeze({
+    intensity: [0, 32],
+    divisions: [2, 32],
+    autoPadding: [0, 4],
+    rays: [32, 256],
+    hysteresis: [0.5, 0.99],
+    normalBias: [0, 8],
+    radianceClamp: [0, 64],
+    depthSharpness: [1, 200],
+    cheby: [0, 1],
+    classify: [0, 1],
+    filter: [0, 1],
+    smoothness: [0, 1],
+    detail: [0, 1],
+    reflectionIntensity: [0, 1],
+    changeThreshold: [0.5, 8],
+    snapAmount: [0, 0.9],
+    fireflyClamp: [1, 20],
+});
+
+const REFLECTION_QUALITIES = ['off', 'rough', 'high', 'ultra'];
+
+export function normalizeSpeedballSettings(input = {}, base = SPEEDBALL_DEFAULTS) {
+    const source = input && typeof input === 'object' ? input : {};
+    const out = { ...SPEEDBALL_DEFAULTS, ...base };
+    for (const [key, range] of Object.entries(SPEEDBALL_LIMITS)) {
+        if (key in source) out[key] = clampNumber(source[key], range, out[key]);
+    }
+    out.divisions = Math.round(out.divisions);
+    out.rays = Math.round(out.rays / 16) * 16;
+    if ('cascades' in source) out.cascades = Math.round(Number(source.cascades)) === 2 ? 2 : 1;
+    if ('continuous' in source) out.continuous = source.continuous !== false;
+    if ('hysteresisNormalize' in source) out.hysteresisNormalize = source.hysteresisNormalize !== false;
+    if (source.jitterMode === 'gated' || source.jitterMode === 'montecarlo') out.jitterMode = source.jitterMode;
+    // Named tiers win; older scenes stored a roughReflections switch.
+    if (REFLECTION_QUALITIES.includes(source.reflectionQuality)) out.reflectionQuality = source.reflectionQuality;
+    else if ('roughReflections' in source) out.reflectionQuality = source.roughReflections === true ? 'ultra' : 'off';
+    // The change boost cannot exceed what the hysteresis leaves room for.
+    out.snapAmount = Math.min(out.snapAmount, Math.max(0, Math.round((out.hysteresis - 0.55) * 100) / 100));
+    return out;
+}
+
+// Light probe state ({ enabled, settings, volumes }) for the speedballGi block
+// of a scene or snapshot saved before Speedball became a probe mode. Its
+// volumes are world boxes with optional probe counts (`res`); none means the
+// field fits the scene.
+export function lightProbesFromLegacySpeedballGi(legacy) {
+    if (!legacy || typeof legacy !== 'object') return null;
+    const volumes = [];
+    for (const entry of Array.isArray(legacy.volumes) ? legacy.volumes : []) {
+        const min = Array.isArray(entry?.min) ? entry.min.map(Number) : null;
+        const max = Array.isArray(entry?.max) ? entry.max.map(Number) : null;
+        if (!min || !max || min.length < 3 || max.length < 3 || ![...min, ...max].every(Number.isFinite)) continue;
+        const res = Array.isArray(entry.res) && entry.res.length >= 3 ? entry.res.map((n) => Math.round(Number(n))) : null;
+        volumes.push({ min: min.slice(0, 3), max: max.slice(0, 3), resolution: res?.every(Number.isFinite) ? res.slice(0, 3) : null });
+    }
+    return {
+        enabled: legacy.enabled === true,
+        settings: { mode: 'speedball', speedball: normalizeSpeedballSettings(legacy) },
+        volumes,
+    };
+}
+
 export const LIGHT_PROBE_DEFAULTS = Object.freeze({
+    mode: 'grid',
+    speedball: SPEEDBALL_DEFAULTS,
     intensity: 1,
     bounces: 2,
     cubemapSize: 16,
@@ -45,6 +140,8 @@ export function normalizeLightProbeSettings(input = {}, base = LIGHT_PROBE_DEFAU
     const pick = (key) => source[key] ?? base[key];
     const cubemapSize = Math.round(Number(pick('cubemapSize')));
     return {
+        mode: pick('mode') === 'speedball' ? 'speedball' : 'grid',
+        speedball: normalizeSpeedballSettings(source.speedball, base.speedball ?? SPEEDBALL_DEFAULTS),
         intensity: clampNumber(pick('intensity'), LIGHT_PROBE_LIMITS.intensity, LIGHT_PROBE_DEFAULTS.intensity),
         bounces: Math.round(clampNumber(pick('bounces'), LIGHT_PROBE_LIMITS.bounces, LIGHT_PROBE_DEFAULTS.bounces)),
         cubemapSize: CUBEMAP_SIZES.includes(cubemapSize) ? cubemapSize : LIGHT_PROBE_DEFAULTS.cubemapSize,

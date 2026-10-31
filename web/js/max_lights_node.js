@@ -597,6 +597,9 @@ export default class MaxLightsNode extends DynamicLightsNode {
                 HASH_DATA.push(0);
             }
         }
+        // The probe GI token moves only on enable and grid resize, never on
+        // probe data writes, so updates do not recompile materials.
+        if (probeGiNode?.active) typeSet.add(probeGiNode.cacheToken);
         for (const token of [...typeSet].sort()) HASH_DATA.push(NodeUtils.hashString(token));
         const key = NodeUtils.hashArray(HASH_DATA);
         HASH_DATA.length = 0;
@@ -712,6 +715,11 @@ export default class MaxLightsNode extends DynamicLightsNode {
             lightNodes.push(dataNode);
         }
 
+        // Probe GI adds its bounce into context.irradiance, unmasked. It comes
+        // after materialLightings, so a reflection composite sees the
+        // EnvironmentNode first.
+        if (probeGiNode?.active && !lightmapped) lightNodes.push(probeGiNode);
+
         this._lightNodes = lightNodes;
         return lightNodes;
     }
@@ -758,6 +766,13 @@ export default class MaxLightsNode extends DynamicLightsNode {
 }
 
 export const maxLights = (options = {}) => new MaxLightsNode(options);
+
+// Speedball's probe node (speedball_probes.js) while its field exists, else
+// null. It joins the graph and the cache key only while `active`.
+let probeGiNode = null;
+export function setProbeGiNode(node) {
+    probeGiNode = node ?? null;
+}
 
 export function installMaxLightsRenderer(renderer, options = {}) {
     if (!renderer?.lighting?.createNode) return false;

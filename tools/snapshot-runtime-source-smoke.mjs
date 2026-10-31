@@ -166,12 +166,20 @@ assert.match(snapshotExportSource, /const std::wstring bvhDependency = webDir \+
     'standalone export resolves three-mesh-bvh for runtime layers');
 assert.match(snapshotExportSource, /CopyDirectoryRecursive\(bvhDependency, outDir \+ L"\\\\node_modules\\\\three-mesh-bvh"\)/,
     'standalone export copies three-mesh-bvh beside the snapshot runtime');
-assert.doesNotMatch(snapshotExportSource, /speedball/i, 'standalone export no longer ships Speedball');
+assert.match(snapshotExportSource, /CopyDirectoryRecursive\(speedballVendor, outDir \+ L"\\\\vendor\\\\speedball-gi"\)/,
+    'standalone export copies Speedball for the speedball probe mode');
 for (const page of snapshotPages) {
-    assert.doesNotMatch(page, /speedball-gi/, 'snapshot shells no longer map Speedball');
+    assert.match(page, /"speedball-gi": "\.\/vendor\/speedball-gi\/js\/index\.js"/,
+        'every snapshot shell maps Speedball to the copied vendor');
     assert.match(page, /"three-mesh-bvh": "\.\/node_modules\/three-mesh-bvh\/src\/index\.js"/,
         'every snapshot shell maps three-mesh-bvh to the copied dependency');
 }
+assert.match(probeReplay, /exported\?\.settings\?\.mode === 'speedball'/,
+    'snapshot probes replay the speedball mode');
+assert.match(probeReplay, /snapshotUi\?\.speedballGi\?\.enabled === true[\s\S]*lightProbesFromLegacySpeedballGi/,
+    'snapshots exported with speedballGi replay it as the speedball probe mode');
+assert.ok(probeReplay.indexOf('speedballGi') < probeReplay.indexOf('lightProbeEnabled === false'),
+    'legacy speedballGi ran whatever the light probe toggle said');
 
 assert.match(sceneLightsSource, /THREE\.MathUtils\.clamp\(penumbra, 0, 1\)/,
     'snapshot light replay clamps old out-of-range spotlight penumbra values');

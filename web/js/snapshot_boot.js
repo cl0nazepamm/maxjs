@@ -610,11 +610,61 @@ async function registerOptionalModules(features, ctx) {
 // Probe grids rebake at boot from the exported settings and world-space volumes
 // (light_probes.js), like the editor. While a grid lights the scene it owns the
 // HDRI's diffuse irradiance, which it captured with occlusion.
-async function createSnapshotLightProbes({ renderer, scene, snapshotUi } = {}) {
-    const exported = snapshotUi?.lightProbes;
-    if (snapshotUi?.lightProbeEnabled === false || !Array.isArray(exported?.volumes) || exported.volumes.length === 0) {
+// Speedball probe mode: the field converges before the first frame and re-traces
+// when late textures land, so its bounce reflects the textured scene. It finds
+// scene edits itself.
+async function createSnapshotSpeedballProbes({ renderer, scene, exported }) {
+    const { createSpeedballProbes } = await import('./speedball_probes.js');
+    const speedball = await createSpeedballProbes({ renderer, scene, settings: exported.settings?.speedball });
+    if (!speedball) {
+        console.warn('[snapshot_boot] Speedball GI needs a WebGPU renderer');
         return null;
     }
+    speedball.setVolumes(Array.isArray(exported.volumes) ? exported.volumes : []);
+    speedball.setEnabled(true);
+    const loadingManager = THREE.DefaultLoadingManager;
+    const priorOnLoad = loadingManager.onLoad;
+    const onTexturesSettled = () => {
+        if (typeof priorOnLoad === 'function') priorOnLoad();
+        speedball.retrace();
+    };
+    loadingManager.onLoad = onTexturesSettled;
+    return {
+        system: null,
+        speedball,
+        requestBake() {},
+        update: () => speedball.update({ playing: maxTimeline.playing?.() === true }),
+        setSuspended: (on) => speedball.setEnabled(on !== true),
+        dispose() {
+            if (loadingManager.onLoad === onTexturesSettled) loadingManager.onLoad = priorOnLoad ?? undefined;
+            speedball.dispose();
+        },
+    };
+}
+
+async function createSnapshotLightProbes({ renderer, scene, snapshotUi } = {}) {
+    const exported = snapshotUi?.lightProbes;
+    // Snapshots exported before Speedball became a probe mode carry speedballGi,
+    // which ran whatever the light probe toggle said.
+    if (!exported && snapshotUi?.speedballGi?.enabled === true) {
+        const { lightProbesFromLegacySpeedballGi } = await import('./light_probes.js');
+        try {
+            return await createSnapshotSpeedballProbes({ renderer, scene, exported: lightProbesFromLegacySpeedballGi(snapshotUi.speedballGi) });
+        } catch (error) {
+            console.warn('[snapshot_boot] Speedball GI unavailable', error);
+            return null;
+        }
+    }
+    if (snapshotUi?.lightProbeEnabled === false) return null;
+    if (exported?.settings?.mode === 'speedball') {
+        try {
+            return await createSnapshotSpeedballProbes({ renderer, scene, exported });
+        } catch (error) {
+            console.warn('[snapshot_boot] Speedball GI unavailable', error);
+            return null;
+        }
+    }
+    if (!Array.isArray(exported?.volumes) || exported.volumes.length === 0) return null;
     try {
         const [{ createLightProbeSystem }, { installHdriDiffuseSplit }] = await Promise.all([
             import('./light_probes.js'),

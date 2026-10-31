@@ -178,7 +178,20 @@
             return false;
         }
 
-        // The snapshot import maps resolve three-mesh-bvh for runtime layers.
+        // Speedball GI runs the 'speedball' light probe mode and replays older
+        // speedballGi snapshots.
+        const std::wstring speedballVendor = webDir + L"\\vendor\\speedball-gi";
+        if (!DirectoryExists(speedballVendor + L"\\js")) {
+            error = L"Snapshot runtime dependency missing: web/vendor/speedball-gi/js";
+            return false;
+        }
+        if (!CopyDirectoryRecursive(speedballVendor, outDir + L"\\vendor\\speedball-gi")) {
+            error = L"Failed to copy snapshot runtime Speedball vendor";
+            return false;
+        }
+
+        // The snapshot import maps resolve three-mesh-bvh for runtime layers
+        // and Speedball's scene BVH.
         const std::wstring bvhDependency = webDir + L"\\node_modules\\three-mesh-bvh";
         if (!DirectoryExists(bvhDependency + L"\\src")) {
             error = L"Snapshot runtime dependency missing: web/node_modules/three-mesh-bvh/src";

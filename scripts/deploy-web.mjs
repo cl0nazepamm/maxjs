@@ -10,15 +10,19 @@
 //   node scripts/deploy-web.mjs --target=PATH
 //   node scripts/deploy-web.mjs --target=PATH --watch
 //   node scripts/deploy-web.mjs --target=PATH --paths=js,snapshot.html
+//   node scripts/deploy-web.mjs --target=PATH --include-vendor --prune
 //
 // Behavior:
 //   - Files in web/* that are newer (or missing in dst) are copied.
-//   - Files only in the target are LEFT ALONE; this script never deletes.
-//   - node_modules/ and vendor/ are huge but rarely change; we still
-//     stat-check them so a vendor bump propagates. First sync of these
-//     is the slow one.
+//   - Files only in the target are left alone unless --prune is passed,
+//     which deletes them from the subtrees this run mirrors (removed
+//     modules, old vendor trees). Other top-level target entries are
+//     never touched.
+//   - node_modules/ and vendor/ are huge but rarely change, so they are
+//     skipped unless --include-vendor is passed. Pass it after a vendor
+//     bump; the first sync of these is the slow one.
 
-import { stat, mkdir, readdir, copyFile } from 'node:fs/promises';
+import { stat, mkdir, readdir, copyFile, rm } from 'node:fs/promises';
 import { existsSync, watch as watchSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -43,10 +47,12 @@ function parseArgs(argv) {
         target: null,
         paths: null,
         includeVendor: false,
+        prune: false,
     };
     for (const a of argv) {
         if (a === '--watch') args.watch = true;
         else if (a === '--include-vendor') args.includeVendor = true;
+        else if (a === '--prune') args.prune = true;
         else if (a.startsWith('--target=')) {
             const target = a.slice('--target='.length).trim();
             if (!target) throw new Error('--target requires a non-empty path');
@@ -99,7 +105,30 @@ async function syncDir(srcDir, dstDir, opts, accum) {
     }
 }
 
-async function syncOnce({ src, dst, paths, skipHeavy }) {
+async function countFiles(dir) {
+    let count = 0;
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+        count += entry.isDirectory() ? await countFiles(path.join(dir, entry.name)) : 1;
+    }
+    return count;
+}
+
+// Delete everything under dstDir that has no counterpart under srcDir.
+async function pruneDir(srcDir, dstDir, accum) {
+    if (!existsSync(dstDir)) return;
+    for (const entry of await readdir(dstDir, { withFileTypes: true })) {
+        const subSrc = path.join(srcDir, entry.name);
+        const subDst = path.join(dstDir, entry.name);
+        if (!existsSync(subSrc)) {
+            accum.pruned += entry.isDirectory() ? await countFiles(subDst) : 1;
+            await rm(subDst, { recursive: true, force: true });
+        } else if (entry.isDirectory()) {
+            await pruneDir(subSrc, subDst, accum);
+        }
+    }
+}
+
+async function syncOnce({ src, dst, paths, skipHeavy, prune = false }) {
     if (!existsSync(src)) {
         console.error(`[deploy-web] source missing: ${src}`);
         process.exit(1);
@@ -110,7 +139,7 @@ async function syncOnce({ src, dst, paths, skipHeavy }) {
         process.exit(1);
     }
 
-    const accum = { copied: 0, skipped: 0, bytes: 0 };
+    const accum = { copied: 0, skipped: 0, pruned: 0, bytes: 0 };
     const tStart = performance.now();
 
     const targets = paths && paths.length
@@ -129,6 +158,7 @@ async function syncOnce({ src, dst, paths, skipHeavy }) {
         const sStat = await stat(subSrc);
         if (sStat.isDirectory()) {
             await syncDir(subSrc, subDst, { skipHeavy }, accum);
+            if (prune) await pruneDir(subSrc, subDst, accum);
         } else if (sStat.isFile()) {
             const copied = await maybeCopy(subSrc, subDst, sStat);
             if (copied) { accum.copied++; accum.bytes += sStat.size; }
@@ -143,6 +173,7 @@ async function syncOnce({ src, dst, paths, skipHeavy }) {
         : `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
     console.log(
         `[deploy-web] ${accum.copied} copied, ${accum.skipped} skipped, ` +
+        (prune ? `${accum.pruned} pruned, ` : '') +
         `${fmt(accum.bytes)} in ${ms.toFixed(0)} ms` +
         (skipHeavy ? '  (skipped vendor/, node_modules/)' : ''),
     );
@@ -202,6 +233,7 @@ async function main() {
             dst: args.target,
             paths: args.paths,
             skipHeavy: !args.includeVendor,
+            prune: args.prune,
         });
         watchMode({ src: SRC_DEFAULT, dst: args.target, paths: args.paths });
         return;
@@ -212,6 +244,7 @@ async function main() {
         dst: args.target,
         paths: args.paths,
         skipHeavy: !args.includeVendor,
+        prune: args.prune,
     });
 }
 

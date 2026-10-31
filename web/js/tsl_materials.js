@@ -46,6 +46,9 @@ export function makeBakeNodeToTexture(renderer, THREE, { onComplete = () => {} }
                 format: THREE.RGBAFormat,
                 type: THREE.UnsignedByteType,
             });
+            // Drawn once and read back: pipeline pacing (pipeline_warmup.js)
+            // must never skip this draw, or the bake stays blank for good.
+            rt.texture.userData.maxjsOneShot = true;
             const mat = new THREE.MeshBasicNodeMaterial();
             mat.colorNode = colorNode;
             const quad = new THREE.QuadMesh(mat);

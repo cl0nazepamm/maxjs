@@ -1,110 +1,80 @@
-# Three.js r186 migration
+# Three.js r187 migration
 
-Based on the official [185 → 186 migration guide](https://github.com/mrdoob/three.js/wiki/Migration-Guide#185--186)
-and [r186 release notes](https://github.com/mrdoob/three.js/releases/tag/r186).
+Based on the official [186 → 187 migration guide](https://github.com/mrdoob/three.js/wiki/Migration-Guide#186--187)
+and [r187 release notes](https://github.com/mrdoob/three.js/releases/tag/r187).
 
 ## Runtime and features
 
-- Pin npm Three to `0.186.0`; editor, both snapshot entrypoints and native snapshot export use `vendor/three-r186`.
-- Update `postprocessing` to `^6.39.5` for r186 peer compatibility and clean npm installs.
-- Physical material: **Retroreflection / Strength** (`physicalRetroreflectivity` in Max, `retroreflectivity` in scene JSON). Includes live scalar updates and snapshot animation. Default zero preserves existing materials.
-- Sky map: cloud coverage, density, scale and elevation; optional **Cascaded shadows** using native `SunLight` on all three backends. Shadow distance uses viewer scene units. Clouds and sun shadows default off. Clouds stay static; existing approximate sky lighting/reflections remain.
-- Rename the classic GI grid to `LightProbeGridWebGL`; remove obsolete GTAO distance controls and `Sky.up`/`SkyMesh.upUniform` assignments.
-- New Max parameter IDs are appended; retired IDs remain reserved.
+- Pin npm Three to `0.187.0`; editor, both snapshot entrypoints and native snapshot export use `vendor/three-r187`.
+- Renderer backends: classic `WebGLRenderer` (WebGL mode) and `WebGPURenderer` (WebGPU, falling back to its WebGL2 backend, "TSL_GL"). The spectral render mode is gone.
+- **Probe GI** (`js/light_probes.js`, editor glue `js/editor/light_probe_glue.js`): stock r187 irradiance probe grids on every renderer — `LightProbeGrid` on `WebGPURenderer`, `LightProbeGridWebGL` on `WebGLRenderer`. Max **Light Probe Grid** helpers (class ID unchanged; formerly "Speedball GI Probe Grid") set the grid volumes; without one the grid fits the visible meshes. Grids bake in time slices into staging grids that swap in once every bounce pass is done; scene, light and environment edits rebake once the scene rests (never during playback). While a grid lights the scene it owns the HDRI's diffuse irradiance (`environment_lighting.js`), because it captured the environment with occlusion. Snapshots export the settings and world-space volumes and rebake at boot.
+- **GI lightmaps** (`js/lightmap_baker.js`, node renderers): r187 `LightMapper` bakes the probe grids' irradiance into per-mesh lightmaps on Max map channel 2 (`uv1`), sized by surface area. They apply through the bake system's per-mesh material instances; file lightmap overrides win while enabled. Lightmapped materials skip the probe grid in `MaxLightsNode` so bounce is not counted twice, and probe captures mute GI lightmaps so a rebake does not feed on its own output. Channel 2 UVs are outside the host's geometry change hash, so enabling lightmaps or a manual Rebake requests `sync_lightmap_uvs`.
+- **Path tracing** (`js/editor/path_tracer.js`, glue `js/editor/pathtracing_glue.js`): three-gpu-pathtracer's `WebGPUPathTracer` (the tracer r187's `webgpu_renderer_pathtracer` example uses) replaces the spectral tracer. Native WebGPU only, live-viewer only. Edits flow through `updateTransforms` / `updateMaterials` / `updateLights` / `updateEnvironment`, in-place deformation refits the existing BVH, and new geometry rebuilds through `setScene`. The renderer rollout maps **Render samples** to Render to Image / Sequence capture samples, **Max bounces** to `maxBounces` and **GI clamp** to `clampIndirect`.
+- **Speedball GI removed:** its probe field, surfel volume, BLAS cache and geometry content keys, sky feed, native `gi_surface_bin` / `gi_light_bin` / `gi_probe_refresh` packets and the snapshot replay. IR illuminators (`userData.emitterClass`) are plain lights gated by color in `js/ir_emitters.js`: black until PowerShot infrared/NightShot senses NIR, then white × illuminator gain, on every renderer.
+
+## Migration guide items
+
+- `Light.registerNode()` replaces `NodeLibrary.addLight()` / `getLightNodeClass()`: `sky_parameters.js` registers `SunLightNode` once; `MaxLightsNode` resolves per-light nodes through `light._lightNode`, like upstream `LightsNode`.
+- r187 refactored `DynamicLightsNode` to build per-instance data nodes in `setLights()`. `MaxLightsNode` keeps its renderer-shared data nodes, calls `LightsNode.setLights` directly, and now keys its program from upstream `LightsNode.customCacheKey` (adds the shadow-version hashing from #35019) over its non-batched lights.
+- PMREMs on cube render targets, `setViewport` / `setScissor` with a bound render target, `pixelationPass`, struct storage buffers, `iridescenceThicknessRange` and the r177 removals (`transformedNormal*`, `ColorManagement.{from,to}WorkingColorSpace`): no max.js usage.
 
 ## Vendor provenance
 
-`vendor/three-r186/build` is `three@0.186.0` from npm with one backported
-upstream fix and two local fixes filed upstream as open PRs (all below). Upstream
-`examples/jsm` is stored as `examples` to preserve max.js import-map layout.
-Existing extra decoder/encoder libraries and `examples/materialx` regression
-fixtures are retained. The only edited upstream r186 addon files are below.
+`vendor/three-r187/build` is `three@0.187.0` from npm, unmodified. The three r186
+build patches are gone: the `ContextNode.setup()` backport (#34531) and the
+`getSharedContext()` loop-state deletes (#34650) ship in r187, and the shadow
+pipeline churn patch (#34647) was closed upstream in favor of #35232, which ships
+in r187 (the source material is now part of override-pass render object keys).
+The DREAM `Plane001` churn has not been re-measured on r187.
+
+Upstream `examples/jsm` is stored as `examples` to preserve max.js import-map
+layout, plus the `examples/materialx` regression fixtures. Libraries npm does not
+ship (ammo, rhino3dm, ecsy, lottie, opentype, draco_encoder) are no longer vendored.
+The only edited upstream r187 addon files:
 
 | File under `examples/` | Retained compatibility fix |
 | --- | --- |
-| `tsl/display/TemporalReprojectNode.js` | Size history from source depth and guard copies whose extents differ during resize. Upstream still sizes from the drawing buffer. |
+| `tsl/display/TemporalReprojectNode.js` | Size history from source depth and copy depth only on an exact size match. |
 | `tsl/display/RecurrentDenoiseNode.js` | Size denoise history from source depth in a reduced-resolution chain. |
-| `tsl/display/TRAANode.js` | Skip an incompatible previous-depth copy during resize. |
-| `loaders/materialx/MaterialXSurfaceMappings.js` | Convert opacity to float instead of indexing it. Stock r186 emits invalid scalar indexing for existing scalar-opacity documents; reproduced on WebGPU and TSL_GL. Color opacity still selects its first component. |
-| `loaders/materialx/MaterialXDocument.js` | Carry the normalmap-result marker through references/type conversions. |
-| `loaders/materialx/MaterialXNodeLibrary.js` | Avoid decoding Max's nested normalmap wrappers twice. Keep r186's world-space normal calculation and surface transform. |
+| `tsl/display/TRAANode.js` | Copy previous depth only when the history target matches the depth source. |
+| `loaders/materialx/MaterialXSurfaceMappings.js` | Convert opacity to float instead of indexing it; stock r187 still emits `0.7[0u]` for scalar opacity. |
 
-The temporal fixes retain their inline max.js comments; MaterialX edits are also
-marked inline. Recheck these six files against upstream on the next upgrade.
+Stock r187 temporal nodes still size from the drawing buffer (also on `dev`), so a
+post stack at a reduced resolution scale fails WebGPU's full-subresource depth copy
+rule (`tools/temporal-resize.playwright.js`). The r186 MaterialX normal-map edits
+(`MaterialXDocument.js`, `MaterialXNodeLibrary.js`) are dropped: r187's loader passes
+the Max-exported nested normal map pixel comparison unmodified.
 
-**Build backport — `build/three.webgpu.js` and `build/three.webgpu.nodes.js`,
-`ContextNode.setup()`:** drop the `return node;` that r186 added. Upstream
-`f6080cc6f0` ("ContextNode: Avoid redundant calls", #34251) made `setup()` return
-the child's build result; on context-heavy graphs that re-runs subgraph setup, and
-Speedball GI's traversal kernel went from 52 ms (r185) to ~8 s of synchronous
-node building on r186 — DREAM's boot freeze. Found by bisecting 220 upstream
-commits; `a32e4d658c` ("Nodes: Make build more efficient", #34531, 2026-09-11)
-removes the `return` again, and this hunk is exactly that part of it. Drop the
-backport when upgrading to a release that contains `a32e4d658c` (r187+). The
-same bytes are mirrored to `clone-llc/vendor/three-r186/build/three.webgpu.js`.
-
-**Build fix — same two files, `NodeBuilder.getSharedContext()`:** also delete
-`nodeLoop` and `nodeBlock` (marked inline `max.js:`). Nodes that build a separate
-material from `context( builder.getSharedContext() )` (`RTTNode`, SSGI, DOF, …)
-inherited the parent's loop state when first set up inside a `Loop` body. DOF
-samples its `convertToTexture()` input only inside `Loop( 64 )`, so an SSGI
-composite under DOF built its whole material "inside a loop" and every top-level
-`.toVar()` re-added itself to the stack being iterated — an infinite main-thread
-loop (plastic-botanic never loaded; 26M → 41M stack nodes in 8 s). r186 made it
-reachable by moving SSGI's shared context onto `material.contextNode` (#34025).
-Filed upstream as [#34650](https://github.com/mrdoob/three.js/pull/34650) (open;
-§21 in `docs/THREEJS_UPSTREAM_PR_CANDIDATES.md`) — the same two lines. Drop when a
-release contains it. Mirrored to the clone-llc copy like the backport above.
-
-**Build fix — same two files, `Renderer.renderObject()`:** a shadow override pass
-without a `passId` now derives one from the resolved shadow side (`_shadowPassIds`,
-marked inline `max.js:`). The shared shadow material's `side` is set per draw, and
-all groups of a multi-material caster share one shadow RenderObject; with mixed
-sides the render cache key flipped between groups and a new render pipeline was
-created synchronously every frame (DREAM `Plane001`: ~120/s, forever). Separate
-RenderObjects per side keep both pipelines cached. DREAM: 492 → 2 synchronous
-`createRenderPipeline` calls per load, shadows unchanged. The two code lines are
-exactly those of the open upstream PR
-[#34647](https://github.com/mrdoob/three.js/pull/34647) (§20); only the comment
-differs (marker). Drop when a release contains it. Mirrored to the clone-llc copy.
-
-## Removed or reduced patches
-
-- **SSR:** use unmodified r186 `SSRNode`. The old numeric-cast vendor change is removed; SSR and denoising render on WebGPU and TSL_GL at reduced resolution.
-- **DOF:** remove `stabilizeDofSetup` and the manual CoC-blur reaper. Upstream now constructs and disposes the blur node ([PR #34188](https://github.com/mrdoob/three.js/pull/34188)). Keep max.js alpha composition and ownership of input RTT nodes.
-- **MaterialX:** replace the old loader fork with r186's loader/modules, keeping only the compatibility edits listed above. Max's scalar-plus-map weighting and legacy IOR alias move to shared `js/materialx_compat.js`, used by editor and snapshot loading. This expresses weights as standard MaterialX multiplication and keeps zero-weight lobes disabled.
-- **HDRI:** replace the copied `EnvironmentNode.setup` body with `js/environment_lighting.js`, a small diffuse-intensity hook around upstream setup. This preserves r186 specular/retroreflection behavior.
-- **PostFX disposal:** let r186 `PassNode`, `RTTNode` and `RenderPipeline` release their own render targets/materials. Keep cleanup for detached temporal textures and explicit ownership of factory-created RTT inputs.
+`vendor/three-gpu-pathtracer` is three-gpu-pathtracer `main` at `1df8ec7b8a`
+(2026-10-31, the r187 port; unreleased — 0.0.27 still binds struct storage buffers
+the r186 way). It peers on `three-mesh-bvh` `0.9.17` from `web/node_modules`.
 
 ## App-side safeguards still present
+
+Carried over from the r186 audit; not re-audited for r187 unless noted.
 
 | Area | Why retained |
 | --- | --- |
 | `js/fx/viewport_registry.js` | Per-render-target viewport texture clones still require explicit eviction. |
-| `js/fx/core.js` | Retire the whole pipeline on graph changes; retain the historical stale-graph safeguard and detached temporal-texture cleanup. Long-duration leak elimination is not claimed by this migration. |
-| `js/fx/effects/ssgi.js` | r186 still uses `UnsignedInt101111Type` for GI; retain the `rg11b10ufloat-renderable` device check. |
+| `js/fx/core.js` | Retire the whole pipeline on graph changes; retain the stale-graph safeguard and detached temporal-texture cleanup. |
+| `js/fx/effects/ssgi.js` | Retain the `rg11b10ufloat-renderable` device check for the GI target. |
 | `js/editor/renderer_core.js` | Request supported device limits needed by large scenes. |
-| `js/gpu_normals.js` | Keep compute normals disabled while Three storage-buffer preparation mutates itemSize-3 attributes. |
-| `js/editor/boot.js` | Keep per-material environment intensity policy and asynchronous Inspector detach/timestamp shutdown. r186 Inspector disposal does not restore timestamp tracking. |
-| `js/max_lights_node.js` | Keep observer/light-linking markers, finite point/spot handling and volumetric link bypass. These are max.js behavior and regression protections. |
+| `js/gpu_normals.js` | Keep compute normals disabled while storage-buffer preparation mutates itemSize-3 attributes. |
+| `js/editor/boot.js` | Keep per-material environment intensity policy and asynchronous Inspector detach/timestamp shutdown. |
+| `js/max_lights_node.js` | Keep observer/light-linking markers, finite point/spot handling and volumetric link bypass. |
+| `js/environment_lighting.js` | HDRI diffuse split hook; audited against r187 `EnvironmentNode.setup()`, now on both node backends. |
 | Material/environment loaders | Keep pending-texture binding guards, PMREM render-target ownership wrappers, and EXR `m44f` warning filtering. |
-
-The older local `docs/THREEJS_UPSTREAM_PR_CANDIDATES.md` is a historical r185
-inventory. This file records the r186 migration decisions; retained historical
-safeguards are not claims of newly reproduced upstream defects.
 
 ## Verification
 
-- Build `maxjs` Release with the Max 2026 SDK. Installation into a running Max session is separate.
-- `node tools/check_esm_graph.mjs`
-- `node tools/volumetric-light-source-smoke.mjs`
-- Runtime lifecycle, mesh reuse, surface sampling, vanilla runtime and M3 protocol smokes.
-- `node tools/snapshot-runtime-parity-smoke.mjs`
-- Browser regression: start `node tools/split_smoke_server.mjs 8901`, open that URL with `playwright-cli`, then run `tools/three-r186.playwright.js` and `tools/three-r186-materialx.playwright.js` with `run-code --filename=...`.
+- Build `maxjs` Release (`build.bat 2027` here; Max 2026 is not installed on this machine).
+- `node tools/check_esm_graph.mjs` and the node smokes in `tools/*-smoke.mjs`.
+- Browser regressions: start `node tools/split_smoke_server.mjs 8901`, open it with `playwright-cli`, then `run-code --filename=` each of `tools/three-r187.playwright.js`, `tools/three-r187-materialx.playwright.js`, `tools/temporal-resize.playwright.js`, `tools/light-probes.playwright.js` and `tools/lightmap-pathtracer.playwright.js`.
 
-The browser checks render retroreflection, clouds and sun shadows with pixel
-readback on WebGPU, TSL_GL and classic WebGL; exercise SSR/SSGI/GTAO/DOF/TRAA and
-SSR denoising on both node backends; compile 24 MaterialX fixtures per node
-backend; and compare pixels for Max-exported weighted/disabled lobes and nested
-normal maps. These checks do not replace a newly exported scene from the native
-plugin or a long-running GPU-memory soak.
+The browser checks render retroreflection, clouds and sun shadows on WebGPU, TSL_GL
+and classic WebGL; exercise SSR/SSGI/GTAO/DOF/TRAA and SSR denoising on both node
+backends, also while resizing at a reduced resolution scale; compile the MaterialX
+fixtures per node backend with Max-export pixel comparisons; bake probe grids on all
+three backends (bounce reaches an unlit wall, staged swap, disable); bake GI lightmaps
+on both node backends; and accumulate, update and capture the path tracer on WebGPU.
+They do not replace a long-running GPU-memory soak.

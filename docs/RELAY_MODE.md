@@ -69,12 +69,13 @@ it. Disabling Relay unregisters the host observer and tears the producer down.
 ## Forwarded lanes
 
 Every sync lane the local viewer consumes is forwarded once a baseline is
-established. Binary continuations: `delta_bin`, `geo_fast`, `gi_surface_bin`,
-`gi_light_bin` (native HALO-GI packets). JSON continuations: `scene` (SLOW
-JSON baseline), `geo_fast`, `xform`, `hair_fast`, `cam`, `audio_update`,
-`gltf_update`, `webapp_update`, `env_update`, `probeGrids`, `clay_mode`, plus
-the panel-owned `haloGiSettings` / `probeGrids` state replayed after every
-baseline.
+established. Binary continuations: `delta_bin`, `geo_fast`. JSON
+continuations: `scene` (SLOW JSON baseline), `geo_fast`, `xform`, `hair_fast`,
+`cam`, `audio_update`, `gltf_update`, `webapp_update`, `env_update`,
+`probeGrids`, `clay_mode`, plus the panel-owned `lightProbeSettings` /
+`probeGrids` state replayed after every baseline. `probeGrids` carries each Max
+Light Probe Grid helper's size and divisions; `lightProbeSettings` carries the
+viewer's three.js probe grid settings.
 
 The lane set is additive over time. A consumer must ignore frame and message
 types it does not implement — throwing on an unknown lane makes `RelayClient`

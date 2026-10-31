@@ -1,29 +1,22 @@
 # Runtime packages
 
-- Speedball GI: `0.9.0`; Three r185/r186, with `three-mesh-bvh` pinned to `0.9.14`.
-- PowerShot: `0.10.0`; runtime modules and the flare atlas match `PowerShot-threejs/src`.
+- Three.js: `0.187.0` in `vendor/three-r187` (stock build; four addon patches listed in `THREE_MIGRATION.md`).
+- three-gpu-pathtracer: `main` at `1df8ec7b8a` (unreleased r187 port) in `vendor/three-gpu-pathtracer`; the editor's path tracing view only. `src/` is upstream except that `webgpu/nodes/aux.wgsl.js` is renamed `auxBuffers.wgsl.js` (imports updated): `aux` is a reserved Windows device name, which Git for Windows refuses to add or check out.
+- three-mesh-bvh: `0.9.17` from `web/node_modules` (the path tracer's peer; also mapped for runtime layers in snapshots).
+- PowerShot: `0.10.0`; runtime modules and the flare atlas match `PowerShot-threejs/src`, including its uncommitted Aura infrared profile in `infrared.js`.
 - Sigils is a standalone package/demo, not a max.js runtime dependency.
 
-Speedball's published runtime modules match the sibling source, including the
-0.9.0 BLAS worker/cache work (`js/blas_cache.js`, `js/blas_worker.js`; see its
-`docs/CHANGELOG.md`). The unshipped `gi_settings.js` demo
-helper retains max.js's continuous-solve control. `docs/CHANGELOG.md` is the
-current upstream changelog; the root changelog is historical.
+Global illumination is stock three.js: `LightProbeGrid` / `LightProbeGridWebGL`
+irradiance probes (`js/light_probes.js`) and `LightMapper` GI lightmaps
+(`js/lightmap_baker.js`). Host integration stays in max.js: `editor/light_probe_glue.js`
+fits grid volumes to Max Light Probe Grid helpers and schedules rebakes from native
+scene events; `max_lights_node.js` owns lighting and light links; `ir_emitters.js`
+gates IR illuminators for PowerShot's NIR modes.
 
-BLAS caching across scene switches: `scene_binary.js` stamps a content hash on
-`geometry.userData.speedballGeometryKey` for live decodes and clears it on every
-in-place attribute write; `editor/gi_volume_glue.js` owns one session-wide
-`createBlasCache()` and passes it (with `blasWorkers: 'auto'`) to every probe
-field. Snapshot boot does not stamp keys. The snapshot exporter copies
-`vendor/speedball-gi` and `node_modules/three-mesh-bvh` whole, which the module
-worker needs (`src/core/build/buildTree.js`).
+The path tracer is imported lazily on the first switch into the path tracing view
+(`editor/path_tracer.js`), so neither it nor `three-mesh-bvh/webgpu` loads unless used.
+Snapshots never include it. The snapshot exporter copies `vendor/three-r187` (build,
+examples, LICENSE, README, package.json), `vendor/powershot-threejs` and
+`node_modules/three-mesh-bvh`.
 
-Keep host integration in max.js: `editor/gi_volume_glue.js` constructs probe fields
-with automatic scene scanning disabled; `max_lights_node.js` owns lighting, light
-links and NIR sensing. Native scene events drive targeted invalidations. Snapshot
-boot installs the same lighting before restoring GI. Do not replace these paths
-with the standalone installer.
-
-Validation: GI budget/centroid tests, GI settings and hysteresis checks, timeline
-and snapshot source checks, snapshot runtime parity, PowerShot persistence, and
-`tools/gi-backends.html` against the actual vendored Three runtime.
+Validation: the browser regressions and node smokes listed in `THREE_MIGRATION.md`.

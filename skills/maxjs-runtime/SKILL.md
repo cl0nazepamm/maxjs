@@ -328,7 +328,7 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 - `ctx.audio`: Max audio origins + layer SFX — `list()`, `play(handle)`, `stop(handle)`, `setVolume(handle, v)` (holds until Max re-syncs that origin), `muted`, and `playOneShot(url, { volume, position, refDistance, loop })` → `{ stop(), active }`. Positional when `position` (Vector3 or `[x,y,z]` world) is given; one-shots are silenced automatically on layer dispose. Audio requires a prior user gesture (browser autoplay policy) — one-shots fired before that are dropped.
 - `ctx.services`: shared service registry between layers.
 - `ctx.runtime`: runtime metadata and helpers; includes `ctx.runtime.gltf`.
-- `ctx.spectral`: authored spectral material overrides. `setNirAlbedo(selector, value)` assigns scalar NIR reflectance without requiring a TSL material and returns a disposable live handle.
+- `ctx.spectral`: NIR material overrides for PowerShot infrared/NightShot. `setNirAlbedo(selector, value)` assigns scalar NIR reflectance without requiring a TSL material and returns a disposable live handle.
 - `ctx.THREE`: same Three.js namespace passed as the second factory arg.
 
 After changing `ctx.params` persistence or snapshot transport, run:
@@ -339,10 +339,11 @@ node tools/runtime-layer-lifecycle-smoke.mjs
 node tools/snapshot-runtime-parity-smoke.mjs
 ```
 
-## Spectral Material Tags
+## NIR Material Tags
 
 Use `ctx.spectral.setNirAlbedo(selector, value)` to author the scalar NIR
-reflectance consumed by the spectral tracer. Values clamp to `[0, 1]`. The
+reflectance PowerShot's infrared and NightShot modes see. Values clamp to `[0, 1]`
+unless `{ max }` allows more. The
 assignment follows late-synced nodes, survives material rebuilds, replays in
 snapshots, and restores the previous material value when disposed. Cleanup is
 also automatic when the owning layer unloads.
@@ -377,9 +378,11 @@ still one Three.js material, so its NIR value changes everywhere it is used.
 Material name selectors check both the current Three material name and the
 original Max material name retained by baked/runtime replacements.
 
-`nirAlbedo` is currently consumed by the spectral path tracer. The SPC/probe
-raster path continues using visible material albedo while only its IR-light
-band gate changes.
+While PowerShot infrared or NightShot senses NIR, a tagged material's diffuse
+color becomes grey at its `nirAlbedo` level; a TSL material can instead provide
+`userData.maxjsNirColorNode` / `maxjsNirEmissiveNode` for the NIR pass. Lights
+whose `emitterClass` marks them as IR illuminators stay black until then and
+light at white × the PowerShot illuminator gain.
 
 `ctx.camera` can lock to Max scene cameras and expose the live render camera:
 
@@ -479,6 +482,7 @@ function replayTo(t) {
 - The directional shadow frustum fits the bounds of visible **synced Max meshes** only, so runtime meshes outside them are clipped and a large set spreads the map thin. A Max helper named `ShadowMapOrigin` (radius in the name, cm: `ShadowMapOrigin_r500`) pins the frustum center and radius.
 - max.js lights (`Directional_lightlight`, `Hemisphere_Light`, `Point_Light`, `Spot_Light`, `Rect_Area_Light`, `Ambient_Light`) aim along the node's local **−Y**. Their colors reach `light.color.setRGB()` unconverted, so a Max swatch is read as linear.
 - Background/environment are read-only to layers (`ctx.maxScene.background|environment|fog`). Raw writes to `ctx.renderer.sceneRoot` are overwritten by host environment sync. Author the environment in Max, or use a runtime sky mesh. `ctx.renderer.pmremFromScene()` / `pmremFromEquirectangular()` return untracked textures: `ctx.js.own()` them.
+- Indirect light comes from three.js irradiance probe grids (`LightProbeGrid`, or `LightProbeGridWebGL` on classic WebGL) fitted to Max Light Probe Grid helpers, or to the scene when there are none. They light runtime meshes too. Bakes capture the scene as it was; layer mutations reschedule one once the scene rests, never during playback. Meshes with a Max map channel 2 UV set can take baked GI lightmaps instead (node renderers, Light Probes panel). The path tracing view (WebGPU, live viewer only) traces synced and runtime meshes alike.
 
 ## PowerShot
 
@@ -525,7 +529,7 @@ Rules and behavior:
 - Returned handle: `fx.params`, `fx.uniform(name)`, `fx.matched` (handles), `fx.active`, `fx.dispose()` (restores the original material nodes). Disposal is automatic on layer dispose/hot reload.
 - Deformation binds per material: meshes sharing one Max material deform together. Assign a unique material in Max to isolate one object.
 - Geometry stays at rest on the CPU — `ctx.maxScene.raycast` and `sampleSurface` read undeformed positions.
-- TSL nodes must follow the three.js r186 chaining rules (see TSL Material Snippets below).
+- TSL nodes must follow the three.js r187 chaining rules (see TSL Material Snippets below).
 - The three.js Deform modifier flag is NOT required for `ctx.deform.attach`. Use the flag as the authoring marker (`n => n.jsmod` / `listJsmodNodes()`); it IS mandatory for `ctx.deform.simulate` and any other buffer-writing deformation because it stops fastsync geometry rebuilds from stomping the buffers.
 
 ### `ctx.deform.simulate` — Stateful Compute Simulation
@@ -620,7 +624,7 @@ material.alphaTestNode = ...;
 material.positionNode = ...; // vertex displacement
 ```
 
-TSL in this repo is Three.js r186 (`web/vendor/three-r186`). Use method chaining, not JS infix operators:
+TSL in this repo is Three.js r187 (`web/vendor/three-r187`). Use method chaining, not JS infix operators:
 
 ```js
 const t = TSL.time.mul(params.strength);
@@ -670,5 +674,5 @@ Before shipping runtime code:
 - Does it read through `ctx.maxScene` and write through `ctx.js` or `node.transform`?
 - Are all runtime objects tracked/owned for cleanup and snapshot export?
 - Are TSL parameters declared with stable `// @param` names?
-- Are TSL nodes valid for Three.js r186 (`web/vendor/three-r186`)?
+- Are TSL nodes valid for Three.js r187 (`web/vendor/three-r187`)?
 - Do TSL defaults and physical params match **max.js cm unit scale** (not meter-based Three.js example values)?

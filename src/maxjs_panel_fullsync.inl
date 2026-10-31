@@ -188,6 +188,7 @@
         SendProbeGridSync();
         SendRenderOutputSettings(true);
         ResetFastPathState(true);
+        RefreshMaterialSyncBaselines(t);
         CapturePlaybackDeliveredStateAtTime(t);
         return true;
     }
@@ -1065,6 +1066,7 @@
         SendProbeGridSync();
         SendRenderOutputSettings(true);
         ResetFastPathState(true);
+        RefreshMaterialSyncBaselines(t);
         CapturePlaybackDeliveredStateAtTime(t);
         return true;
     }

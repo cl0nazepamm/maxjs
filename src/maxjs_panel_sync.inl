@@ -637,8 +637,12 @@
         if (!ip) return;
         TimeValue t = ip->GetTime();
         bool changed = false;
+        bool needsFullSync = false;
         std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
 
+        // Keep scanning after the first full-sync hit so every node sharing
+        // the edited material gets its hashes refreshed (see
+        // NotifyMaterialEditedTarget).
         for (ULONG handle : geomHandles_) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
@@ -677,9 +681,8 @@
                 fastScalarIt->second = state.fastScalarHash;
 
                 if (structureChanged || scalarChanged || !state.canFastSync) {
-                    materialFastDirtyHandles_.clear();
-                    SetDirtyImmediate();
-                    return;
+                    needsFullSync = true;
+                    continue;
                 }
 
                 materialFastDirtyHandles_.insert(handle);
@@ -708,6 +711,11 @@
             }
         }
 
+        if (needsFullSync) {
+            materialFastDirtyHandles_.clear();
+            SetDirtyImmediate();
+            return;
+        }
         if (changed) QueueFastFlush();
     }
 
@@ -1432,6 +1440,7 @@
         TimeValue t = ip->GetTime();
         bool changed = false;
         bool cacheStale = false;
+        bool needsFullSync = false;
         std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
         const std::vector<ULONG> handles = FindMaterialEditHandles(target);
         Mtl* targetMtl = dynamic_cast<Mtl*>(target);
@@ -1440,6 +1449,11 @@
             return;
         }
 
+        // Visit every node sharing the edited material, even once a full sync
+        // is known to be needed. Stopping at the first one left the other
+        // sharers on pre-edit hashes; the idle crawler then "discovered" each
+        // of them as a structure change, one confirmed full sync (plus a
+        // geometry resend) per node, for seconds after a single edit.
         for (ULONG handle : handles) {
             INode* node = ip->GetINodeByHandle(handle);
             if (!node) {
@@ -1468,10 +1482,8 @@
                 mtlScalarHashMap_[handle] = state.scalarHash;
                 mtlFastScalarHashMap_[handle] = state.fastScalarHash;
                 if (!state.canFastSync) {
-                    materialFastDirtyHandles_.clear();
-                    ClearMaterialEditHandleCache();
-                    SetDirtyImmediate();
-                    return;
+                    needsFullSync = true;
+                    continue;
                 }
                 materialFastDirtyHandles_.insert(handle);
                 fastDirtyHandles_.insert(handle);
@@ -1486,16 +1498,21 @@
             mtlScalarHashMap_[handle] = state.scalarHash;
             mtlFastScalarHashMap_[handle] = state.fastScalarHash;
             if (structureChanged || scalarChanged || !state.canFastSync) {
-                materialFastDirtyHandles_.clear();
-                ClearMaterialEditHandleCache();
-                SetDirtyImmediate();
-                return;
+                needsFullSync = true;
+                continue;
             }
             if (fastScalarChanged) {
                 materialFastDirtyHandles_.insert(handle);
                 fastDirtyHandles_.insert(handle);
                 changed = true;
             }
+        }
+
+        if (needsFullSync) {
+            materialFastDirtyHandles_.clear();
+            ClearMaterialEditHandleCache();
+            SetDirtyImmediate();
+            return;
         }
 
         if (changed) {
@@ -2731,6 +2748,19 @@
         QueueFastFlush();
     }
 
+    // Face groups — and so the geometry payload — depend on the material only
+    // for Multi/Sub nodes: ExtractMesh records raw face matIDs and the full
+    // sync emits groups only through ShouldEmitMultiSubMaterialGroups. A
+    // single material's structure change (on a textured material that is any
+    // edit, color included) must not force a geometry re-extract and resend.
+    void InvalidateMaterialGroupGeometry(INode* node, ULONG handle) {
+        Mtl* multiMtl = node ? FindMultiSubMtl(node->GetMtl()) : nullptr;
+        if (!multiMtl || multiMtl->NumSubMtls() <= 0) return;
+        groupCache_.erase(handle);
+        geoHashMap_.erase(handle);
+        lastBBoxHash_.erase(handle);
+    }
+
     void MarkMaterialNodesDirty(const NodeEventNamespace::NodeKeyTab& nodes, bool structured) {
         if (nodes.Count() <= 0) return;
         Interface* ip = GetCOREInterface();
@@ -2788,11 +2818,7 @@
                 fastScalarIt->second = state.fastScalarHash;
 
                 if (structureChanged || scalarChanged || !state.canFastSync) {
-                    if (structureChanged) {
-                        groupCache_.erase(handle);
-                        geoHashMap_.erase(handle);
-                        lastBBoxHash_.erase(handle);
-                    }
+                    if (structureChanged) InvalidateMaterialGroupGeometry(current, handle);
                     needsFullSync = true;
                     return;
                 }
@@ -2800,7 +2826,9 @@
                 materialFastDirtyHandles_.insert(handle);
                 if (fastDirtyHandles_.insert(handle).second) changed = true;
             });
-            if (needsFullSync) break;
+            // No early break once a full sync is due: every listed node must
+            // get its hashes refreshed here, or the idle crawler re-finds the
+            // rest one full sync at a time (see NotifyMaterialEditedTarget).
         }
 
         if (needsFullSync) {
@@ -5246,6 +5274,34 @@
         return state;
     }
 
+    // A delivered full sync carries every node's current material, so it is
+    // the viewer's material baseline: re-seed the per-node hashes from it.
+    // Without this, any node an edit path did not visit keeps a pre-edit hash
+    // and the idle crawler later re-finds it as a change, one confirmed full
+    // sync per node. Watcher targets queued before this sync are covered by it
+    // (capture is suppressed while it serializes), so they are dropped rather
+    // than drained into a redundant second full sync. Multi/Sub nodes keep
+    // their hashes: their state hash re-extracts every sub-material per node,
+    // too costly to pay on every full sync.
+    void RefreshMaterialSyncBaselines(TimeValue t) {
+        pendingMaterialEditTargets_.clear();
+        pendingMaterialEditOverflow_ = false;
+        idleMaterialFullSyncCandidateHash_.clear();
+        Interface* ip = GetCOREInterface();
+        if (!ip) return;
+        std::unordered_map<Mtl*, MaterialSyncState> materialStateCache;
+        for (ULONG handle : geomHandles_) {
+            INode* node = ip->GetINodeByHandle(handle);
+            if (!node) continue;
+            Mtl* multiMtl = FindMultiSubMtl(node->GetMtl());
+            if (multiMtl && multiMtl->NumSubMtls() > 1) continue;
+            const MaterialSyncState state = ComputeMaterialSyncStateCached(node, t, materialStateCache);
+            mtlHashMap_[handle] = state.structureHash;
+            mtlScalarHashMap_[handle] = state.scalarHash;
+            mtlFastScalarHashMap_[handle] = state.fastScalarHash;
+        }
+    }
+
     uint64_t ComputeLightStateHash(INode* node, TimeValue t) {
         if (!node) return 0;
 
@@ -5454,11 +5510,7 @@
                 fastScalarIt->second = state.fastScalarHash;
                 // Material structure changed — invalidate geometry hash + group cache
                 // so next full sync re-extracts face matIDs for multi-sub materials
-                if (structureChanged) {
-                    geoHashMap_.erase(handle);
-                    groupCache_.erase(handle);
-                    lastBBoxHash_.erase(handle);
-                }
+                if (structureChanged) InvalidateMaterialGroupGeometry(node, handle);
                 materialFastDirtyHandles_.clear();
                 requestedFullSync = true;
                 RequestIdlePollFullSync();

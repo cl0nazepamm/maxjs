@@ -94,6 +94,10 @@ if(MSVC)
     target_compile_options(${PLUGIN_NAME} PRIVATE /W3 /MP /EHa)
     set_property(TARGET ${PLUGIN_NAME} PROPERTY MSVC_RUNTIME_LIBRARY
         "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    # Release keeps a PDB beside the plugin so debuggers and crash analysis can name
+    # functions. The plugin's code is unchanged: /OPT:REF and /OPT:ICF stay on.
+    target_compile_options(${PLUGIN_NAME} PRIVATE $<$<CONFIG:Release>:/Zi>)
+    target_link_options(${PLUGIN_NAME} PRIVATE $<$<CONFIG:Release>:/DEBUG:FULL /OPT:REF /OPT:ICF>)
 endif()
 
 # ── Deploy to Max ────────────────────────────────────────────────

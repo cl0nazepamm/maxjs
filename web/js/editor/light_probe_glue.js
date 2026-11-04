@@ -25,8 +25,20 @@ import {
 const SCENE_REBAKE_DELAY_MS = 350;
 const PLAYBACK_RETRY_MS = 500;
 const LIGHTMAP_MESHES_PER_FRAME = 4;
+// A scene "rests" only when no change arrived during this many rendered frames.
+const SCENE_REST_FRAMES = 2;
+const SCENE_REST_RETRY_MS = 100;
 
 function createLightProbeGlue(deps = {}) {
+    // The rebake timer alone measured rest in milliseconds. A source that changes
+    // the scene every frame (an autoplaying glTF origin) kept pushing it back at a
+    // normal frame rate, but once one frame took longer than the delay (a post-FX
+    // pipeline rebuild), the timer fired between frames and a bake started. Bake
+    // frames are slow, so the timer then fired before every frame and restarted
+    // the bake, which never finished: the viewer sat at ~2 fps until reloaded.
+    // Rest is now counted in rendered frames as well.
+    let renderedFrames = 0;
+    let lastSceneChangeFrame = -Infinity;
     // Probe grid helpers: handle -> { size: [l, w, h], div: [x, y, z], enabled }.
     // The helper transform rides the normal helper-node sync.
     const probeGridData = new Map();
@@ -140,6 +152,7 @@ function createLightProbeGlue(deps = {}) {
     }
 
     function updateLightProbes() {
+        renderedFrames += 1;
         if (speedball) {
             speedball.update({ camera: deps.camera, playing: deps.maxTimeline?.playing?.() === true });
             const hasData = speedball.hasData();
@@ -273,10 +286,15 @@ function createLightProbeGlue(deps = {}) {
     // and move Speedball's volumes with their helpers.
     function scheduleLightProbeFromCurrentScene({ force = false, delay = SCENE_REBAKE_DELAY_MS } = {}) {
         if (!deps.lightProbeEnabled && !force) return;
+        lastSceneChangeFrame = renderedFrames;
         if (rebakeTimer) clearTimeout(rebakeTimer);
         rebakeTimer = setTimeout(function fire() {
             if (deps.maxTimeline?.playing?.() === true) {
                 rebakeTimer = setTimeout(fire, PLAYBACK_RETRY_MS);
+                return;
+            }
+            if (renderedFrames - lastSceneChangeFrame < SCENE_REST_FRAMES) {
+                rebakeTimer = setTimeout(fire, Math.max(delay, SCENE_REST_RETRY_MS));
                 return;
             }
             rebakeTimer = 0;

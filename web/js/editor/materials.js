@@ -3,10 +3,12 @@ import * as THREE from 'three';
 import { hashBlur } from 'three/addons/tsl/display/hashBlur.js';
 import {
     color as tslColor,
+    depth as tslDepth,
     float as tslFloat,
     linearDepth,
     screenUV,
     texture as tslTexture,
+    vec3 as tslVec3,
     viewportLinearDepth,
     viewportSharedTexture,
 } from 'three/tsl';
@@ -340,7 +342,17 @@ function createMaterials(deps = {}) {
             let material;
             switch (runtimeModelName) {
             case 'MeshDepthMaterial':
-                material = new THREE.MeshDepthMaterial();
+                // Node renderers have no MeshDepthMaterial counterpart (it drew
+                // nothing and logged "not compatible"); show the same
+                // BasicDepthPacking value, 1 - fragment depth, unlit. Mirrors
+                // createDepthUtilityMaterial in material_builder.js.
+                if (!String(deps.rendererBackendLabel || '').startsWith('WebGL') && typeof THREE.MeshBasicNodeMaterial === 'function') {
+                    material = new THREE.MeshBasicNodeMaterial();
+                    material.colorNode = tslVec3(tslDepth.oneMinus());
+                    material.userData.maxjsDepthUtility = true;
+                } else {
+                    material = new THREE.MeshDepthMaterial();
+                }
                 break;
             case 'MeshMatcapMaterial':
                 material = new THREE.MeshMatcapMaterial();

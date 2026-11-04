@@ -577,10 +577,25 @@ function applyUtilityScalarParams(material, md) {
     if (Number.isFinite(md?.alphaTest) && 'alphaTest' in material) material.alphaTest = md.alphaTest;
 }
 
-function createMaterialForRuntimeModel(runtimeModelName, params) {
+// WebGPURenderer (WebGPU and TSL_GL) has no node counterpart of MeshDepthMaterial
+// ("Material "MeshDepthMaterial" is not compatible"), so the Utility model's Depth
+// mode drew nothing there. Node renderers get an unlit node material showing the
+// same BasicDepthPacking value (1 - fragment depth); the classic WebGLRenderer,
+// and builds without node materials, keep MeshDepthMaterial.
+export function createDepthUtilityMaterial(params = {}, nodeRenderer = false) {
+    if (nodeRenderer && typeof THREE.MeshBasicNodeMaterial === 'function' && typeof TSL.depth?.oneMinus === 'function') {
+        const material = new THREE.MeshBasicNodeMaterial(params);
+        material.colorNode = TSL.vec3(TSL.depth.oneMinus());
+        material.userData.maxjsDepthUtility = true;
+        return material;
+    }
+    return new THREE.MeshDepthMaterial(params);
+}
+
+function createMaterialForRuntimeModel(runtimeModelName, params, { nodeRenderer = false } = {}) {
     switch (runtimeModelName) {
         case 'MeshDepthMaterial':
-            return new THREE.MeshDepthMaterial(params);
+            return createDepthUtilityMaterial(params, nodeRenderer);
         case 'MeshLambertMaterial':
             return new THREE.MeshLambertMaterial(params);
         case 'MeshMatcapMaterial':
@@ -1508,7 +1523,9 @@ export function createMaterialBuilder({ rootUrl = '.', bakeState = null, rendere
             }
         }
 
-        let material = createMaterialForRuntimeModel(info.runtimeModelName, params);
+        let material = createMaterialForRuntimeModel(info.runtimeModelName, params, {
+            nodeRenderer: renderer?.isWebGPURenderer === true,
+        });
         const boundSlots = [];
 
         if (info.wantsUtilityMaterial) {

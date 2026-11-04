@@ -33,6 +33,16 @@ const MATERIAL_ONLY = new Set([
     'caustics',
 ]);
 
+// Textures left out of the preset list: every displacement texture. Their
+// `<name>Raw` / `<name>NormalRaw` Fns carry setLayout(), so three r187 emits them
+// as standalone WGSL functions, and positionGeometry / normalLocal read inside
+// those bodies don't resolve there ("unresolved value 'position'", plus
+// "'nodeVarying5'" or "cameraViewMatrix not found" in the normal pass). The
+// vertex and normal shaders fail to compile, and so does the shadow pass of any
+// mesh using them. Verified live for supersphere and translator; rotator and
+// scaler share the exact pattern.
+const EXCLUDED = new Set(['supersphere', 'rotator', 'scaler', 'translator']);
+
 const CAT_BITMAP = 0, CAT_MATERIAL = 1, CAT_DISPLACEMENT = 2;
 
 // ── inert chainable proxy for TSL nodes referenced inside defaults literals ──
@@ -133,6 +143,7 @@ function build() {
     while ((m = assignRe.exec(bundle))) {
         const fnName = m[1];
         const varName = m[2];
+        if (EXCLUDED.has(fnName)) continue;
         const declRe = new RegExp(`(?:var|let|const)\\s+${varName.replace('$', '\\$')}\\s*=\\s*`);
         const declMatch = declRe.exec(bundle);
         if (!declMatch) { errors.push(`${fnName}: defaults decl ${varName} not found`); continue; }

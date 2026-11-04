@@ -15,7 +15,7 @@
 //   - Transform from `nd.t` (16-float matrix).
 //   - Visibility from `nd.vis`.
 //   - Multi/sub material groups via `geom.addGroup`.
-//   - Forest Pack / RailClone / tyFlow instance groups from binary ranges
+//   - Forest Pack / RailClone instance groups from binary ranges
 //     in M3, with legacy JSON-array fallback.
 //   - Removal of stale nodes not present in the new payload.
 //   - Skeleton bind-pose calculation after the world matrix updates.
@@ -29,7 +29,7 @@
 //   - HTML auto-fit, selection state stamping.
 //   - Light linking / light probes / scene profiling.
 //   - `finalizeSceneSnapshot` side effects (camera fit, HDRI load, fog,
-//     audio, gltf, hairInstances, volumes).
+//     audio, gltf, hairInstances).
 //
 // All of the above are wired through the `hooks` parameter so caller code
 // can opt in incrementally. The default hooks are no-ops.

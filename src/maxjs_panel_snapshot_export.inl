@@ -1241,7 +1241,6 @@
                     runtimeFeatures.lights += 1;
                 }
                 if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-                    (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
                     SupportsRenderTimeInstancing(node, t)) {
                     collect(node);
                     continue;
@@ -1429,8 +1428,6 @@
                             ExtractForestPackInstances(node, t, snapshotInstanceGroups);
                         else if (IsRailCloneAvailable() && IsRailCloneNode(node))
                             ExtractRailCloneInstances(node, t, snapshotInstanceGroups);
-                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                            ExtractTyFlowInstances(node, t, snapshotInstanceGroups);
                         else if (SupportsRenderTimeInstancing(node, t))
                             ExtractRenderTimeInstances(node, t, snapshotInstanceGroups);
                     }

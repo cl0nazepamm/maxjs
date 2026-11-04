@@ -28,7 +28,7 @@ function createNodeMapFacade(nodeMap, getAdapter) {
 }
 
 // ctx.instances — read/write access to synced instanced groups (ForestPack /
-// RailClone / tyFlow scatters). Each group lands as a THREE.InstancedMesh tagged
+// RailClone scatters). Each group lands as a THREE.InstancedMesh tagged
 // userData.maxjsInstanceGroup and keyed by userData.maxjsSource (see
 // scene_applier.js applyForestInstances). Built through createLayerManager, so it
 // behaves identically in the live viewer and in exported standalone snapshots.

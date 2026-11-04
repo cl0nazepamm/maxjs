@@ -2420,8 +2420,7 @@
     bool ShouldBootstrapVisibleNode(INode* node, TimeValue t) const {
         if (!node) return false;
         if (IsMaxJSHierarchyNode(node, t)) return true;
-        if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-            (IsTyFlowAvailable() && IsTyFlowNode(node))) {
+        if (IsForestPackNode(node) || IsRailCloneNode(node)) {
             return true;
         }
 
@@ -2650,9 +2649,9 @@
                 // ControllerStructured / TopologyChanged events on viewport
                 // redraw for many cases: Editable Poly live cache flips,
                 // modifier validity-interval churn, procedural generators
-                // (RailClone / Forest Pack / TyFlow) re-evaluating per
-                // redraw, etc. If the current geometry state hashes
-                // identical to the last sent state, this is one of those
+                // (RailClone / Forest Pack) re-evaluating per redraw, etc.
+                // If the current geometry state hashes identical to the
+                // last sent state, this is one of those
                 // spurious events — skip both the fast-path mark AND the
                 // full-sync escalation. Camera movement with nothing
                 // selected used to flip scene/delta at 30Hz because every
@@ -2672,13 +2671,12 @@
                 // unselected static meshes where topology/UV edits could be
                 // missed by the positions-only fast-positions path.
                 //
-                // Procedurals (RC/FP/Ty) always take the fast path — the
+                // Procedurals (RC/FP) always take the fast path — the
                 // hash dedupe above handles their spurious events, and when
                 // they do change, geo_fast correctly streams the new mesh.
                 const bool isProcedural =
                     IsForestPackNode(current) ||
-                    IsRailCloneNode(current) ||
-                    (IsTyFlowAvailable() && IsTyFlowNode(current));
+                    IsRailCloneNode(current);
                 const bool isDeformingHandle =
                     skinnedHandles_.count(handle) ||
                     deformHandles_.count(handle);
@@ -2755,8 +2753,7 @@
 
             VisitNodeSubtree(node, [this, t, &needsFullSync](INode* current) {
                 if (needsFullSync) return;
-                if (IsForestPackNode(current) || IsRailCloneNode(current) ||
-                    (IsTyFlowAvailable() && IsTyFlowNode(current))) {
+                if (IsForestPackNode(current) || IsRailCloneNode(current)) {
                     needsFullSync = true;
                     return;
                 }
@@ -3713,7 +3710,7 @@
                 guardIt->second.plan.sparse &&
                 guardIt->second.plan.sparse->valid;
 
-            // Hash-dedupe before extracting. RailClone / Forest Pack / TyFlow
+            // Hash-dedupe before extracting. RailClone / Forest Pack
             // (and Max itself) fire spurious ControllerStructured events when
             // the viewport redraws, even if the generated mesh is byte-identical
             // to the last send. ExtractMesh + SharedBuffer allocation on every
@@ -5456,7 +5453,7 @@
         geoScanCursor_ = idx;
     }
 
-    // Detect changes to Forest Pack / RailClone / tyFlow plugin nodes.
+    // Detect changes to Forest Pack / RailClone plugin nodes.
     // These generators rebuild instance structure from referenced nodes, so they
     // stay on the conservative full-sync path instead of fast mesh deltas.
     void DetectJsModChanges() {
@@ -5501,7 +5498,7 @@
         });
     }
 
-    // Plugin-instance producers (Forest Pack / RailClone / tyFlow / native
+    // Plugin-instance producers (Forest Pack / RailClone / native
     // RenderTimeInstancing, incl. 2027.2 Point Instance stacks) are NOT
     // change-detected. Deliberate: hashing them means evaluating them, and a
     // Point Instance stack regenerates its instanced mesh on every evaluation

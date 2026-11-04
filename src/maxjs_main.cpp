@@ -29,8 +29,6 @@
 #include <maxscript/maxscript.h>
 #include "itreesinterface.h"
 #include "ircinterface.h"
-#include "tyParticleObjectExt.h"
-#include "tyVolumeObjectExt.h"
 #include "sync_protocol.h"
 #include "maxjs_core_utils.h"
 #include "maxjs_morpher_compat.h"

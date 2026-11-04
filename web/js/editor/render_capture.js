@@ -71,7 +71,6 @@ function createRenderCapture(deps = {}) {
             if (deps.defaultLights.visible) {
                 deps.defaultKey.position.copy(deps.getActiveCameraWorldPosition(deps.cameraPositionWorld));
             }
-            deps.updateVolumeUniforms();
             const effectiveElapsed = Number.isFinite(renderTimeSeconds)
                 ? renderTimeSeconds
                 : deps.inlineClock.getElapsed();

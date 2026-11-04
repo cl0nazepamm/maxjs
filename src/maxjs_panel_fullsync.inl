@@ -102,8 +102,6 @@
                             ExtractForestPackInstances(node, t, allInstGroups);
                         else if (IsRailCloneAvailable() && IsRailCloneNode(node))
                             ExtractRailCloneInstances(node, t, allInstGroups);
-                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                            ExtractTyFlowInstances(node, t, allInstGroups);
                         else if (SupportsRenderTimeInstancing(node, t))
                             ExtractRenderTimeInstances(node, t, allInstGroups);
                     }
@@ -140,41 +138,6 @@
         }
         WriteHairInstanceGroupsJson(ss, root, t);
 
-        // TODO: tyFlow volume rendering (smoke/fire) — disabled pending shader fixes
-        if (false && IsTyFlowAvailable()) {
-            std::vector<VolumeData> volumes;
-            std::function<void(INode*)> collectVolumes = [&](INode* parent) {
-                for (int c = 0; c < parent->NumberOfChildren(); c++) {
-                    INode* node = parent->GetChildNode(c);
-                    if (!node) continue;
-                    if (IsTyFlowNode(node))
-                        ExtractTyFlowVolumes(node, t, volumes);
-                    collectVolumes(node);
-                }
-            };
-            collectVolumes(root);
-            if (!volumes.empty()) {
-                ss << L",\"volumes\":[";
-                for (size_t vi = 0; vi < volumes.size(); vi++) {
-                    if (vi) ss << L',';
-                    auto& vd = volumes[vi];
-                    ss << L"{\"h\":" << vd.handle;
-                    ss << L",\"dim\":[" << vd.dimX << L',' << vd.dimY << L',' << vd.dimZ << L']';
-                    ss << L",\"voxSize\":[";
-                    WriteFloats(ss, vd.voxelSize, 3);
-                    ss << L"],\"origin\":[";
-                    WriteFloats(ss, vd.origin, 3);
-                    ss << L"],\"tm\":";
-                    WriteFloats(ss, vd.transform, 16);
-                    ss << L",\"step\":" << vd.stepSize;
-                    ss << L",\"density\":";
-                    WriteFloats(ss, vd.density.data(), vd.density.size());
-                    ss << L'}';
-                }
-                ss << L']';
-            }
-        }
-
         ss << L'}';
 
         const HRESULT scenePostResult = webview_->PostWebMessageAsJson(ss.str().c_str());
@@ -206,10 +169,9 @@
                 WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
                 continue;
             }
-            // Skip Forest Pack / ForestIvy / RailClone / tyFlow / native
+            // Skip Forest Pack / ForestIvy / RailClone / native
             // RenderTimeInstancing producers — handled via GPU instancing
             if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-                (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
                 SupportsRenderTimeInstancing(node, t)) {
                 WriteSceneNodes(node, t, ss, first, prevGeom, cameraLightCarriers, materialLibrary);
                 continue;
@@ -566,10 +528,9 @@
                     collect(node);
                     continue;
                 }
-                // Skip Forest Pack / ForestIvy / RailClone / tyFlow / native
+                // Skip Forest Pack / ForestIvy / RailClone / native
                 // RenderTimeInstancing producers — handled via GPU instancing
                 if (IsForestPackNode(node) || IsRailCloneNode(node) ||
-                    (IsTyFlowAvailable() && IsTyFlowNode(node)) ||
                     SupportsRenderTimeInstancing(node, t)) {
                     collect(node);
                     continue;
@@ -974,8 +935,6 @@
                             ExtractForestPackInstances(node, t, allInstGroups);
                         else if (IsRailCloneAvailable() && IsRailCloneNode(node))
                             ExtractRailCloneInstances(node, t, allInstGroups);
-                        else if (IsTyFlowAvailable() && IsTyFlowNode(node))
-                            ExtractTyFlowInstances(node, t, allInstGroups);
                         else if (SupportsRenderTimeInstancing(node, t))
                             ExtractRenderTimeInstances(node, t, allInstGroups);
                     }
@@ -1013,41 +972,6 @@
             }
         }
         WriteHairInstanceGroupsJson(ss, root, t);
-
-        // TODO: tyFlow volume rendering (smoke/fire) — disabled pending shader fixes
-        if (false && IsTyFlowAvailable()) {
-            std::vector<VolumeData> volumes;
-            std::function<void(INode*)> collectVolumes = [&](INode* parent) {
-                for (int c = 0; c < parent->NumberOfChildren(); c++) {
-                    INode* node = parent->GetChildNode(c);
-                    if (!node) continue;
-                    if (IsTyFlowNode(node))
-                        ExtractTyFlowVolumes(node, t, volumes);
-                    collectVolumes(node);
-                }
-            };
-            collectVolumes(root);
-            if (!volumes.empty()) {
-                ss << L",\"volumes\":[";
-                for (size_t vi = 0; vi < volumes.size(); vi++) {
-                    if (vi) ss << L',';
-                    auto& vd = volumes[vi];
-                    ss << L"{\"h\":" << vd.handle;
-                    ss << L",\"dim\":[" << vd.dimX << L',' << vd.dimY << L',' << vd.dimZ << L']';
-                    ss << L",\"voxSize\":";
-                    WriteFloats(ss, vd.voxelSize, 3);
-                    ss << L",\"origin\":";
-                    WriteFloats(ss, vd.origin, 3);
-                    ss << L",\"tm\":";
-                    WriteFloats(ss, vd.transform, 16);
-                    ss << L",\"step\":" << vd.stepSize;
-                    ss << L",\"density\":";
-                    WriteFloats(ss, vd.density.data(), vd.density.size());
-                    ss << L'}';
-                }
-                ss << L']';
-            }
-        }
 
         ss << L",";
         WriteSceneCamerasJson(ss);

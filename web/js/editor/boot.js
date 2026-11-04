@@ -1596,7 +1596,6 @@
             updateSceneCameraList: (...args) => updateSceneCameraList(...args),
             applyHairInstances: (...args) => applyHairInstances(...args),
             applyForestInstances: (...args) => applyForestInstances(...args),
-            applyVolumes: (...args) => applyVolumes(...args),
             applyHairTransform: (...args) => applyHairTransform(...args),
             applyHairVisibility: (...args) => applyHairVisibility(...args),
             applyLightData: (...args) => applyLightData(...args),
@@ -1669,7 +1668,6 @@
             schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
             updateSyncHud,
             maxjsDebugLog,
-            getActiveCameraWorldPosition: (...args) => getActiveCameraWorldPosition(...args),
             get hairMeshes() { return hairMeshes; },
             set hairMeshes(value) { hairMeshes = value; },
             get forestMeshes() { return forestMeshes; },
@@ -1683,7 +1681,6 @@
             get layerManager() { return layerManager; },
             get maxjsFx() { return maxjsFx; },
             get transportMode() { return transportMode; },
-            get cameraPositionWorld() { return cameraPositionWorld; },
         });
         const {
             createHairBladeGeometry,
@@ -1708,10 +1705,6 @@
             shouldCollapseForestMaterialsForWebGpu,
             createForestInstanceMaterial,
             applyForestInstances,
-            createSmokePalette,
-            createVolumeMesh,
-            applyVolumes,
-            updateVolumeUniforms,
         } = sceneExtras;
 
         const cameraSystem = createCameraSystem({
@@ -2120,7 +2113,7 @@
             }
         };
 
-        // Instance producers (Point Instance / Forest / RailClone / tyFlow)
+        // Instance producers (Point Instance / Forest / RailClone)
         // are not change-detected host-side — this is their manual pull.
         // scene_dirty asks the host for a full resend without a panel reload.
         document.getElementById('btnRefreshInstances').onclick = () => {
@@ -2487,7 +2480,6 @@
             isLightmapBakePending,
             syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
             getActiveCameraWorldPosition: (...args) => getActiveCameraWorldPosition(...args),
-            updateVolumeUniforms: (...args) => updateVolumeUniforms(...args),
             updateLightHelpers: (...args) => updateLightHelpers(...args),
             removeWebGPUIncompatibleSceneMaterials: (...args) => removeWebGPUIncompatibleSceneMaterials(...args),
             isPathTracingViewActive: (...args) => isPathTracingViewActive(...args),
@@ -2709,7 +2701,6 @@
             PATH_TRACING_CAPTURE_DEFAULT_SAMPLES,
             PATH_TRACING_TEXTURE_WAIT_MS,
             getActiveCameraWorldPosition: (...args) => getActiveCameraWorldPosition(...args),
-            updateVolumeUniforms: (...args) => updateVolumeUniforms(...args),
             isPathTracingViewActive: (...args) => isPathTracingViewActive(...args),
             renderPathTracingLiveFrame: (...args) => renderPathTracingLiveFrame(...args),
             renderViewerFrame: (...args) => renderViewerFrame(...args),

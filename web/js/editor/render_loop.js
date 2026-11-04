@@ -68,7 +68,6 @@ function createRenderLoop(deps = {}) {
                     deps.defaultKey.position.copy(cameraWorldPosition);
                 }
             }
-            deps.updateVolumeUniforms();
             deps.lightLinking.updateCameraConstraints();
             if (deps.lightHelpersVisible) deps.updateLightHelpers();
             deps.layerManager.update(frameDt, frameElapsed);

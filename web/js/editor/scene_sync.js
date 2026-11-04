@@ -863,7 +863,6 @@ function createSceneSync(deps = {}) {
             deps.gltfSystem?.applyGLTFs(snapshot.gltfs ?? []);
             deps.applyHairInstances(snapshot.hairInstances ?? []);
             deps.applyForestInstances(snapshot.forestInstances ?? [], options.binaryBuffer ?? null);
-            deps.applyVolumes(snapshot.volumes ?? []);
             const bucketPlan = options.bucketPlan ?? planMaxInstanceBuckets(snapshot.nodes);
             deps.refreshMaterialRegistry(snapshot.nodes, bucketPlan);
             const bucketChanged = buildMaxInstanceBuckets(snapshot.nodes, bucketPlan);

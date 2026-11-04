@@ -9,7 +9,7 @@
 // Per the project's determinism analysis, raw byte-compare is NOT a valid gate:
 //   - vertex/uv/normal/transform floats re-evaluate to bit-different values
 //     (FP non-associativity + threaded reductions) for an unchanged scene;
-//   - ForestPack/RailClone/tyFlow forestInstances[].src/.key are
+//   - ForestPack/RailClone forestInstances[].src/.key are
 //     reinterpret_cast<uintptr_t>(Mesh*) and differ every process run;
 //   - asset URLs embed absolute paths / FNV1a(abspath) hashes (machine-dependent);
 //   - top-level camera / node selection / animation current-time are editor state.

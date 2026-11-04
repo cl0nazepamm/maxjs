@@ -14,8 +14,6 @@
 
 #include "itreesinterface.h"
 #include "ircinterface.h"
-#include "tyParticleObjectExt.h"
-#include "tyVolumeObjectExt.h"
 #include "maxjs_core_utils.h"
 #include "maxjs_morpher_compat.h"
 #include "maxjs_geometry_sync.h"
@@ -1611,14 +1609,12 @@ static bool IsForestPackAvailable() {
 enum class InstanceGroupKind {
     ForestPack,
     RailClone,
-    TyFlow,
     RenderTime
 };
 
 static const wchar_t* InstanceGroupKindName(InstanceGroupKind kind) {
     switch (kind) {
     case InstanceGroupKind::RailClone: return L"railclone";
-    case InstanceGroupKind::TyFlow: return L"tyflow";
     case InstanceGroupKind::RenderTime: return L"rendertime";
     case InstanceGroupKind::ForestPack:
     default: return L"forestpack";
@@ -1931,119 +1927,6 @@ static bool ExtractRailCloneInstances(INode* rcNode, TimeValue t,
 }
 
 // ══════════════════════════════════════════════════════════════
-//  tyFlow Particle Instance Extraction
-// ══════════════════════════════════════════════════════════════
-
-#define TYFLOW_CLASS_ID   Class_ID(825370769, 1895152074)
-
-static bool IsTyFlowClassID(const Class_ID& id) {
-    return id == TYFLOW_CLASS_ID;
-}
-
-static bool IsTyFlowNode(INode* node) {
-    if (!node) return false;
-    Object* base = GetBaseObject(node->GetObjectRef());
-    return base && IsTyFlowClassID(base->ClassID());
-}
-
-static bool IsTyFlowAvailable() {
-    static int cached = -1;
-    if (cached < 0) {
-        cached = (GetModuleHandleW(L"tyFlow_2026.dlo") != nullptr ||
-                  GetModuleHandleW(L"tyFlow.dlo") != nullptr) ? 1 : 0;
-    }
-    return cached == 1;
-}
-
-// SEH wrappers for tyFlow API
-static tyFlow::tyParticleInterface* SafeGetTyInterface(INode* node) {
-    __try {
-        Object* base = GetBaseObject(node->GetObjectRef());
-        if (!base) return nullptr;
-        return tyFlow::GetTyParticleInterfaceForced(static_cast<BaseObject*>(base));
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
-}
-
-// Can't use __try here due to TSTR having a destructor — call directly
-static tyFlow::tyVector<tyFlow::tyInstanceInfo>* SafeTyCollectInstances(
-    tyFlow::tyParticleInterface* tyObj, INode* node, TimeValue t) {
-    return tyObj->CollectInstances(
-        node, tyFlow::DataFlags::mesh, t, t, _T("maxjs"));
-}
-
-static void SafeTyReleaseInstances(tyFlow::tyParticleInterface* tyObj,
-                                   tyFlow::tyVector<tyFlow::tyInstanceInfo>* inst) {
-    __try { tyObj->ReleaseInstances(inst); }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-
-static bool ExtractTyFlowInstances(INode* tyNode, TimeValue t,
-                                   std::vector<ForestInstanceGroup>& outGroups) {
-    if (!IsTyFlowAvailable()) return false;
-    if (!IsTyFlowNode(tyNode)) return false;
-
-    tyFlow::tyParticleInterface* tyObj = SafeGetTyInterface(tyNode);
-    if (!tyObj) return false;
-
-    tyFlow::tyVector<tyFlow::tyInstanceInfo>* infos =
-        SafeTyCollectInstances(tyObj, tyNode, t);
-    if (!infos || infos->size() == 0) return false;
-
-    Matrix3 nodeTM = tyNode->GetNodeTM(t);
-
-    std::unordered_map<uintptr_t, size_t> meshToGroupIdx;
-
-    for (size_t g = 0; g < infos->size(); g++) {
-        tyFlow::tyInstanceInfo& info = (*infos)[g];
-        if (!(info.flags & tyFlow::DataFlags::mesh) || !info.data) continue;
-
-        Mesh* srcMesh = static_cast<Mesh*>(info.data);
-        uintptr_t key = reinterpret_cast<uintptr_t>(srcMesh);
-
-        // Extract geometry once per unique mesh
-        auto it = meshToGroupIdx.find(key);
-        if (it == meshToGroupIdx.end()) {
-            size_t idx = outGroups.size();
-            meshToGroupIdx[key] = idx;
-            outGroups.emplace_back();
-            ForestInstanceGroup& grp = outGroups.back();
-            grp.kind = InstanceGroupKind::TyFlow;
-            grp.groupKey = key;
-            grp.ownerKey = static_cast<uintptr_t>(tyNode->GetHandle());
-            ExtractMeshFromRawMesh(*srcMesh, grp.verts, grp.uvs, grp.indices, grp.groups, &grp.norms);
-            // tyFlow: use node material (instance overrides handled below)
-            grp.mtl = tyNode->GetMtl();
-            grp.mtlNode = tyNode;
-            it = meshToGroupIdx.find(key);
-        }
-
-        ForestInstanceGroup& grp = outGroups[it->second];
-
-        // Each tyInstance has a tyVector<Matrix3> tms — use tms[0] for current frame
-        for (size_t i = 0; i < info.instances.size(); i++) {
-            tyFlow::tyInstance& inst = info.instances[i];
-            if (inst.tms.size() == 0) continue;
-
-            Matrix3 worldTM = inst.tms[0] * nodeTM;
-            float xform[16];
-            Matrix3To16(worldTM, xform);
-            grp.transforms.insert(grp.transforms.end(), xform, xform + 16);
-            grp.instanceCount++;
-        }
-
-        // Clean up mesh if flagged
-        if (info.flags & tyFlow::DataFlags::pluginMustDelete) {
-            delete srcMesh;
-            info.data = nullptr;
-        }
-    }
-
-    SafeTyReleaseInstances(tyObj, infos);
-    return !outGroups.empty();
-}
-
-// ══════════════════════════════════════════════════════════════
 //  RenderTimeInstancing Extraction (SDK-native instancing contract)
 // ══════════════════════════════════════════════════════════════
 //
@@ -2054,7 +1937,7 @@ static bool ExtractTyFlowInstances(INode* tyNode, TimeValue t,
 // it also serve an aggregate collapsed mesh through GetRenderMesh for
 // consumers that don't speak it — the path max.js fell back to before this
 // lane existed. Probed generically, so any future producer joins for free;
-// the dedicated Forest/RailClone/tyFlow lanes keep precedence.
+// the dedicated Forest/RailClone lanes keep precedence.
 
 static bool SupportsRenderTimeInstancing(INode* node, TimeValue t) {
     if (!node) return false;
@@ -2138,109 +2021,6 @@ static bool ExtractRenderTimeInstances(INode* node, TimeValue t,
 
     instancer->ReleaseInstanceData();
     return outGroups.size() > firstGroup;
-}
-
-// ══════════════════════════════════════════════════════════════
-//  tyFlow Volume Extraction (smoke/fire)
-// ══════════════════════════════════════════════════════════════
-
-struct VolumeData {
-    ULONG handle;
-    int dimX, dimY, dimZ;           // voxel counts
-    float voxelSize[3];             // world-space size per voxel
-    float origin[3];                // world origin (first voxel center)
-    float transform[16];            // world transform of the volume
-    std::vector<float> density;     // flat density array [dimX * dimY * dimZ]
-    float stepSize = 1.0f;          // raymarching step size
-};
-
-static bool ExtractTyFlowVolumes(INode* tyNode, TimeValue t,
-                                 std::vector<VolumeData>& outVolumes) {
-    if (!IsTyFlowAvailable()) return false;
-    if (!IsTyFlowNode(tyNode)) return false;
-
-    Object* base = GetBaseObject(tyNode->GetObjectRef());
-    if (!base) return false;
-
-    // Try v3 first (has step size + fuel color), fall back to v1
-    tyFlow::tyVolumeObjectExt_v3* volIf3 = tyFlow::GetTyVolumeInterface_v3(static_cast<BaseObject*>(base));
-    tyFlow::tyVolumeObjectExt_v1* volIf = volIf3
-        ? static_cast<tyFlow::tyVolumeObjectExt_v1*>(volIf3)
-        : tyFlow::GetTyVolumeInterface_v1(static_cast<BaseObject*>(base));
-    if (!volIf) return false;
-
-    volIf->UpdateVolumes(t, _T("maxjs"));
-
-    int numVolumes = volIf->NumVolumes();
-    if (numVolumes <= 0) {
-        volIf->ReleaseVolumes();
-        return false;
-    }
-
-    float stepSize = volIf3 ? volIf3->GetVolumeRaymarchingStepSize() : 1.0f;
-
-    // For the combined bounding box, all volumes share same dimensions/scale (axiom 1)
-    tyFlow::tyVolume_v1* vol0 = volIf->GetVolume(0);
-    if (!vol0) { volIf->ReleaseVolumes(); return false; }
-
-    IPoint3 dim = vol0->dimensions;
-    if (dim.x <= 0 || dim.y <= 0 || dim.z <= 0) {
-        volIf->ReleaseVolumes();
-        return false;
-    }
-
-    // Compute voxel size from the transform (scale of axes / dimensions)
-    Matrix3 tm0 = vol0->transform;
-    Point3 axisX = tm0.GetRow(0);
-    Point3 axisY = tm0.GetRow(1);
-    Point3 axisZ = tm0.GetRow(2);
-    float voxelSizeX = axisX.Length() / (float)dim.x;
-    float voxelSizeY = axisY.Length() / (float)dim.y;
-    float voxelSizeZ = axisZ.Length() / (float)dim.z;
-
-    // For MVP: extract each volume block as a separate VolumeData
-    // (JS side will render each as a separate volume)
-    for (int vi = 0; vi < numVolumes; vi++) {
-        tyFlow::tyVolume_v1* vol = volIf->GetVolume(vi);
-        if (!vol) continue;
-
-        VolumeData vd;
-        vd.handle = tyNode->GetHandle();
-        vd.dimX = dim.x;
-        vd.dimY = dim.y;
-        vd.dimZ = dim.z;
-        vd.voxelSize[0] = voxelSizeX;
-        vd.voxelSize[1] = voxelSizeY;
-        vd.voxelSize[2] = voxelSizeZ;
-        vd.stepSize = stepSize;
-
-        // Volume origin in world space
-        Point3 orig = vol->transform.GetTrans();
-        vd.origin[0] = orig.x;
-        vd.origin[1] = orig.y;
-        vd.origin[2] = orig.z;
-
-        Matrix3To16(vol->transform, vd.transform);
-
-        // Extract density voxels
-        int totalVoxels = dim.x * dim.y * dim.z;
-        vd.density.resize(totalVoxels);
-
-        for (int z = 0; z < dim.z; z++) {
-            for (int y = 0; y < dim.y; y++) {
-                for (int x = 0; x < dim.x; x++) {
-                    Point3 coord((float)x, (float)y, (float)z);
-                    float d = vol->GetScalar(coord, tyFlow::tyVolume_v1::density);
-                    vd.density[x + y * dim.x + z * dim.x * dim.y] = d;
-                }
-            }
-        }
-
-        outVolumes.push_back(std::move(vd));
-    }
-
-    volIf->ReleaseVolumes();
-    return !outVolumes.empty();
 }
 
 // ══════════════════════════════════════════════════════════════

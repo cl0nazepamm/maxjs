@@ -87,8 +87,8 @@
     // Full resend without reloading WebView2. Shared by the web-side
     // scene_dirty / relay_resync repair path and the "Send Dirty Signal"
     // menu action — instance producers (Forest Pack / RailClone /
-    // tyFlow / Point Instance) only re-extract on full syncs, so this is
-    // their manual pull.
+    // Point Instance) only re-extract on full syncs, so this is their
+    // manual pull.
     void RequestFullSceneRepair() {
         jsmodStateMap_.clear();
         geoHashMap_.clear();

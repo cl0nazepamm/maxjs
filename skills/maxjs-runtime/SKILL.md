@@ -318,7 +318,7 @@ Do not replace whole synced objects or bypass the adapter for this pattern. Raw 
 
 - `ctx.camera`: camera adapter.
 - `ctx.renderer`: renderer info/capabilities.
-- `ctx.instances`: read/write synced instanced groups (ForestPack / RailClone / tyFlow scatters) that render as `THREE.InstancedMesh`.
+- `ctx.instances`: read/write synced instanced groups (ForestPack / RailClone scatters) that render as `THREE.InstancedMesh`.
 - `ctx.input`: event helper with auto-cleanup.
 - `ctx.clock`: JS runtime time, `{ dt, elapsed }`.
 - `ctx.maxTime`: Max timeline, `{ seconds, frame, fps, playing, source }`.
@@ -410,7 +410,7 @@ PowerShot illuminator gain.
 
 Check `entry.state` before using `entry.root` or `entry.clips`.
 
-`ctx.instances` exposes synced instanced groups — ForestPack / RailClone / tyFlow scatters — which land as one `THREE.InstancedMesh` per source, tagged `userData.maxjsInstanceGroup`. It behaves identically in the live viewer and in exported standalone snapshots, so a layer that drives a scatter keeps working after export.
+`ctx.instances` exposes synced instanced groups — ForestPack / RailClone scatters — which land as one `THREE.InstancedMesh` per source, tagged `userData.maxjsInstanceGroup`. It behaves identically in the live viewer and in exported standalone snapshots, so a layer that drives a scatter keeps working after export.
 
 - `ctx.instances.count` / `keys()` / `has(key)` / `all()` / `forEach((group, key) => …)` / iteration enumerate the groups.
 - `ctx.instances.get(key)` returns a group handle (or `null`). Resolve it once and hold it — the per-instance accessors then go straight to the mesh with no scene traversal.

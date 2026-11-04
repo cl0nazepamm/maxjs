@@ -341,6 +341,26 @@ export function createLightProbeSystem({
         };
     }
 
+    // The node grid captures through an ArrayCamera (6 faces x 8 probes), where
+    // every camera uniform becomes its own per-camera uniform array. A transmissive
+    // physical material then needs 13-14 fragment uniform buffers, over WebGPU's
+    // per-stage limit of 12, and its capture pipeline fails validation on every
+    // bake. Glass adds next to nothing to diffuse bounce, so transmissive meshes
+    // sit out the capture (they still render normally, and light from the grid).
+    function usesTransmission(material) {
+        if (Array.isArray(material)) return material.some(usesTransmission);
+        if (!material) return false;
+        if (typeof material.useTransmission === 'boolean') return material.useTransmission;
+        return material.transmission > 0;
+    }
+
+    function collectCaptureExclusions(out) {
+        if (!useNodeGrid) return;
+        scene.traverseVisible((object) => {
+            if (object.isMesh && usesTransmission(object.material)) out.push(object);
+        });
+    }
+
     // Advances the staging bake by up to `probesPerFrame` probes. The bake swaps in
     // when the last bounce pass of the last grid finishes.
     function stepBake() {
@@ -354,7 +374,9 @@ export function createLightProbeSystem({
         };
         const bakeBackground = getBakeBackground();
         const hidden = [];
-        for (const object of [...live, ...helpers.values()]) {
+        const excluded = [...live, ...helpers.values()];
+        collectCaptureExclusions(excluded);
+        for (const object of excluded) {
             if (object.visible) { object.visible = false; hidden.push(object); }
         }
         if (bakeBackground) {

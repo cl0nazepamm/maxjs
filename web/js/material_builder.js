@@ -584,12 +584,26 @@ function applyUtilityScalarParams(material, md) {
 // and builds without node materials, keep MeshDepthMaterial.
 export function createDepthUtilityMaterial(params = {}, nodeRenderer = false) {
     if (nodeRenderer && typeof THREE.MeshBasicNodeMaterial === 'function' && typeof TSL.depth?.oneMinus === 'function') {
-        const material = new THREE.MeshBasicNodeMaterial(params);
+        const material = constructWithOwnParams(THREE.MeshBasicNodeMaterial, params);
         material.colorNode = TSL.vec3(TSL.depth.oneMinus());
         material.userData.maxjsDepthUtility = true;
         return material;
     }
-    return new THREE.MeshDepthMaterial(params);
+    return constructWithOwnParams(THREE.MeshDepthMaterial, params);
+}
+
+// createParams carries the shared PBR/map scalars (aoMapIntensity,
+// lightMapIntensity, normalScale, color, ...) that the simpler models don't own,
+// and Material.setValues warns once per unknown key ("'aoMapIntensity' is not a
+// property of THREE.MeshMatcapMaterial"). Hand each model only the keys it has.
+function constructWithOwnParams(MaterialClass, params) {
+    const material = new MaterialClass();
+    const own = {};
+    for (const [key, value] of Object.entries(params ?? {})) {
+        if (value !== undefined && key in material) own[key] = value;
+    }
+    material.setValues(own);
+    return material;
 }
 
 function createMaterialForRuntimeModel(runtimeModelName, params, { nodeRenderer = false } = {}) {
@@ -597,22 +611,22 @@ function createMaterialForRuntimeModel(runtimeModelName, params, { nodeRenderer 
         case 'MeshDepthMaterial':
             return createDepthUtilityMaterial(params, nodeRenderer);
         case 'MeshLambertMaterial':
-            return new THREE.MeshLambertMaterial(params);
+            return constructWithOwnParams(THREE.MeshLambertMaterial, params);
         case 'MeshMatcapMaterial':
-            return new THREE.MeshMatcapMaterial(params);
+            return constructWithOwnParams(THREE.MeshMatcapMaterial, params);
         case 'MeshNormalMaterial':
-            return new THREE.MeshNormalMaterial(params);
+            return constructWithOwnParams(THREE.MeshNormalMaterial, params);
         case 'MeshPhongMaterial':
-            return new THREE.MeshPhongMaterial(params);
+            return constructWithOwnParams(THREE.MeshPhongMaterial, params);
         case 'MeshToonMaterial':
-            return new THREE.MeshToonMaterial(params);
+            return constructWithOwnParams(THREE.MeshToonMaterial, params);
         case 'MeshSSSNodeMaterial':
-            return new THREE.MeshSSSNodeMaterial(params);
+            return constructWithOwnParams(THREE.MeshSSSNodeMaterial, params);
         case 'MeshPhysicalMaterial':
-            return new THREE.MeshPhysicalMaterial(params);
+            return constructWithOwnParams(THREE.MeshPhysicalMaterial, params);
         case 'MeshStandardMaterial':
         default:
-            return new THREE.MeshStandardMaterial(params);
+            return constructWithOwnParams(THREE.MeshStandardMaterial, params);
     }
 }
 

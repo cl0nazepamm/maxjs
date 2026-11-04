@@ -104,8 +104,15 @@ const DEFAULT_HOOKS = Object.freeze({
     /** (handle, nd) → bool transformsChanged */
     updateInstanceBucketNode: RETURNS_FALSE,
 
-    /** (mesh, isJsmod) → void */
-    applyJsmodSyncState: NOOP,
+    /** (mesh, isJsmod) → void — the three.js Deform flag that adapter.jsmod,
+     *  ctx.deform targets (n => n.jsmod) and simulate()'s guard read. The live
+     *  editor stamps it the same way (editor/materials.js applyJsmodSyncState);
+     *  a no-op default left every snapshot mesh unflagged. */
+    applyJsmodSyncState: (mesh, enabled) => {
+        if (!mesh?.userData) return;
+        if (enabled) mesh.userData.jsmod = true;
+        else delete mesh.userData.jsmod;
+    },
 
     /** (mesh, instOfHandle) → void */
     applyInstanceSyncState: NOOP,
@@ -828,6 +835,7 @@ export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, 
         // Full payloads omit the field when the buffer is empty.
         if (typeof nd.userProps === 'string' && nd.userProps) mesh.userData.maxjsUserProps = nd.userProps;
         else delete mesh.userData.maxjsUserProps;
+        hooks.applyJsmodSyncState(mesh, jsmodFlag);
 
         // Transform + visibility (a tiny subset of finalizeSceneNode).
         syncParent(mesh, nd, nodeMap, maxRoot);

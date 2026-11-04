@@ -1325,17 +1325,34 @@ function createSceneSync(deps = {}) {
         // target + MRT, so target the post-FX scene pass when one exists;
         // variants it cannot reach (shadow passes, a pass not built yet) still
         // compile on the first frame — behind the overlay.
+        //
+        // The pass target + MRT stay set across the await, so warm-ups can
+        // overlap (a superseded apply and its successor). If each one saved and
+        // restored "the previous state", the later one would capture the earlier
+        // one's pass target and restore it for good; every render outside a pass
+        // then inherits the scene pass MRT (a light-probe bake into its own face
+        // target compiles every material to an empty WGSL OutputType). Only the
+        // outermost warm-up saves the resting state; the last one out restores it.
+        let warmupDepth = 0;
+        let warmupRestingTarget = null;
+        let warmupRestingMRT = null;
+        let warmupChangedTarget = false;
         async function warmupScenePipelines() {
             const renderer = deps.renderer;
             const camera = deps.camera;
             if (!renderer || typeof renderer.compileAsync !== 'function' || !camera) return false;
             const scenePass = deps.maxjsFx?.getScenePass?.() ?? null;
             const passTarget = scenePass?.renderTarget?.isRenderTarget ? scenePass.renderTarget : null;
-            const previousTarget = typeof renderer.getRenderTarget === 'function' ? renderer.getRenderTarget() : null;
-            const previousMRT = typeof renderer.getMRT === 'function' ? renderer.getMRT() : null;
+            if (warmupDepth === 0) {
+                warmupRestingTarget = typeof renderer.getRenderTarget === 'function' ? renderer.getRenderTarget() : null;
+                warmupRestingMRT = typeof renderer.getMRT === 'function' ? renderer.getMRT() : null;
+                warmupChangedTarget = false;
+            }
+            warmupDepth += 1;
             let timer = 0;
             try {
                 if (passTarget) {
+                    warmupChangedTarget = true;
                     renderer.setRenderTarget(passTarget);
                     if (typeof renderer.setMRT === 'function') renderer.setMRT(scenePass.getMRT?.() ?? null);
                 }
@@ -1349,12 +1366,18 @@ function createSceneSync(deps = {}) {
                 return false;
             } finally {
                 if (timer) clearTimeout(timer);
-                try {
-                    if (passTarget) {
-                        renderer.setRenderTarget(previousTarget);
-                        if (typeof renderer.setMRT === 'function') renderer.setMRT(previousMRT);
-                    }
-                } catch { /* renderer torn down mid-load */ }
+                warmupDepth -= 1;
+                if (warmupDepth === 0) {
+                    try {
+                        if (warmupChangedTarget) {
+                            renderer.setRenderTarget(warmupRestingTarget);
+                            if (typeof renderer.setMRT === 'function') renderer.setMRT(warmupRestingMRT);
+                        }
+                    } catch { /* renderer torn down mid-load */ }
+                    warmupRestingTarget = null;
+                    warmupRestingMRT = null;
+                    warmupChangedTarget = false;
+                }
             }
         }
 

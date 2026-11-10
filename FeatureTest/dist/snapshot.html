@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <title>max.js snapshot</title>
+    <link rel="icon" href="data:,">
+    <style>
+        html,body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+        #stage { display: block; width: 100vw; height: 100vh; }
+        /* Pre-boot status — replaced by canvas content once boot() resolves. */
+        #boot-status {
+            position: fixed; inset: 0;
+            display: flex; align-items: center; justify-content: center;
+            color: #888; font: 12px/1.4 'Segoe UI', system-ui, sans-serif;
+            background: #000;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        #boot-status.hidden { opacity: 0; }
+        #boot-status.error { color: #f55; pointer-events: auto; }
+        #boot-status pre {
+            margin: 8px 0 0; max-width: 80vw; white-space: pre-wrap;
+            font: 11px/1.5 'Consolas', monospace;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "./vendor/three-r187/build/three.module.js",
+            "three-std": "./vendor/three-r187/build/three.module.js",
+            "three/webgpu": "./vendor/three-r187/build/three.webgpu.js",
+            "three/tsl": "./vendor/three-r187/build/three.tsl.js",
+            "tsl-textures": "./vendor/tsl-textures/tsl-textures.js",
+            "three/addons/": "./vendor/three-r187/examples/",
+            "three/examples/jsm/": "./vendor/three-r187/examples/",
+            "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
+            "speedball-gi": "./vendor/speedball-gi/js/index.js",
+            "powershot-threejs/pipeline": "./vendor/powershot-threejs/pipeline.js",
+            "powershot-threejs/presets": "./vendor/powershot-threejs/presets.js",
+            "powershot-threejs/film": "./vendor/powershot-threejs/film.js",
+            "powershot-threejs/infrared": "./vendor/powershot-threejs/infrared.js",
+            "powershot-threejs/nightshot": "./vendor/powershot-threejs/nightshot.js",
+            "powershot-threejs/solar-flare": "./vendor/powershot-threejs/solar-flare.js",
+            "powershot-threejs/solar-flare-profile": "./vendor/powershot-threejs/solar-flare-profile.js",
+            "postprocessing": "./node_modules/postprocessing/build/index.js",
+            "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js"
+        },
+        "scopes": {
+            "./vendor/three-r187/examples/objects/Sky.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./vendor/three-r187/examples/lighting/LightProbeGridWebGL.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./vendor/three-r187/examples/helpers/LightProbeGridHelperWebGL.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./node_modules/three-mesh-bvh/": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            }
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="stage"></canvas>
+    <div id="boot-status">booting…</div>
+    <script type="module">
+        import { boot } from './js/snapshot_boot.js';
+
+        const status = document.getElementById('boot-status');
+        const canvas = document.getElementById('stage');
+
+        // Default workflow: always export from Max into web/snapshots/current/
+        // and keep this tab open at /snapshot.html. The page auto-reloads on
+        // every fresh export. Override with ?root=... when you want a specific
+        // iter folder, or ?noreload to disable the watcher.
+        const params = new URLSearchParams(location.search);
+        async function hasSnapshotAt(candidateRoot) {
+            try {
+                const head = await fetch(`${candidateRoot}/snapshot.json`, { method: 'HEAD', cache: 'no-store' });
+                return head.ok;
+            } catch { return false; }
+        }
+        const root = params.get('root') ?? ((await hasSnapshotAt('.')) ? '.' : 'snapshots/current');
+        const reloadEnabled = !params.has('noreload');
+        const explicitRendererBackend = (() => {
+            const raw = String(
+                params.get('renderer')
+                ?? params.get('backend')
+                ?? params.get('rendererBackend')
+                ?? '',
+            ).toLowerCase();
+            if (params.has('webgpu') || raw.includes('webgpu')) return 'webgpu';
+            if (params.has('tsl_gl') || raw.includes('tsl')) return 'tsl_gl';
+            if (params.has('webgl') || raw.includes('webgl')) return 'webgl';
+            return null;
+        })();
+        function inferSnapshotRendererBackend(meta) {
+            const backend = String(
+                meta?.runtimeFeatures?.renderer_pref
+                ?? meta?.runtimeFeatures?.rendererBackend
+                ?? meta?.snapshotUi?.rendererBackend
+                ?? '',
+            ).toLowerCase();
+            if (backend.includes('webgpu')) return 'webgpu';
+            if (backend.includes('tsl')) return 'tsl_gl';
+            if (backend.includes('webgl')) return 'webgl';
+            return 'webgl';
+        }
+        async function loadSnapshotMeta() {
+            try {
+                const response = await fetch(`${root}/snapshot.json`, { cache: 'no-store' });
+                if (!response.ok) return null;
+                return await response.json();
+            } catch {
+                return null;
+            }
+        }
+        function redirectToNodeSnapshotIfNeeded(meta) {
+            if (location.pathname.toLowerCase().endsWith('/snapshot_webgpu.html')) return false;
+            const backend = explicitRendererBackend ?? inferSnapshotRendererBackend(meta);
+            if (backend !== 'webgpu' && backend !== 'tsl_gl') return false;
+            const target = new URL('snapshot_webgpu.html', location.href);
+            target.search = location.search;
+            target.searchParams.set('renderer', backend);
+            if (explicitRendererBackend == null) target.searchParams.set('maxjsAutoRenderer', '1');
+            else target.searchParams.delete('maxjsAutoRenderer');
+            target.hash = location.hash;
+            status.textContent = `switching to ${backend === 'tsl_gl' ? 'TSL_GL' : 'WebGPU'} snapshot...`;
+            location.replace(target.href);
+            return true;
+        }
+
+        // ── Auto-reload watcher ───────────────────────────────────────
+        // Polls snapshot.json. When its Last-Modified changes (or it
+        // appears for the first time after a "waiting" state), reload the
+        // page so the new scene replaces the old. Cheap: HEAD request
+        // every 1500 ms, no body bytes.
+        async function pollForUpdates(initialKey) {
+            const url = `${root}/snapshot.json`;
+            let lastKey = initialKey;
+            while (true) {
+                await new Promise(r => setTimeout(r, 1500));
+                try {
+                    const head = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+                    if (!head.ok) continue;
+                    const key = head.headers.get('last-modified') ?? head.headers.get('etag') ?? '';
+                    if (key && lastKey && key !== lastKey) {
+                        console.log('[snapshot.html] new export detected, reloading');
+                        location.reload();
+                        return;
+                    }
+                    if (!lastKey) lastKey = key;
+                } catch { /* network blip — keep polling */ }
+            }
+        }
+
+        async function snapshotKey() {
+            try {
+                const head = await fetch(`${root}/snapshot.json`, { method: 'HEAD', cache: 'no-store' });
+                if (!head.ok) return null;
+                return head.headers.get('last-modified') ?? head.headers.get('etag') ?? '';
+            } catch { return null; }
+        }
+
+        async function waitForFirstSnapshot() {
+            status.innerHTML =
+                '<div>waiting for first export…</div>' +
+                `<pre style="opacity:0.7">root: ${root}/snapshot.json</pre>` +
+                '<pre style="opacity:0.5">click Export Snapshot in Max → this tab will pick it up</pre>';
+            while (true) {
+                await new Promise(r => setTimeout(r, 1200));
+                if ((await snapshotKey()) != null) return;
+            }
+        }
+
+        try {
+            // An explicit node backend already determines the shell. Redirect
+            // before waiting for snapshot.json so direct TSL_GL/WebGPU URLs also
+            // work before the first export exists.
+            const redirectedExplicitNode = explicitRendererBackend !== null
+                && redirectToNodeSnapshotIfNeeded(null);
+            if (!redirectedExplicitNode) {
+                // If the snapshot doesn't exist yet, sit in a "waiting" state
+                // instead of throwing. Lets the user open the tab BEFORE the
+                // first export.
+                if ((await snapshotKey()) == null) {
+                    await waitForFirstSnapshot();
+                }
+                const initialKey = await snapshotKey();
+                const snapshotMeta = await loadSnapshotMeta();
+
+                if (!redirectToNodeSnapshotIfNeeded(snapshotMeta)) {
+                    const player = await boot({
+                        root,
+                        canvas,
+                        options: { debug: params.has('debug'), rendererBackend: explicitRendererBackend ?? 'webgl' },
+                    });
+                    window.maxjsPlayer = player;
+                    status.classList.add('hidden');
+                    setTimeout(() => status.remove(), 400);
+
+                    if (reloadEnabled) pollForUpdates(initialKey);
+                }
+            }
+        } catch (err) {
+            console.error('[max.js snapshot] boot failed', err);
+            status.classList.add('error');
+            status.innerHTML =
+                '<div>snapshot boot failed</div>' +
+                '<pre>' + (err?.stack ?? err?.message ?? String(err)) + '</pre>' +
+                '<pre style="opacity:0.7">retry: refresh the page after fixing the issue</pre>';
+            // Still poll for the next export so a fix can land without manual reload.
+            if (reloadEnabled) pollForUpdates(await snapshotKey());
+        }
+
+        // boot() installs its own resize handler that updates renderer
+        // size + re-derives camera fov from Max's horizontal fov. No
+        // wrapper handler needed here.
+    </script>
+</body>
+</html>

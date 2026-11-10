@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    <title>max.js snapshot WebGPU</title>
+    <link rel="icon" href="data:,">
+    <style>
+        html,body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+        #stage { display: block; width: 100vw; height: 100vh; }
+        #boot-status {
+            position: fixed; inset: 0;
+            display: flex; align-items: center; justify-content: center;
+            color: #888; font: 12px/1.4 'Segoe UI', system-ui, sans-serif;
+            background: #000;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+        #boot-status.hidden { opacity: 0; }
+        #boot-status.error { color: #f55; pointer-events: auto; }
+        #boot-status pre {
+            margin: 8px 0 0; max-width: 80vw; white-space: pre-wrap;
+            font: 11px/1.5 'Consolas', monospace;
+        }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "./vendor/three-r187/build/three.webgpu.js",
+            "three-std": "./vendor/three-r187/build/three.module.js",
+            "three/webgpu": "./vendor/three-r187/build/three.webgpu.js",
+            "three/tsl": "./vendor/three-r187/build/three.tsl.js",
+            "tsl-textures": "./vendor/tsl-textures/tsl-textures.js",
+            "three/addons/": "./vendor/three-r187/examples/",
+            "three/examples/jsm/": "./vendor/three-r187/examples/",
+            "three-mesh-bvh": "./node_modules/three-mesh-bvh/src/index.js",
+            "speedball-gi": "./vendor/speedball-gi/js/index.js",
+            "powershot-threejs/pipeline": "./vendor/powershot-threejs/pipeline.js",
+            "powershot-threejs/presets": "./vendor/powershot-threejs/presets.js",
+            "powershot-threejs/film": "./vendor/powershot-threejs/film.js",
+            "powershot-threejs/infrared": "./vendor/powershot-threejs/infrared.js",
+            "powershot-threejs/nightshot": "./vendor/powershot-threejs/nightshot.js",
+            "powershot-threejs/solar-flare": "./vendor/powershot-threejs/solar-flare.js",
+            "powershot-threejs/solar-flare-profile": "./vendor/powershot-threejs/solar-flare-profile.js",
+            "postprocessing": "./node_modules/postprocessing/build/index.js",
+            "@dimforge/rapier3d-compat": "./vendor/rapier/rapier.es.js",
+            "react": "https://esm.sh/react@18.3.1",
+            "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+            "react/jsx-dev-runtime": "https://esm.sh/react@18.3.1/jsx-dev-runtime",
+            "react-dom": "https://esm.sh/react-dom@18.3.1",
+            "react-dom/client": "https://esm.sh/react-dom@18.3.1/client"
+        },
+        "scopes": {
+            "./vendor/three-r187/examples/objects/Sky.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./vendor/three-r187/examples/lighting/LightProbeGridWebGL.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./vendor/three-r187/examples/helpers/LightProbeGridHelperWebGL.js": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./node_modules/three-mesh-bvh/": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            },
+            "./node_modules/postprocessing/": {
+                "three": "./vendor/three-r187/build/three.module.js"
+            }
+        }
+    }
+    </script>
+</head>
+<body>
+    <canvas id="stage"></canvas>
+    <div id="boot-status">booting...</div>
+    <script type="module">
+        import { boot } from './js/snapshot_boot.js';
+
+        const status = document.getElementById('boot-status');
+        const canvas = document.getElementById('stage');
+        const params = new URLSearchParams(location.search);
+        async function hasSnapshotAt(candidateRoot) {
+            try {
+                const head = await fetch(`${candidateRoot}/snapshot.json`, { method: 'HEAD', cache: 'no-store' });
+                return head.ok;
+            } catch { return false; }
+        }
+        const root = params.get('root') ?? ((await hasSnapshotAt('.')) ? '.' : 'snapshots/current');
+        const reloadEnabled = !params.has('noreload');
+        const autoRendererBackend = params.get('maxjsAutoRenderer') === '1';
+        const requestedBackend = String(
+            params.get('renderer')
+            ?? params.get('backend')
+            ?? params.get('rendererBackend')
+            ?? 'webgpu',
+        ).toLowerCase();
+        const rendererBackend = requestedBackend.includes('tsl') ? 'tsl_gl' : 'webgpu';
+
+        async function pollForUpdates(initialKey) {
+            const url = `${root}/snapshot.json`;
+            let lastKey = initialKey;
+            while (true) {
+                await new Promise(r => setTimeout(r, 1500));
+                try {
+                    const head = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+                    if (!head.ok) continue;
+                    const key = head.headers.get('last-modified') ?? head.headers.get('etag') ?? '';
+                    if (key && lastKey && key !== lastKey) {
+                        if (autoRendererBackend) {
+                            console.log('[snapshot_webgpu.html] new export detected, re-evaluating renderer');
+                            const target = new URL('snapshot.html', location.href);
+                            target.searchParams.delete('renderer');
+                            target.searchParams.delete('maxjsAutoRenderer');
+                            location.replace(target.href);
+                        } else {
+                            console.log('[snapshot_webgpu.html] new export detected, reloading');
+                            location.reload();
+                        }
+                        return;
+                    }
+                    if (!lastKey) lastKey = key;
+                } catch {}
+            }
+        }
+
+        async function snapshotKey() {
+            try {
+                const head = await fetch(`${root}/snapshot.json`, { method: 'HEAD', cache: 'no-store' });
+                if (!head.ok) return null;
+                return head.headers.get('last-modified') ?? head.headers.get('etag') ?? '';
+            } catch { return null; }
+        }
+
+        async function waitForFirstSnapshot() {
+            status.innerHTML =
+                '<div>waiting for first export...</div>' +
+                `<pre style="opacity:0.7">root: ${root}/snapshot.json</pre>` +
+                '<pre style="opacity:0.5">click Export Snapshot in Max -> this tab will pick it up</pre>';
+            while (true) {
+                await new Promise(r => setTimeout(r, 1200));
+                if ((await snapshotKey()) != null) return;
+            }
+        }
+
+        try {
+            if ((await snapshotKey()) == null) {
+                await waitForFirstSnapshot();
+            }
+            const initialKey = await snapshotKey();
+
+            const player = await boot({
+                root,
+                canvas,
+                options: { debug: params.has('debug'), rendererBackend },
+            });
+            window.maxjsPlayer = player;
+            status.classList.add('hidden');
+            setTimeout(() => status.remove(), 400);
+
+            if (reloadEnabled) pollForUpdates(initialKey);
+        } catch (err) {
+            console.error(`[max.js snapshot ${rendererBackend}] boot failed`, err);
+            status.classList.add('error');
+            status.innerHTML =
+                `<div>snapshot ${rendererBackend === 'tsl_gl' ? 'TSL_GL' : 'WebGPU'} boot failed</div>` +
+                '<pre>' + (err?.stack ?? err?.message ?? String(err)) + '</pre>' +
+                (rendererBackend === 'webgpu'
+                    ? '<pre style="opacity:0.7">WebGPU deploys require native browser WebGPU. Use ?renderer=tsl_gl for the TSL WebGL backend.</pre>'
+                    : '<pre style="opacity:0.7">TSL_GL requires WebGL2 support.</pre>');
+            if (reloadEnabled) pollForUpdates(await snapshotKey());
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,865 @@
+// Shared post-FX frame-graph core — used by BOTH the editor facade
+// (maxjs_fx.js, static registry) and the standalone snapshot viewer
+// (snapshot_fx.js, dynamic loader). The graph-building code here is a
+// verbatim move of the old maxjs_fx.js rebuildPipeline(): same fold, same
+// node order, so editor and snapshot are structurally pixel-identical.
+//
+// Core-resident concerns (NOT descriptors, NOT dynamic modules):
+//   - shared pre-pass (depth/normal/velocity MRT union)
+//   - scene pass MRT + texture extraction + beauty-alpha coverage
+//   - PS1 vertex snap (material-level, driven by retro.wiggle / shaderlab)
+//   - pixel frame timer
+//   - forced contact-shadow light, toon-mesh cache, deep node disposal
+//
+// Shader Lab, PowerShot, the clone CPU overlay, and colorGrading (CSS canvas
+// filter) stay in the editor facade — they are final-stylize / CPU concerns,
+// not part of the TSL composite.
+import * as THREE from 'three';
+import {
+    color,
+    convertToTexture,
+    diffuseColor,
+    float,
+    max,
+    metalness,
+    mrt,
+    normalView,
+    output,
+    packNormalToRGB,
+    pass,
+    positionLocal,
+    positionView,
+    positionWorld,
+    roughness,
+    sample,
+    screenSize,
+    texture,
+    triNoise3D,
+    uniform,
+    unpackRGBToNormal,
+    vec4,
+    velocity,
+    Fn,
+    cameraProjectionMatrix,
+    cameraViewMatrix,
+    modelWorldMatrix,
+} from 'three/tsl';
+import { purgeViewportCachesForTarget } from './viewport_registry.js';
+
+// Effects safe to run on a path-traced source: pure color-domain folds that
+// need no gbuffer. Everything else (SSGI/SSR/GTAO/DOF/motionBlur/...)
+// reads depth/normal the PT has no gbuffer for — and PT already does GI/DOF —
+// so they are gated off whenever ctx.pathTracedColor is set.
+const PT_SAFE_EFFECTS = new Set(['bloom', 'pixel', 'retro']);
+
+function setTexturePrecision(scenePass) {
+    const diffuseTexture = scenePass.getTexture('diffuseColor');
+    if (diffuseTexture) diffuseTexture.type = THREE.UnsignedByteType;
+
+    const normalTexture = scenePass.getTexture('normal');
+    if (normalTexture) normalTexture.type = THREE.UnsignedByteType;
+
+    const metalRoughTexture = scenePass.getTexture('metalrough');
+    if (metalRoughTexture) metalRoughTexture.type = THREE.UnsignedByteType;
+}
+
+export function createFxCore({
+    renderer,
+    scene,
+    descriptors = [],
+    state,
+    getCamera,
+    getMainLight = () => null,
+    supportsScreenSpaceEffects = false,
+    supportsTslPostEffects = supportsScreenSpaceEffects,
+    isShaderLabEnabled = () => false,
+    getResolutionScale = () => 1.0,
+}) {
+    const PipelineCtor = THREE.RenderPipeline || THREE.PostProcessing;
+    // Recreated on every clearNodes() — see recreatePostPipeline(). Consumers
+    // must read it through the exported getter, never cache the instance.
+    let postProcessing = new PipelineCtor(renderer);
+    const emptyOutputNode = vec4(0, 0, 0, 0);
+    const SSR_REFERENCE_SIZE = 6.0;
+
+    const byId = new Map(descriptors.map((d) => [d.id, d]));
+    const sorted = [...descriptors].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0));
+
+    let activeNodes = [];
+    const activePasses = new Map();
+    const resolutionScaleBindings = new Map();
+    let activeScenePass = null;
+
+    // ── Effect context ──────────────────────────────────────────────────
+    // One persistent ctx per core; per-build fields are reset at the top of
+    // buildPipeline(). Descriptor build()/update() read everything from here
+    // instead of closure locals — that is the whole refactor.
+
+    const uniforms = {
+        dofFocusDistanceU: uniform(100),
+        dofFocalLengthU: uniform(50),
+        dofBokehScaleU: uniform(5),
+        retroCurvatureU: uniform(0.02),
+        retroBleedingU: uniform(0.001),
+        retroColorDepthU: uniform(32),
+        retroScanlineIntensityU: uniform(0.3),
+        retroScanlineDensityU: uniform(1),
+        retroVignetteIntensityU: uniform(0.3),
+        pixelSizeU: uniform(4),
+        pixelChromaticIntensityU: uniform(0.005),
+        pixelSharpenStrengthU: uniform(0.5),
+        pixelGrainIntensityU: uniform(0.08),
+        pixelBrightnessU: uniform(0),
+        pixelContrastU: uniform(0),
+        pixelSaturationU: uniform(0),
+        pixelTimer: uniform(0),
+    };
+
+    let currentBeauty = null;
+    let currentBeautyAlpha = null;
+    let currentDerived = null;
+
+    const ctx = {
+        THREE,
+        renderer,
+        scene,
+        state,
+        uniforms,
+        shared: {},
+        get camera() { return getCamera(); },
+        get mainLight() { return getMainLight(); },
+        get derived() { return currentDerived; },
+        get beauty() { return currentBeauty; },
+        set beauty(node) { currentBeauty = node; },
+        get beautyAlpha() { return currentBeautyAlpha; },
+        set beautyAlpha(node) { currentBeautyAlpha = node; },
+        prePass: null,
+        scenePass: null,
+        sceneTex: null,
+        sceneContext: null,
+        pathTracedColor: null, // when set, the linear-HDR PT texture replaces the scene pass
+        isShaderLabEnabled,
+        has: isEffectActive,
+        pushNode(node) { activeNodes.push(node); },
+        // Wrap a computed node as a texture input AND take ownership of the
+        // RTTNode this mints, so clearNodes() disposes its render target on
+        // the next rebuild. Vendored effect factories (dof, CRT colorBleeding,
+        // recurrentDenoise, …) call convertToTexture internally on whatever
+        // they are handed — an RTT minted INSIDE the factory is reachable by
+        // nothing here and leaks a screen-sized HalfFloat target on every
+        // rebuildPipeline() (2026-07-23: DOF on + slider drags leaked VRAM
+        // until the WebGPU device died). Pre-wrapping makes the factory's
+        // internal wrap a no-op (convertToTexture is identity on texture
+        // nodes) and puts the RTT in activeNodes where disposal can see it.
+        ownedTexture(node) {
+            const wrapped = convertToTexture(node);
+            if (wrapped !== node) activeNodes.push(wrapped);
+            return wrapped;
+        },
+        setActivePass(key, passNode) { activePasses.set(key, passNode); },
+        getActivePass(key) { return activePasses.get(key) ?? null; },
+        applyNodeResolutionScale,
+        raiseBeautyAlpha(alphaNode) {
+            currentBeautyAlpha = max(currentBeautyAlpha, alphaNode);
+            return currentBeautyAlpha;
+        },
+        withBeautyAlpha(node) { return vec4(node.rgb, currentBeautyAlpha); },
+        getToonMeshes,
+    };
+
+    function isEffectActive(id) {
+        const descriptor = byId.get(id);
+        if (!descriptor || !state[id]?.enabled) return false;
+        // Path-traced source → color-domain effects only (no gbuffer exists).
+        if (ctx.pathTracedColor && !PT_SAFE_EFFECTS.has(id)) return false;
+        const supports = (id === 'ssr' || id === 'bloom')
+            ? supportsTslPostEffects
+            : supportsScreenSpaceEffects;
+        if (!supports) return false;
+        if (typeof descriptor.activeWhen === 'function' && !descriptor.activeWhen(ctx)) return false;
+        return true;
+    }
+
+    function anyEffectActive() {
+        return sorted.some((d) =>
+            isEffectActive(d.id) && (d.id !== 'toonOutline' || cachedHasToonMeshes));
+    }
+
+    function deactivateInactiveEffects() {
+        for (const d of sorted) {
+            if (!isEffectActive(d.id)) d.deactivate?.(ctx);
+        }
+    }
+
+    function deactivateAllEffects() {
+        for (const d of sorted) d.deactivate?.(ctx);
+    }
+
+    // ── Resolution scaling ──────────────────────────────────────────────
+
+    function getCombinedPostFxResolutionScale(extraScale = 1.0) {
+        const extra = Number(extraScale);
+        const safeExtra = Number.isFinite(extra) ? extra : 1.0;
+        return THREE.MathUtils.clamp(getResolutionScale() * safeExtra, 0.1, 1.0);
+    }
+
+    function getScaledPostFxSize(width, height, extraScale = 1.0) {
+        const scale = getCombinedPostFxResolutionScale(extraScale);
+        return {
+            width: Math.max(2, Math.round(width * scale)),
+            height: Math.max(2, Math.round(height * scale)),
+        };
+    }
+
+    function applyNodeResolutionScale(node, extraScale = 1.0) {
+        if (!node) return;
+        resolutionScaleBindings.set(node, extraScale);
+        const scale = getCombinedPostFxResolutionScale(extraScale);
+        if (typeof node.setResolutionScale === 'function') {
+            node.setResolutionScale(scale);
+        } else if ('resolutionScale' in node) {
+            node.resolutionScale = scale;
+        }
+    }
+
+    // ── Toon mesh cache — refreshed on pipeline rebuild, not every frame ──
+
+    let cachedHasToonMeshes = false;
+
+    function refreshToonMeshCache() {
+        cachedHasToonMeshes = false;
+        scene.traverse(obj => {
+            if (!obj.isMesh || !obj.visible) return;
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) {
+                if (m && m.isMeshToonMaterial) {
+                    cachedHasToonMeshes = true;
+                    return;
+                }
+            }
+        });
+    }
+
+    function getToonMeshes() {
+        // Only used during pipeline rebuild — returns fresh list
+        const result = [];
+        scene.traverse(obj => {
+            if (!obj.isMesh || !obj.visible) return;
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+            for (const m of mats) {
+                if (m && m.isMeshToonMaterial) {
+                    result.push(obj);
+                    break;
+                }
+            }
+        });
+        return result;
+    }
+
+    // ── Post-pass hide list ─────────────────────────────────────────────
+
+    let postPassHideList = [];
+    let normalsComputed = new WeakSet();
+    let hiddenDuringPost = [];
+
+    function refreshPostPassHideList() {
+        postPassHideList = [];
+        scene.traverse((object) => {
+            if (!object?.visible) return;
+            if (object.isLine || object.isLineSegments || object.isPoints || object.isSprite) {
+                postPassHideList.push(object);
+            }
+            // Pre-compute normals once, not every frame
+            if (object.isMesh && object.geometry && !normalsComputed.has(object.geometry)) {
+                if (!object.geometry.getAttribute?.('normal') && object.geometry.getAttribute?.('position')) {
+                    try { object.geometry.computeVertexNormals(); } catch {}
+                }
+                normalsComputed.add(object.geometry);
+            }
+        });
+    }
+
+    function prepareSceneForPostPass() {
+        hiddenDuringPost = postPassHideList.filter(o => o.visible);
+        for (const o of hiddenDuringPost) o.visible = false;
+    }
+
+    function restoreSceneAfterPostPass() {
+        for (const o of hiddenDuringPost) o.visible = true;
+        hiddenDuringPost = [];
+    }
+
+    // ── Forced contact-shadow light ─────────────────────────────────────
+
+    let forcedContactShadowLightState = null;
+
+    function restoreForcedContactShadowLight() {
+        if (!forcedContactShadowLightState) return;
+
+        const { light, castShadow, shadowIntensity } = forcedContactShadowLightState;
+        forcedContactShadowLightState = null;
+
+        if (!light) return;
+
+        light.castShadow = castShadow;
+        if (light.shadow && shadowIntensity != null) {
+            light.shadow.intensity = shadowIntensity;
+            light.shadow.needsUpdate = true;
+        }
+    }
+
+    function ensureMainLightSupportsContactShadow() {
+        const mainLight = getMainLight();
+        if (!state.contactShadow?.enabled || !mainLight?.isDirectionalLight) {
+            restoreForcedContactShadowLight();
+            return;
+        }
+
+        if (forcedContactShadowLightState?.light && forcedContactShadowLightState.light !== mainLight) {
+            restoreForcedContactShadowLight();
+        }
+
+        if (mainLight.castShadow || forcedContactShadowLightState?.light === mainLight) return;
+
+        forcedContactShadowLightState = {
+            light: mainLight,
+            castShadow: mainLight.castShadow,
+            shadowIntensity: mainLight.shadow && Number.isFinite(mainLight.shadow.intensity)
+                ? mainLight.shadow.intensity
+                : null,
+        };
+
+        mainLight.castShadow = true;
+        if (mainLight.shadow) {
+            if (typeof mainLight.shadow.intensity === 'number') {
+                mainLight.shadow.intensity = 0;
+            }
+            mainLight.shadow.needsUpdate = true;
+        }
+    }
+
+    function cleanupUnsupportedRealtimeResources() {
+        if (supportsScreenSpaceEffects) return;
+        restoreForcedContactShadowLight();
+        deactivateAllEffects();
+        activePasses.delete('contactShadow');
+    }
+
+    // ── Node disposal ───────────────────────────────────────────────────
+
+    function disposeResource(resource, seen) {
+        if (!resource || seen.has(resource)) return;
+        seen.add(resource);
+        // A dying render target may be a key in ViewportTextureNode clone
+        // caches (glass backdrops, transmission, viewportLinearDepth) — reap
+        // those framebuffer copies or they outlive every rebuild.
+        if (resource.isRenderTarget) purgeViewportCachesForTarget(resource);
+        if (typeof resource.dispose === 'function') {
+            try { resource.dispose(); } catch (_) { /* best effort */ }
+        }
+    }
+
+    function retirePostPipeline({ recreate = true } = {}) {
+        // Retire the ENTIRE pipeline object, not just its node graph. Swapping
+        // outputNode on a reused quad is not enough on the WebGPU backend
+        // (r185): the old quad's compiled builder state (updateBeforeNodes)
+        // survives via closure retention, so the old graph's PassNodes keep
+        // updateBefore-running every frame and lazily RESURRECT their disposed
+        // render targets — VRAM grows by one zombie graph per rebuild
+        // (2026-07-23: heap snapshot showed 49 live PassNodes / 15 DOF nodes /
+        // 408 RenderTargets after a DOF slider session; the session died by
+        // GPU device loss). A fresh RenderPipeline instance makes the old quad
+        // unreachable, so its render-object caches, builder state, and node
+        // graph all become collectable together.
+        const previous = postProcessing;
+        try { previous?.dispose?.(); } catch {}
+        try {
+            const quadMat = previous?._quadMesh?.material;
+            if (quadMat) {
+                quadMat.fragmentNode = null;
+            }
+        } catch {}
+        if (previous) {
+            previous.outputNode = emptyOutputNode;
+            previous.needsUpdate = true;
+        }
+        if (!recreate) {
+            postProcessing = null;
+            return;
+        }
+        postProcessing = new PipelineCtor(renderer);
+        postProcessing.outputNode = emptyOutputNode;
+        postProcessing.needsUpdate = true;
+    }
+
+    function recreatePostPipeline() {
+        retirePostPipeline({ recreate: true });
+    }
+
+    // r187 PassNode/RTTNode dispose their own targets, including every MRT
+    // output (getTexture() adds each to renderTarget.textures), and the RTT
+    // quad material. Then drop the retired node's references so a retained
+    // closure cannot keep its scene, camera or textures alive.
+    function disposeNodeDeep(node, seen) {
+        if (!node) return;
+        try {
+            disposeResource(node, seen);
+
+            node.scene = null;
+            node.camera = null;
+            node.contextNode = null;
+            node.renderTarget = null;
+            node._previousTextures = {};
+            node._previousTextureNodes = {};
+            node._textures = {};
+            node._textureNodes = {};
+            node._linearDepthNodes = {};
+            node._viewZNodes = {};
+            node._contextNodeCache = null;
+        } catch (_) {
+            // Cleanup must never break a rebuild.
+        }
+    }
+
+    function clearNodes({ recreatePipeline = true } = {}) {
+        if (recreatePipeline) recreatePostPipeline();
+        else retirePostPipeline({ recreate: false });
+        activePasses.clear();
+        resolutionScaleBindings.clear();
+        activeScenePass = null;
+        const seen = new Set();
+        for (const node of activeNodes) {
+            disposeNodeDeep(node, seen);
+        }
+        activeNodes = [];
+    }
+
+    // ── Derived state ───────────────────────────────────────────────────
+
+    function computeSceneReferenceSize() {
+        const box = new THREE.Box3();
+        let foundMesh = false;
+
+        scene.traverse((object) => {
+            if (!object?.visible || !object.isMesh || !object.geometry) return;
+            const position = object.geometry.getAttribute?.('position');
+            if (!position || position.count === 0) return;
+            box.expandByObject(object);
+            foundMesh = true;
+        });
+
+        if (!foundMesh || box.isEmpty()) return SSR_REFERENCE_SIZE;
+
+        const size = box.getSize(new THREE.Vector3());
+        const maxDimension = Math.max(size.x, size.y, size.z);
+        return Number.isFinite(maxDimension) && maxDimension > 1.0e-3
+            ? maxDimension
+            : SSR_REFERENCE_SIZE;
+    }
+
+    function computeDerivedState() {
+        const sceneReferenceSize = computeSceneReferenceSize();
+        const ssrUnitScale = Math.max(1, sceneReferenceSize / SSR_REFERENCE_SIZE);
+
+        // Optional chaining: the snapshot core only carries state for the
+        // effects it loaded; fall back to descriptor defaults.
+        return {
+            sceneReferenceSize,
+            ssrUnitScale,
+            effectiveSSRMaxDistance: (state.ssr?.maxDistance ?? 0.5) * ssrUnitScale,
+            effectiveSSRThickness: (state.ssr?.thickness ?? 0.015) * ssrUnitScale,
+            effectiveGTAORadius: (state.gtao?.radius ?? 0.5) * ssrUnitScale,
+            effectiveGTAOThickness: (state.gtao?.thickness ?? 1.0) * ssrUnitScale,
+            effectiveContactShadowMaxDistance: (state.contactShadow?.maxDistance ?? 0.1) * ssrUnitScale,
+            effectiveContactShadowThickness: (state.contactShadow?.thickness ?? 0.006) * ssrUnitScale,
+            ps1SnapActive: isPS1WiggleActive(),
+        };
+    }
+
+    // ── PS1 Vertex Snap ─────────────────────────────────────────────────
+    // Snaps vertices to screen-pixel grid in clip space. Modifies materials
+    // in-place — no material cloning, no CubeMapNode overhead, no separate
+    // render pass.
+
+    const ps1SnapStrength = uniform(5.0);
+    // PS1 vertex snap — outputs clip-space position via vertexNode (bypasses Three.js projection)
+    const ps1VertexSnap = Fn(() => {
+        const worldPos = modelWorldMatrix.mul(vec4(positionLocal, 1.0));
+        const clipPos = cameraProjectionMatrix.mul(cameraViewMatrix).mul(worldPos);
+        const w = clipPos.w;
+        const ndc = clipPos.xy.div(w);
+        const screenPx = ndc.add(1.0).mul(0.5).mul(screenSize);
+        const grid = ps1SnapStrength;
+        const snappedPx = screenPx.div(grid).floor().mul(grid);
+        const snappedNdc = snappedPx.div(screenSize).mul(2.0).sub(1.0);
+        return vec4(snappedNdc.mul(w), clipPos.z, w);
+    })();
+
+    let ps1WiggleActive = false;
+    let ps1SceneDirty = true;
+    const ps1SavedNodes = new Map();
+
+    function isPS1WiggleActive() {
+        return supportsScreenSpaceEffects
+            && !!state.retro?.wiggle
+            && (state.retro?.enabled || isShaderLabEnabled());
+    }
+
+    function ps1SavedVertexNode(saved) {
+        return saved && typeof saved === 'object' && Object.prototype.hasOwnProperty.call(saved, 'vertexNode')
+            ? saved.vertexNode
+            : saved;
+    }
+
+    function restorePS1Material(mat) {
+        if (!ps1SavedNodes.has(mat)) return;
+        mat.vertexNode = ps1SavedVertexNode(ps1SavedNodes.get(mat));
+        ps1SavedNodes.delete(mat);
+    }
+
+    function hasPS1ExcludedToken(value) {
+        const text = String(value || '').toLowerCase();
+        return /(^|[_\-\s])(sky|skydome|skybox|background|backdrop|environment|env)([_\-\s]|$)/.test(text);
+    }
+
+    function shouldSkipPS1Object(obj) {
+        if (!obj || (!obj.isMesh && !obj.isSkinnedMesh && !obj.isInstancedMesh)) return true;
+        const data = obj.userData || {};
+        if (data.maxjsNoPS1Wiggle || data.maxjsSky || data.maxjsBackground || data.maxjsBackdrop) return true;
+        if (obj.isSky || obj.isSkyMesh || hasPS1ExcludedToken(obj.name) || hasPS1ExcludedToken(obj.type)) return true;
+        return false;
+    }
+
+    function shouldSkipPS1Material(mat) {
+        if (!mat) return true;
+        const data = mat.userData || {};
+        if (data.maxjsNoPS1Wiggle || data.maxjsSky || data.maxjsBackground || data.maxjsBackdrop) return true;
+        return hasPS1ExcludedToken(mat.name) || hasPS1ExcludedToken(mat.type);
+    }
+
+    function enablePS1Wiggle(strength = 5.0) {
+        ps1SnapStrength.value = Math.max(1.0, strength);
+        ps1WiggleActive = true;
+        scene.traverse(obj => {
+            const skipObject = shouldSkipPS1Object(obj);
+            const mats = obj.material
+                ? (Array.isArray(obj.material) ? obj.material : [obj.material])
+                : [];
+            for (const mat of mats) {
+                if (skipObject || shouldSkipPS1Material(mat)) {
+                    restorePS1Material(mat);
+                    continue;
+                }
+                if (ps1SavedNodes.has(mat)) continue;
+                ps1SavedNodes.set(mat, { vertexNode: mat.vertexNode || null, object: obj });
+                mat.vertexNode = ps1VertexSnap;
+            }
+        });
+    }
+
+    function disablePS1Wiggle() {
+        if (!ps1WiggleActive && ps1SavedNodes.size === 0) return;
+        ps1WiggleActive = false;
+        for (const [mat, saved] of ps1SavedNodes) {
+            mat.vertexNode = ps1SavedVertexNode(saved);
+        }
+        ps1SavedNodes.clear();
+    }
+
+    function syncSharedSceneEffects(force = false) {
+        const shouldUsePS1Wiggle = isPS1WiggleActive();
+        if (shouldUsePS1Wiggle) {
+            if (force || ps1SceneDirty || !ps1WiggleActive) {
+                enablePS1Wiggle(state.retro?.affineDistortion ?? 5.0);
+            } else {
+                ps1SnapStrength.value = Math.max(1.0, state.retro?.affineDistortion ?? 5.0);
+            }
+        } else {
+            disablePS1Wiggle();
+        }
+        ps1SceneDirty = false;
+    }
+
+    // ── Build / teardown ────────────────────────────────────────────────
+
+    function prepareRebuild() {
+        disablePS1Wiggle();
+        ps1SceneDirty = true;
+        refreshToonMeshCache();
+        refreshPostPassHideList();
+        ensureMainLightSupportsContactShadow();
+        cleanupUnsupportedRealtimeResources();
+        deactivateInactiveEffects();
+    }
+
+    function teardownPipeline() {
+        syncSharedSceneEffects(true);
+        restoreForcedContactShadowLight();
+        // Terminal teardown must not leave a fresh RenderPipeline owned by a
+        // disposed scene. The next rebuild creates one through clearNodes().
+        clearNodes({ recreatePipeline: false });
+    }
+
+    function handleBuildFailure() {
+        restoreForcedContactShadowLight();
+        deactivateAllEffects();
+        clearNodes({ recreatePipeline: false });
+    }
+
+    /**
+     * Reproduces the old rebuildPipeline() graph construction, data-driven:
+     *  1. union pre-pass for descriptors with needs (samples:1 when forced)
+     *  2. context-stage descriptors (slot order) build ctx.sceneContext
+     *  3. scene pass (scenePass-stage descriptor or default pass) + MRT
+     *  4. beauty fold in slot order
+     *  5. output node with coverage-derived beauty alpha
+     *
+     * The caller decides teardown-vs-build and owns error escalation; an
+     * exception is returned, not thrown.
+     */
+    function buildPipeline() {
+        activePasses.clear();
+        ctx.prePass = null;
+        ctx.scenePass = null;
+        ctx.sceneTex = null;
+        ctx.sceneContext = null;
+        activeScenePass = null;
+        currentBeauty = null;
+        currentBeautyAlpha = null;
+
+        try {
+            // PS1 vertex snap — coexists with all post-FX, no takeover needed
+            syncSharedSceneEffects(true);
+
+            currentDerived = computeDerivedState();
+
+            // ── Path-traced source ──────────────────────────────────────────
+            // The path tracer already produced linear-HDR beauty (with real GI +
+            // DOF), so there is no scene pass and no gbuffer. Feed that color in
+            // as the beauty and fold ONLY the color-domain effects (bloom/pixel/
+            // retro); the gbuffer passes are gated off via isEffectActive. Output
+            // (PowerShot film emulation + tone map) is shared with the raster
+            // path, so the linear workflow is identical from here down.
+            if (ctx.pathTracedColor) {
+                const ptColor = texture(ctx.pathTracedColor);
+                currentBeauty = vec4(ptColor.rgb, float(1));
+                currentBeautyAlpha = float(1);
+                for (const d of sorted) {
+                    if (d.stage !== 'beauty' || !isEffectActive(d.id)) continue;
+                    const next = d.build(ctx);
+                    if (next != null) currentBeauty = next;
+                }
+                postProcessing.outputNode = ctx.withBeautyAlpha(currentBeauty);
+                postProcessing.needsUpdate = true;
+                return { ok: true, builtAgainstEmptyScene: false };
+            }
+
+            const active = sorted.filter((d) => isEffectActive(d.id));
+
+            const descriptorNeeds = (descriptor) => (
+                typeof descriptor.needs === 'function'
+                    ? descriptor.needs(ctx)
+                    : descriptor.needs
+            );
+            const descriptorFlag = (descriptor, key) => (
+                typeof descriptor[key] === 'function'
+                    ? descriptor[key](ctx)
+                    : descriptor[key]
+            );
+
+            const useSharedPrePass = active.some((d) => {
+                const needs = descriptorNeeds(d);
+                return Array.isArray(needs) && needs.length > 0;
+            });
+
+            if (useSharedPrePass) {
+                // TRAA copies depth — MSAA sample count must be 1 to avoid mismatch
+                const forceSamplesOne = active.some((d) => descriptorFlag(d, 'forcePrePassSamplesOne'));
+                const keepNormalCopyCompatible = active.some((d) => descriptorFlag(d, 'needsCopyCompatiblePrePassNormal'));
+                const prePass = forceSamplesOne
+                    ? pass(scene, getCamera(), { samples: 1 })
+                    : pass(scene, getCamera());
+                applyNodeResolutionScale(prePass);
+                activeNodes.push(prePass);
+                prePass.transparent = false;
+                prePass.setMRT(mrt({
+                    output: packNormalToRGB(normalView),
+                    velocity,
+                }));
+
+                const prePassDepth = prePass.getTextureNode('depth');
+                const prePassNormalColor = prePass.getTextureNode('output');
+                const prePassVelocity = prePass.getTextureNode('velocity');
+                const prePassNormal = sample((uvNode) => unpackRGBToNormal(prePassNormalColor.sample(uvNode)));
+
+                const normalTexture = prePass.getTexture('output');
+                // SSR denoise copies normal history; source/destination GPU formats must match.
+                if (normalTexture && !keepNormalCopyCompatible) normalTexture.type = THREE.UnsignedByteType;
+
+                ctx.prePass = {
+                    node: prePass,
+                    depth: prePassDepth,
+                    normal: prePassNormal,
+                    normalColor: prePassNormalColor,
+                    velocity: prePassVelocity,
+                };
+            }
+
+            // Context stage: contactShadow / gtao contribute to ctx.sceneContext
+            for (const d of active) {
+                if (d.stage === 'context') d.build(ctx);
+            }
+
+            const ssrDielectricReflectivityNode = roughness.oneMinus().mul(0.08).add(float(0.02));
+            const ssrReflectivityNode = max(
+                metalness,
+                ssrDielectricReflectivityNode
+            ).mul(roughness.smoothstep(0.85, 0.75));
+
+            // Scene pass: a scenePass-stage descriptor (toonOutline) may replace
+            // the default pass() — outlines + MRT so beauty effects stack on top.
+            const scenePassDescriptor = active.find((d) => d.stage === 'scenePass');
+            let scenePass = scenePassDescriptor ? (scenePassDescriptor.build(ctx) || null) : null;
+            if (!scenePass) scenePass = pass(scene, getCamera());
+            applyNodeResolutionScale(scenePass);
+            activeNodes.push(scenePass);
+            ctx.scenePass = scenePass;
+            activeScenePass = scenePass;
+            // Keep the transparent render list enabled regardless of backdrop.
+            // PassNode.transparent controls whether transparent objects render,
+            // so tying it to the HDRI visibility toggle drops opacity maps.
+            scenePass.transparent = true;
+
+            if (ctx.sceneContext) scenePass.contextNode = ctx.sceneContext;
+
+            scenePass.setMRT(mrt({
+                output,
+                diffuseColor,
+                normal: packNormalToRGB(normalView),
+                metalrough: vec4(metalness, roughness, ssrReflectivityNode, 1),
+            }));
+
+            setTexturePrecision(scenePass);
+
+            const scenePassColor = scenePass.getTextureNode('output');
+            const scenePassDiffuse = scenePass.getTextureNode('diffuseColor');
+            const scenePassDepth = scenePass.getTextureNode('depth');
+            const scenePassNormalColor = scenePass.getTextureNode('normal');
+            const scenePassMetalRough = scenePass.getTextureNode('metalrough');
+            const sceneNormal = sample((uvNode) => unpackRGBToNormal(scenePassNormalColor.sample(uvNode)));
+
+            ctx.sceneTex = {
+                color: scenePassColor,
+                diffuse: scenePassDiffuse,
+                depth: scenePassDepth,
+                normalColor: scenePassNormalColor,
+                metalrough: scenePassMetalRough,
+                normal: sceneNormal,
+                reflectivity: scenePassMetalRough.b,
+            };
+
+            currentBeauty = scenePassColor;
+
+            // The MRT scene-pass output alpha is unreliable for opaque geometry
+            // when there is no background fill (alpha render / transparent
+            // export): opaque pixels can read a=0, which then premultiplies the
+            // whole matte to transparent black on the canvas. Derive coverage
+            // from scene depth (already reliable, drives the env-backdrop
+            // compensation below) and keep the higher of the two so glow/bloom
+            // can still extend alpha past the geometry. This is a no-op for
+            // live/opaque renders, where the background fills depth=far with a=1
+            // — there scenePassColor.a is already 1 and dominates the max().
+            const geometryCoverageAlpha = scenePassDepth.r.lessThan(float(0.999999)).select(float(1), float(0));
+            currentBeautyAlpha = max(scenePassColor.a, geometryCoverageAlpha);
+
+            for (const d of active) {
+                if (d.stage !== 'beauty') continue;
+                const next = d.build(ctx);
+                if (next != null) currentBeauty = next;
+            }
+
+            postProcessing.outputNode = ctx.withBeautyAlpha(currentBeauty);
+            postProcessing.needsUpdate = true;
+
+            // Track whether the scene had any renderables at build time. If
+            // zero (cold-start with saved post-FX before any scene sync),
+            // pass(scene, camera) cached an empty render list and the next
+            // markSceneChanged must escalate to a real rebuild.
+            let renderableCount = 0;
+            scene.traverse((obj) => {
+                if (obj?.isMesh || obj?.isSkinnedMesh) renderableCount++;
+            });
+
+            return {
+                ok: true,
+                builtAgainstEmptyScene: renderableCount === 0,
+            };
+        } catch (error) {
+            return { ok: false, error };
+        }
+    }
+
+    // ── Per-frame ───────────────────────────────────────────────────────
+
+    function updatePerFrame() {
+        if (activeScenePass) {
+            activeScenePass.transparent = true;
+        }
+        currentDerived = computeDerivedState();
+        for (const d of sorted) {
+            if (!isEffectActive(d.id)) continue;
+            d.update?.(ctx);
+        }
+    }
+
+    function updateFrameTimers() {
+        // Pixel grain timer
+        if (isEffectActive('pixel') && state.pixel.grain) {
+            uniforms.pixelTimer.value = performance.now() * 0.001;
+        }
+    }
+
+    function refreshResolutionScales() {
+        for (const [node, extraScale] of resolutionScaleBindings) {
+            const scale = getCombinedPostFxResolutionScale(extraScale);
+            if (typeof node.setResolutionScale === 'function') node.setResolutionScale(scale);
+            else if ('resolutionScale' in node) node.resolutionScale = scale;
+        }
+        if (postProcessing) postProcessing.needsUpdate = true;
+    }
+
+    return {
+        // Live accessor: the instance is REPLACED on every clearNodes(); a
+        // cached reference would render (and resurrect) the old zombie graph.
+        get postProcessing() { return postProcessing; },
+        ctx,
+        uniforms,
+        descriptors: sorted,
+        isEffectActive,
+        anyEffectActive,
+        hasToonMeshes: () => cachedHasToonMeshes,
+        computeDerivedState,
+        prepareRebuild,
+        buildPipeline,
+        teardownPipeline,
+        handleBuildFailure,
+        clearNodes,
+        cleanupUnsupportedRealtimeResources,
+        updatePerFrame,
+        updateFrameTimers,
+        syncSharedSceneEffects,
+        markPS1SceneDirty: () => { ps1SceneDirty = true; },
+        refreshSceneCaches() {
+            refreshToonMeshCache();
+            refreshPostPassHideList();
+        },
+        ensureMainLightSupportsContactShadow,
+        restoreForcedContactShadowLight,
+        prepareSceneForPostPass,
+        restoreSceneAfterPostPass,
+        getCombinedPostFxResolutionScale,
+        getScaledPostFxSize,
+        applyNodeResolutionScale,
+        refreshResolutionScales,
+    };
+}

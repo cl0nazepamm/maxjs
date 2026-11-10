@@ -1,0 +1,2893 @@
+        import * as THREE from 'three';
+        import { installHdriDiffuseSplit } from '../environment_lighting.js';
+        import { createNirBandView } from '../nir_band_view.js';
+        import * as THREE_STD from 'three-std';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
+        import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+        import { RectAreaLightTexturesLib } from 'three/addons/lights/RectAreaLightTexturesLib.js';
+        import { createWebXRRuntime } from './webxr.js';
+        import { Inspector } from 'three/addons/inspector/Inspector.js';
+        import {
+            installMaxLightsRenderer,
+        } from '../max_lights_node.js';
+        import { createRendererCore } from './renderer_core.js';
+        import { createTexturePipeline } from './texture_pipeline.js';
+        import { createMaterials } from './materials.js';
+        import { createBakeSystem } from './bake_system.js';
+        import { createSceneSync } from './scene_sync.js';
+        import { createSceneExtras } from './scene_extras.js';
+        import { createCameraSystem } from './camera_system.js';
+        import { createSnapshotExport } from './snapshot_export.js';
+        import { createPostFxGlue } from './postfx_glue.js';
+        import { createPathTracingGlue } from './pathtracing_glue.js';
+        import { createPathTracer, normalizePathTracerSettings } from './path_tracer.js';
+        import { createRenderCapture } from './render_capture.js';
+        import { createRenderLoop } from './render_loop.js';
+        import { createSceneLoadGate } from './scene_load_gate.js';
+        import { createLongTaskMonitor } from '../long_task_monitor.js';
+        import { suppressKnownExrMetadataWarnings } from '../exr_warnings.js';
+        import { createPanelsMisc } from './panels_misc.js';
+        import { createLights } from './lights.js';
+        import { createEnvironment } from './environment.js';
+        import { createSky } from './sky.js';
+        import { createLightProbeGlue } from './light_probe_glue.js';
+        import { getHostProfile } from '../host_profile.js';
+        import {
+            materialEnvIntensity,
+        } from 'three/tsl';
+        import * as TSL from 'three/tsl';
+
+        const maxjsHdriDiffuseIntensity = THREE.TSL.uniform(1.0);
+
+        // Patch materialEnvIntensity so scene.environment still respects
+        // per-material envMapIntensity, while scene.environmentIntensity remains
+        // the global HDRI/node intensity control.
+        materialEnvIntensity.onObjectUpdate(({ material, scene }) => {
+            const materialIntensity = Number.isFinite(material?.envMapIntensity)
+                ? material.envMapIntensity
+                : 1.0;
+            const sceneIntensity = Number.isFinite(scene?.environmentIntensity)
+                ? scene.environmentIntensity
+                : 1.0;
+            return materialIntensity * sceneIntensity;
+        });
+
+        // Preserve upstream r187 retroreflection while applying max.js HDRI policy.
+        installHdriDiffuseSplit(maxjsHdriDiffuseIntensity);
+        import { maxTimeline } from '../maxjs_timeline.js';
+        import { createHostBridge } from './host_bridge.js';
+        import { createEditorContext } from './context.js';
+        import { installDebugBridge } from './debug_bridge.js';
+        import { createPerfHud } from '../perf_hud.js';
+        import { createMaxJSFxController } from '../maxjs_fx.js';
+        import { createWebGLBasicFx } from '../webgl_basicfx.js';
+        import { createLayerManager } from '../layer_manager.js';
+        import { MAXJS_LAYER_SSR_EXCLUDE } from '../render_layers.js';
+        import { createMaxJSAnimationSystem } from '../maxjs_animation.js';
+        import { createMaxJSAudioSystem } from '../maxjs_audio.js';
+        import { createMaxJSGLTFSystem } from '../maxjs_gltf.js';
+        import { createProjectRuntime } from '../project_runtime.js';
+        import { attachHTMLClickForwarding } from '../html_texture.js';
+        import { createShaderLabFx } from '../shader_lab_fx.js';
+        import { createCompositionOverlay } from '../composition_overlay.js';
+        import { installDockDragHide } from '../dock_drag.js';
+        import {
+            copyMaxArrayToWorld,
+            copyMaxComponentsToWorld,
+            sceneSpace,
+        } from '../scene_space.js';
+        import {
+            getShaderLabSnapshot,
+            setShaderLabSnapshot,
+            onShaderLabSnapshotChange,
+            updateShaderLabEnabled,
+        } from '../shader_lab_panel.js';
+        const THEME_STORAGE_KEY = 'maxjs-theme';
+        const AUDIO_MUTED_STORAGE_KEY = 'maxjs-audio-muted';
+        const BACKGROUND_COLOR_STORAGE_KEY = 'maxjs-background-color';
+        const DEFAULT_BACKGROUND_COLOR = 0x353535;
+        function hexColorInputValue(hex) {
+            return `#${(hex >>> 0).toString(16).padStart(6, '0')}`;
+        }
+        function parseHexColorInput(value) {
+            if (typeof value !== 'string' || !/^#[0-9a-fA-F]{6}$/.test(value)) return null;
+            return parseInt(value.slice(1), 16);
+        }
+        function readPersistedBackgroundColor() {
+            try {
+                const raw = localStorage.getItem(BACKGROUND_COLOR_STORAGE_KEY);
+                if (raw) {
+                    const value = Number(raw);
+                    if (Number.isFinite(value) && value >= 0 && value <= 0xffffff) {
+                        return value >>> 0;
+                    }
+                }
+                const legacy = localStorage.getItem('maxjs-bg-colors');
+                if (legacy) {
+                    const parsed = JSON.parse(legacy);
+                    const migrated = parsed?.custom ?? parsed?.dark ?? parsed?.light;
+                    if (Number.isFinite(migrated) && migrated >= 0 && migrated <= 0xffffff) {
+                        return migrated >>> 0;
+                    }
+                }
+            } catch { /* private mode / corrupt */ }
+            return DEFAULT_BACKGROUND_COLOR;
+        }
+        function saveBackgroundColor() {
+            try {
+                localStorage.setItem(BACKGROUND_COLOR_STORAGE_KEY, String(hiddenBackgroundColor));
+            } catch { /* private mode */ }
+        }
+        function applyViewportBackdropColor(hex = null) {
+            if (hex == null) {
+                document.documentElement.style.setProperty('--maxjs-viewport-bg', 'transparent');
+                return;
+            }
+            const value = Number.isFinite(hex) ? (hex >>> 0) : DEFAULT_BACKGROUND_COLOR;
+            document.documentElement.style.setProperty(
+                '--maxjs-viewport-bg',
+                `#${value.toString(16).padStart(6, '0')}`
+            );
+        }
+        function readPersistedLightMode() {
+            try {
+                return localStorage.getItem(THEME_STORAGE_KEY) === 'light';
+            } catch {
+                return false;
+            }
+        }
+        function readPersistedAudioMuted() {
+            try {
+                return localStorage.getItem(AUDIO_MUTED_STORAGE_KEY) === 'true';
+            } catch {
+                return false;
+            }
+        }
+        let lightMode = readPersistedLightMode();
+        document.body.classList.toggle('light-mode', lightMode);
+
+        // ── Scene Setup (Y-up world + Max basis boundary) ───
+        let hiddenBackgroundColor = readPersistedBackgroundColor();
+        applyViewportBackdropColor(null);
+        const viewportBackgroundColor = new THREE.Color(hiddenBackgroundColor);
+        const scene = new THREE.Scene();
+        scene.background = null;
+        const maxBasisRoot = new THREE.Group();
+        maxBasisRoot.name = '__maxjs_max_basis_root__';
+        maxBasisRoot.rotation.x = -Math.PI / 2;
+        scene.add(maxBasisRoot);
+        const maxRoot = new THREE.Group();
+        maxRoot.name = '__maxjs_max_root__';
+        maxBasisRoot.add(maxRoot);
+        const jsRoot = new THREE.Group();
+        jsRoot.name = '__maxjs_js_root__';
+        scene.add(jsRoot);
+        const overlayRoot = new THREE.Group();
+        overlayRoot.name = '__maxjs_overlay_root__';
+        maxBasisRoot.add(overlayRoot);
+
+        const cameraTargetWorld = new THREE.Vector3();
+        const cameraPositionWorld = new THREE.Vector3();
+
+        const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
+        function getActiveCameraWorldPosition(target = new THREE.Vector3()) {
+            const activeCamera = renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera;
+            return activeCamera.getWorldPosition(target);
+        }
+
+        const DEFAULT_CAMERA_NEAR = 1.0;
+        const DEFAULT_CAMERA_FAR = 100000;
+        const perspCamera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, DEFAULT_CAMERA_NEAR, DEFAULT_CAMERA_FAR);
+        const orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, DEFAULT_CAMERA_NEAR, DEFAULT_CAMERA_FAR);
+        perspCamera.up.set(0, 1, 0);
+        orthoCamera.up.set(0, 1, 0);
+        perspCamera.position.copy(cameraDefaultPosition);
+        perspCamera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
+        orthoCamera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
+        let camera = perspCamera;
+
+        const PERFORMANCE_DEFAULTS = Object.freeze({
+            fpsCap: 0,
+            renderScale: 1.0,
+            postFxScale: 1.0,
+            optimizeMaxInstances: true,
+            maxInstanceBucketThreshold: 50,
+            // Merge static Max group members into one mesh per material.
+            // Off by default: merged members lose per-node picking until the
+            // cluster dissolves.
+            flattenGroups: false,
+        });
+        let performanceSettings = { ...PERFORMANCE_DEFAULTS };
+        const SAFE_FRAME_STORAGE_KEY = 'maxjs_safe_frame_enabled';
+        const renderOutputSettings = { width: 0, height: 0, aspect: 0 };
+        let safeFrameEnabled = false;
+        let blobOverlayCvs = null;
+        let blobOverlayCtx = null;
+        let compositionOverlay = null;
+
+        try {
+            safeFrameEnabled = localStorage.getItem(SAFE_FRAME_STORAGE_KEY) === 'true';
+        } catch {}
+
+        function getRenderOutputAspect() {
+            const width = Number(renderOutputSettings.width);
+            const height = Number(renderOutputSettings.height);
+            const aspect = Number(renderOutputSettings.aspect);
+            if (Number.isFinite(aspect) && aspect > 0) return aspect;
+            return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+                ? width / height
+                : null;
+        }
+
+        // User-overridable camera clip planes. null means "use auto-fit value".
+        // Raise `near` to reclaim depth precision on large scenes where distant geo z-fights.
+        const cameraClip = { near: null, far: null };
+        function applyCameraClipOverrides(cam) {
+            if (!cam) return;
+            if (Number.isFinite(cameraClip.near) && cameraClip.near > 0) cam.near = cameraClip.near;
+            if (Number.isFinite(cameraClip.far) && cameraClip.far > cam.near) cam.far = cameraClip.far;
+            cam.updateProjectionMatrix();
+        }
+        function applySyncedCameraClip(cam, source = null) {
+            if (!cam || cam.isOrthographicCamera) return;
+            const near = Number(source?.near);
+            const far = Number(source?.far);
+            if (Number.isFinite(near) && near > 0 && Number.isFinite(far) && far > near) {
+                cam.near = near;
+                cam.far = far;
+                return;
+            }
+            if (!Number.isFinite(cam.near) || cam.near < DEFAULT_CAMERA_NEAR) cam.near = DEFAULT_CAMERA_NEAR;
+            if (!Number.isFinite(cam.far) || cam.far <= cam.near) cam.far = DEFAULT_CAMERA_FAR;
+        }
+        let lastRenderTimestamp = 0;
+
+        const isHostedWebView = !!window.chrome?.webview?.postMessage;
+        const pageParams = new URLSearchParams(window.location.search);
+        const isProductionRenderPage = pageParams.has('productionRender');
+        const shouldPreserveCanvasForCapture = isHostedWebView || isProductionRenderPage;
+
+        // Path tracing is a live view on the WebGPU backend (path_tracer.js).
+        // Session-only: every viewer start begins rasterized.
+        let isPathTracingMode = false;
+        document.body.classList.toggle('pathtracing-mode', isPathTracingMode);
+
+        let renderer = null;
+        let rendererBackendLabel = 'WebGPU';
+        let lightLinkingRef = null;
+        const rendererCore = createRendererCore({
+            getRenderOutputAspect,
+            setRailButtonMeta: (...args) => setRailButtonMeta(...args),
+            setViewportMenuItemHidden: (...args) => setViewportMenuItemHidden(...args),
+            get renderer() { return renderer; },
+            set renderer(value) { renderer = value; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            set rendererBackendLabel(value) { rendererBackendLabel = value; },
+            get performanceSettings() { return performanceSettings; },
+            get renderOutputSettings() { return renderOutputSettings; },
+            get safeFrameEnabled() { return safeFrameEnabled; },
+            get camera() { return camera; },
+            get asciiEffect() { return asciiEffect; },
+            get blobOverlayCvs() { return blobOverlayCvs; },
+            get compositionOverlay() { return compositionOverlay; },
+            get maxjsFx() { return maxjsFx; },
+            get webglBasicFx() { return webglBasicFx; },
+            get lastRenderTimestamp() { return lastRenderTimestamp; },
+            set lastRenderTimestamp(value) { lastRenderTimestamp = value; },
+            get isProductionRenderPage() { return isProductionRenderPage; },
+            get shouldPreserveCanvasForCapture() { return shouldPreserveCanvasForCapture; },
+            hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
+        });
+        const {
+            getViewportFrameRect,
+            applyFrameElementStyle,
+            syncSafeFrameButtonUi,
+            updateCameraProjectionForViewportRect,
+            applyRenderViewportLayout,
+            getEffectivePixelRatio,
+            getEffectivePostFxResolutionScale,
+            applyRendererPerformanceSettings,
+            configureRenderer,
+            initializeRenderer,
+            disposeRenderer,
+            normalizeRendererBackend,
+            persistRendererBackendPreference,
+            consumeRequestedRendererBackend,
+            createRenderer,
+            isWgl2FallbackBackendActive,
+            isWgl2BackendActive,
+            isWebGLPipelineActive,
+            getRendererPipelineMode,
+            syncRendererButtonUi,
+            restartWithRendererBackend,
+            getNextRendererPipelineMode,
+        } = rendererCore;
+        try {
+            await createRenderer();
+        } catch (error) {
+            const message = error?.message || String(error);
+            document.getElementById('info').textContent = `max.js - renderer init failed: ${message}`;
+            throw error;
+        }
+
+        if (THREE.RectAreaLightNode?.setLTC) {
+            THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+        }
+
+        // Tell the plugin whether deform normals can be rebuilt GPU-side; when
+        // true the C++ fast lane streams positions only (all mesh sizes) and
+        // gpu_normals.js recomputes normals per update in a compute pass.
+        // Announced false while the GPU path is hard-disabled (see
+        // gpu_normals.js — three (r185 through r187) mutates itemSize-3 storage attributes,
+        // which corrupts live-streamed geometry). CPU normal streaming covers
+        // everything below the compact-channel threshold instead.
+        window.chrome?.webview?.postMessage({ type: 'gpu_normals', enabled: false });
+
+        // ── Lighting ──────────────────────────────────────────
+        // MaxLightsNode is the adaptive lights factory on node renderers.
+        // Unlinked lights stay on Three's own dynamic/native light nodes; only
+        // a light with an explicit include/exclude mode enters the masked path.
+        // Three caches lighting.createNode() per scene, so the factory must be
+        // installed before frame one. The classic WebGLRenderer has no node-lighting
+        // factory and keeps stock behavior.
+        installMaxLightsRenderer(renderer);
+
+        // Scene load gate + long-task attribution (scene_load_gate.js,
+        // long_task_monitor.js). Big scene syncs apply in time slices behind
+        // the gate's overlay and warm their render pipelines before the first
+        // frame.
+        const longTaskMonitor = createLongTaskMonitor({ isLogEnabled: () => debugMode });
+        longTaskMonitor.start();
+        window.maxjsLongTasks = longTaskMonitor; // console handle
+        const sceneLoadGate = createSceneLoadGate({
+            onEnd: ({ reason, elapsedMs }) => {
+                maxjsDebugLog(`max.js scene load: ${reason} after ${Math.round(elapsedMs)} ms`);
+            },
+        });
+        window.maxjsSceneLoadGate = sceneLoadGate; // console handle
+
+        let controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        // Unlocking the camera enables orbit/pan only. Wheel dolly is too easy
+        // to trigger over interactive runtime content and must never move the
+        // viewer camera implicitly.
+        controls.enableZoom = false;
+        controls.zoomToCursor = true;
+        controls.screenSpacePanning = false;
+        controls.mouseButtons = {
+            LEFT: null,               // reserved for selection
+            MIDDLE: THREE.MOUSE.PAN,  // middle = pan
+            RIGHT: null               // reserved
+        };
+        controls.zoomSpeed = 2.0;
+        controls.rotateSpeed = 0.5;
+        controls.panSpeed = 1.0;
+        // Alt+MMB = orbit (3ds Max style) — capture phase to beat OrbitControls
+        renderer.domElement.addEventListener('pointerdown', e => {
+            if (e.button === 1 && controls.enabled) {
+                controls.mouseButtons.MIDDLE = e.altKey ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+            }
+        }, true);
+        renderer.domElement.addEventListener('pointerup', e => {
+            if (e.button === 1) {
+                controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+            }
+        }, true);
+        controls.enabled = false;  // cam lock ON by default
+
+        // Grid lives in Max space under the basis root, so the default helper plane
+        // lands on Max's XY ground plane without extra rotations.
+        const grid = new THREE.GridHelper(200, 20, 0x555555, 0x444444);
+        grid.visible = false;
+        grid.userData.maxjsExcludeFromRuntimeSnapshot = true;
+        overlayRoot.add(grid);
+
+        // Live viewer fallback lighting — camera-following headlight rig used
+        // when the Max scene has no authored lights or environment.
+        const defaultLights = new THREE.Group();
+        const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
+        defaultAmbient.userData.volumetricBypass = true;
+        defaultLights.add(defaultAmbient);
+        const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
+        defaultKey.userData.volumetricBypass = true;
+        defaultKey.castShadow = false;
+        defaultKey.shadow.mapSize.set(2048, 2048);
+        defaultKey.shadow.camera.near = 0.1;
+        defaultKey.shadow.camera.far = 2000;
+        defaultKey.shadow.camera.left = -500;
+        defaultKey.shadow.camera.right = 500;
+        defaultKey.shadow.camera.top = 500;
+        defaultKey.shadow.camera.bottom = -500;
+        defaultKey.shadow.bias = -0.001;
+        defaultKey.shadow.normalBias = 0.02;
+        const defaultFill = new THREE.DirectionalLight(0xe8e8e8, 0.8);
+        defaultFill.userData.volumetricBypass = true;
+        defaultFill.position.set(-1, 1, 0.5);
+        defaultLights.add(defaultKey);
+        defaultLights.add(defaultFill);
+        scene.add(defaultLights);
+        const lightHandleMap = new Map();
+        let lightHelpersVisible = false;
+        let lastLightsSignature = '';
+        let lightLinkPanelVisible = false;
+        const LIGHT_LINK_STORAGE_KEY = 'maxjs-light-linking';
+        const lightProbe = new THREE.LightProbe();
+        scene.add(lightProbe);
+
+        // ── Loaders & Caches ────────────────────────────────
+        const textureLoader = new THREE.TextureLoader();
+        const webglTextureLoader = new THREE_STD.TextureLoader();
+        const rgbeLoader = new HDRLoader();
+        const exrLoader = new EXRLoader();
+        suppressKnownExrMetadataWarnings(exrLoader);
+        textureLoader.setCrossOrigin?.('anonymous');
+        webglTextureLoader.setCrossOrigin?.('anonymous');
+        rgbeLoader.setCrossOrigin?.('anonymous');
+        exrLoader.setCrossOrigin?.('anonymous');
+        const PMREMGeneratorCtor = renderer?.isWebGLRenderer === true
+            ? THREE_STD.PMREMGenerator
+            : THREE.PMREMGenerator;
+        const pmremGenerator = new PMREMGeneratorCtor(renderer);
+        pmremGenerator.compileEquirectangularShader();
+
+        function getTextureExtension(source) {
+            try {
+                const url = new URL(String(source || ''), window.location.href);
+                return (url.pathname.split('.').pop() || '').toLowerCase();
+            } catch {
+                const clean = String(source || '').split(/[?#]/, 1)[0];
+                return (clean.split('.').pop() || '').toLowerCase();
+            }
+        }
+
+        const hdrTextureExtensions = new Set(['hdr', 'exr']);
+
+        function colorSpaceForTextureExtension(ext, requestedColorSpace) {
+            return hdrTextureExtensions.has(ext) && requestedColorSpace === THREE.SRGBColorSpace
+                ? THREE.LinearSRGBColorSpace
+                : requestedColorSpace;
+        }
+
+        const browserTextureExtensions = new Set([
+            'png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif', 'avif', 'svg',
+            'exr', 'hdr',
+        ]);
+
+        function canBrowserLoadTextureExtension(ext) {
+            return !ext || browserTextureExtensions.has(ext);
+        }
+
+        const videoTextureExtensions = new Set(['mp4', 'm4v', 'webm', 'mov', 'ogv']);
+
+        function isVideoTextureExtension(ext) {
+            return !!ext && videoTextureExtensions.has(ext);
+        }
+
+        let pendingTextureLoads = 0;
+        const nodeMap = new Map();
+        const maxInstanceBuckets = new Map(); // bucketKey -> { mesh, materialKey, sourceHandle, handles:Set, handleToIndex:Map, transforms:Map, visible:Map }
+        const maxInstanceHandleToBucket = new Map(); // handle -> bucketKey
+        let animationSystem = null;
+        let audioSystem = null;
+        let audioMuted = readPersistedAudioMuted();
+        let gltfSystem = null;
+        const perfHud = createPerfHud(document.getElementById('info'));
+        perfHud.setStatus(`max.js - ${rendererBackendLabel} renderer ready`);
+
+        const DEBUG_STORAGE_KEY = 'maxjs_debug';
+        const PROFILE_SCENE_STORAGE_KEY = 'maxjs_profile_scene';
+        const isStandalone = !(window.chrome?.webview?.postMessage);
+        const urlMode = new URLSearchParams(location.search).get('mode');
+        let buildMode = urlMode || (isStandalone ? 'release' : 'dev');
+        var debugMode = false;
+        // Session-only by design: sync always boots LIVE; SLOW is a per-session
+        // debugging escape hatch, never a restored state. FLOW is likewise
+        // opt-in per session — it changes Max-side pacing, so it must never be
+        // a state a user finds themselves in without having chosen it.
+        const SYNC_MODES = ['live-fast', 'flow', 'slow-json'];
+        let syncMode = 'live-fast';
+        // Retained so every existing read keeps its exact meaning: FLOW is a
+        // live-fast variant, never a slow-JSON one.
+        let slowJsonSyncMode = false;
+
+        function setAudioMuted(nextMuted, { persist = true } = {}) {
+            audioMuted = !!nextMuted;
+            audioSystem?.setMuted?.(audioMuted);
+            if (persist) {
+                try { localStorage.setItem(AUDIO_MUTED_STORAGE_KEY, audioMuted ? 'true' : 'false'); } catch {}
+            }
+            syncAudioMuteButtonUi();
+        }
+
+        try {
+            const raw = localStorage.getItem(DEBUG_STORAGE_KEY);
+            if (raw === 'true') debugMode = true;
+            else if (raw === 'false') debugMode = false;
+            else {
+                // Unset: loud inside Max; quiet for hosted snapshots (release). ?mode=dev defaults verbose.
+                debugMode = !isStandalone || buildMode !== 'release';
+            }
+        } catch (_) {
+            debugMode = !isStandalone;
+        }
+        function maxjsDebugLog(...args) {
+            if (debugMode) console.log(...args);
+        }
+        function maxjsDebugWarn(...args) {
+            if (debugMode) console.warn(...args);
+        }
+        function isSceneProfilingEnabled() {
+            try {
+                return localStorage.getItem(PROFILE_SCENE_STORAGE_KEY) === 'true';
+            } catch (_) {
+                return false;
+            }
+        }
+
+        const maxjsFx = createMaxJSFxController({
+            renderer,
+            scene,
+            camera,
+            backendLabel: rendererBackendLabel,
+            environmentVisible: false,
+            hiddenBackgroundColor,
+            onError(message) {
+                perfHud.setStatus(`max.js - ${message}`);
+            },
+        });
+        // Default camera light available for contact shadows from the start
+        if (maxjsFx.setMainLight) maxjsFx.setMainLight(defaultKey);
+
+        function setBackgroundColor(hex = hiddenBackgroundColor) {
+            hiddenBackgroundColor = hex >>> 0;
+            viewportBackgroundColor.setHex(hiddenBackgroundColor);
+            syncViewportBackdrop();
+            maxjsFx.setHiddenBackgroundColor(hiddenBackgroundColor);
+            saveBackgroundColor();
+            syncBackgroundColorSlot();
+            savePostFxState();
+        }
+
+        const webglBasicFx = createWebGLBasicFx({
+            THREE: THREE_STD,
+            renderer,
+            scene,
+            camera,
+            backendLabel: rendererBackendLabel,
+            onError(message, error) {
+                console.warn(message, error);
+            },
+        });
+        window.maxjsWebGLBasicFx = webglBasicFx;
+
+        // Forward viewport clicks to HTML texmap content. Raycast hits a
+        // mesh whose material has any HTML-texture map slot → convert UV
+        // hit to host pixel coords → dispatch click to the matching DOM
+        // element inside the texture's shadow tree.
+        attachHTMLClickForwarding(THREE, renderer, () => ({ camera, scene }));
+
+        // Shader Lab FX — optional custom pass consumed by the unified
+        // Post FX controller. Toggled from the right rail. Loads React +
+        // @basementstudio/shader-lab from esm.sh on first enable.
+        const shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+        maxjsFx.setShaderLabFx?.(shaderLabFx);
+        // sampleLimit 0 = unlimited; >0 converges then stops (frees the GPU).
+        const pathTracingSettings = normalizePathTracerSettings();
+        let ptPauseUiSync = null; // set when the PT pause toggle is created
+
+        function beginTextureLoad() {
+            pendingTextureLoads += 1;
+        }
+
+        function endTextureLoad() {
+            pendingTextureLoads = Math.max(0, pendingTextureLoads - 1);
+        }
+        const pathTracingFx = createPathTracer({
+            renderer,
+            scene,
+            camera,
+            settings: pathTracingSettings,
+            onStatus(message) {
+                perfHud.setStatus(message);
+            },
+            onError(error) {
+                reportBridgeError('pathtracing', error);
+            },
+        });
+        const PATH_TRACING_RASTER_WARMUP_FRAMES = 2;
+        const PATH_TRACING_TEXTURE_WAIT_MS = 3000;
+        const PATH_TRACING_CAPTURE_DEFAULT_SAMPLES = 64;
+        const PATH_TRACING_LIVE_REBUILD_DELAY_MS = 180;
+
+        let pathTracingRasterWarmupFrames = 0;
+        let pathTracingWarmupStartedAt = 0;
+        let pathTracingBridge = null;
+        let refreshSkyForPathTracingNow = () => false;
+        const pathTracingGlue = createPathTracingGlue({
+            PATH_TRACING_RASTER_WARMUP_FRAMES,
+            PATH_TRACING_TEXTURE_WAIT_MS,
+            PATH_TRACING_LIVE_REBUILD_DELAY_MS,
+            maxTimeline,
+            syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
+            bridgeHasInitialSync: (...args) => bridgeHasInitialSync(...args),
+            hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
+            get isPathTracingMode() { return isPathTracingMode; },
+            set isPathTracingMode(value) { isPathTracingMode = value; },
+            get pathTracingFx() { return pathTracingFx; },
+            get maxjsFx() { return maxjsFx; },
+            get renderer() { return renderer; },
+            get shaderLabFx() { return shaderLabFx; },
+            get renderToImageActive() { return renderToImageActive; },
+            get pathTracingSettings() { return pathTracingSettings; },
+            get pathTracingRasterWarmupFrames() { return pathTracingRasterWarmupFrames; },
+            set pathTracingRasterWarmupFrames(value) { pathTracingRasterWarmupFrames = value; },
+            get pathTracingWarmupStartedAt() { return pathTracingWarmupStartedAt; },
+            set pathTracingWarmupStartedAt(value) { pathTracingWarmupStartedAt = value; },
+            get pendingTextureLoads() { return pendingTextureLoads; },
+            get bridge() { return pathTracingBridge; },
+            get perfHud() { return perfHud; },
+            get ptPauseUiSync() { return ptPauseUiSync; },
+            refreshSkyForPathTracing: () => refreshSkyForPathTracingNow(),
+        });
+        const {
+            isPathTracingViewActive,
+            leavePathTracingView,
+            setPathTracingActive,
+            renderPathTracingLiveFrame,
+            resetPathTracingStartupWarmup,
+            canStartPathTracingNow,
+            renderPathTracingFallbackFrame,
+            markPathTracingSceneDirtyNow,
+            markPathTracingEnvironmentDirty,
+            schedulePathTracingLiveRebuild,
+            sendPathTracingRuntimeState,
+            applyPathTracingSettings,
+        } = pathTracingGlue;
+
+        // Clone blob overlay — 2D canvas for bounding rectangles
+        blobOverlayCvs = document.createElement('canvas');
+        blobOverlayCvs.style.cssText = 'position:absolute;inset:0;pointer-events:none;z-index:10';
+        const initialBlobFrameRect = getViewportFrameRect();
+        blobOverlayCvs.width = initialBlobFrameRect.width;
+        blobOverlayCvs.height = initialBlobFrameRect.height;
+        applyFrameElementStyle(blobOverlayCvs, initialBlobFrameRect);
+        document.body.appendChild(blobOverlayCvs);
+        blobOverlayCtx = blobOverlayCvs.getContext('2d');
+
+        // Composition guide overlay — always-on-top framing helpers pinned to
+        // the viewport frame so they track Safe Frame cropping automatically.
+        compositionOverlay = createCompositionOverlay({
+            applyFrameStyle: applyFrameElementStyle,
+            getFrameRect: getViewportFrameRect,
+        });
+        compositionOverlay.resize(getViewportFrameRect());
+
+        addEventListener('resize', () => {
+            const rect = getViewportFrameRect();
+            blobOverlayCvs.width = rect.width;
+            blobOverlayCvs.height = rect.height;
+            applyFrameElementStyle(blobOverlayCvs, rect);
+            compositionOverlay?.resize(rect);
+            if (asciiActive && asciiEffect) {
+                asciiEffect.setSize(rect.width, rect.height);
+                applyFrameElementStyle(asciiEffect.domElement, rect);
+            }
+        });
+
+        function createSolidTexture(r, g, b, a = 255) {
+            const tex = new THREE.DataTexture(new Uint8Array([r, g, b, a]), 1, 1);
+            tex.colorSpace = THREE.NoColorSpace;
+            tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+            tex.minFilter = tex.magFilter = THREE.LinearFilter;
+            tex.needsUpdate = true;
+            tex.updateMatrix();
+            return tex;
+        }
+
+        function createSteppedGradientTexture(values) {
+            const data = new Uint8Array(values.length * 4);
+            for (let i = 0; i < values.length; i++) {
+                const value = values[i];
+                const offset = i * 4;
+                data[offset + 0] = value;
+                data[offset + 1] = value;
+                data[offset + 2] = value;
+                data[offset + 3] = 255;
+            }
+            const tex = new THREE.DataTexture(data, values.length, 1);
+            tex.colorSpace = THREE.NoColorSpace;
+            tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+            tex.minFilter = tex.magFilter = THREE.NearestFilter;
+            tex.generateMipmaps = false;
+            tex.needsUpdate = true;
+            tex.updateMatrix();
+            return tex;
+        }
+
+        const fallbackWhiteTexture = createSolidTexture(255, 255, 255, 255);
+        const fallbackFlatNormalTexture = createSolidTexture(128, 128, 255, 255);
+        const fallbackHeightTexture = createSolidTexture(255, 255, 255, 255);
+        const fallbackToonGradientTexture = createSteppedGradientTexture([32, 96, 160, 255]);
+
+        let camLock = true;
+        let physicalCameraDofActive = false;
+        let envVisible = false;
+        let lightProbeEnabled = true;
+        const lightProbeIntensity = 1.0;
+        let currentHdriUrl = null;
+        let currentHdriProbeSignature = '';
+        let currentEnvParams = null;
+        let hasLightProbeData = false;
+        let hdriLoadGeneration = 0;
+
+        let localHdriFile = null;        // original picked/restored file for snapshot export
+
+        // No-op — env intensity is now controlled per-material via
+        // material.envMapIntensity using the patched materialEnvIntensity
+        // node (see import section). No need to stamp envMap on materials.
+        function syncMaterialEnvMaps() {}
+        let localHdriEnabled = true;     // on/off toggle (file stays loaded)
+        let localHdriFileName = '';
+        let localHdriRotation = 0;
+        let localHdriIntensity = 1.0;
+        let localHdriShowBg = false;
+        let localHdriBlur = 0;
+        let localHdriFlip = false;
+        let localHdriReflectionOnly = false;
+
+        // Texture arrivals and material rebuilds change what probes and the path
+        // tracer see; wired once both exist.
+        let notifyMaterialStructureChanged = () => {};
+        const texturePipeline = await createTexturePipeline({
+            TSL,
+            textureLoader,
+            webglTextureLoader,
+            rgbeLoader,
+            exrLoader,
+            fallbackWhiteTexture,
+            fallbackFlatNormalTexture,
+            fallbackHeightTexture,
+            fallbackToonGradientTexture,
+            isFiniteArray: (...args) => isFiniteArray(...args),
+            getTextureExtension,
+            colorSpaceForTextureExtension,
+            canBrowserLoadTextureExtension,
+            isVideoTextureExtension,
+            maxjsDebugWarn,
+            beginTextureLoad,
+            endTextureLoad,
+            rememberMaterialEmissiveBase: (...args) => rememberMaterialEmissiveBase(...args),
+            reapplyBakeOverridesToScene: () => reapplyBakeOverridesToScene(),
+            onMaterialStructureChanged: () => notifyMaterialStructureChanged(),
+            get renderer() { return renderer; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get bakeOverrides() { return bakeOverrides; },
+            get maxjsFx() { return maxjsFx; },
+        });
+        const {
+            configureGradientTexture,
+            maxMapChannelFromMapName,
+            textureWithUvChannel,
+            resolveLightMapMaxMapChannel,
+            createPendingMaterialXMaterial,
+            ensureMaterialXTemplateLoaded,
+            loadTexture,
+            tslCompiler,
+            isWebGLTexturePathActive,
+            loadBakeTextureFromCandidates,
+            bakeExposureScale,
+            isDisplayBakedBeautyProxy,
+            clearBakeTextureLoadFailures,
+            HTML_TEXTURE_AUTO_FIT_KEYS,
+            htmlTextureAutoFitEnabled,
+            matrixScaleSignature,
+            withHTMLAutoFitIdentity,
+            loadMapSlot,
+            applyOpacityTextureSlot,
+            preserveOpacityForHTMLColorMap,
+            wantsHTMLTextureOverrideMaterial,
+            htmlTextureOverrideIdentity,
+            createHTMLTextureOverrideMaterial,
+            textureCache,
+        } = texturePipeline;
+        const MAXJS_SELF_HIDDEN_LAYER = 31;
+        let jsmodVisibilityOwnedByLayer = null;
+        const materials = createMaterials({
+            MAXJS_SELF_HIDDEN_LAYER,
+            fallbackWhiteTexture,
+            fallbackFlatNormalTexture,
+            fallbackHeightTexture,
+            fallbackToonGradientTexture,
+            configureGradientTexture,
+            textureWithUvChannel,
+            resolveLightMapMaxMapChannel,
+            createPendingMaterialXMaterial,
+            ensureMaterialXTemplateLoaded,
+            loadTexture,
+            tslCompiler,
+            HTML_TEXTURE_AUTO_FIT_KEYS,
+            htmlTextureAutoFitEnabled,
+            matrixScaleSignature,
+            withHTMLAutoFitIdentity,
+            loadMapSlot,
+            applyOpacityTextureSlot,
+            preserveOpacityForHTMLColorMap,
+            wantsHTMLTextureOverrideMaterial,
+            htmlTextureOverrideIdentity,
+            createHTMLTextureOverrideMaterial,
+            applyWebGpuLightMapUvContext: (...args) => applyWebGpuLightMapUvContext(...args),
+            applyBakeOverridesToSceneMaterial: (...args) => applyBakeOverridesToSceneMaterial(...args),
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get bakeOverrides() { return bakeOverrides; },
+            get nodeMap() { return nodeMap; },
+            get maxInstanceBuckets() { return maxInstanceBuckets; },
+            get hairMeshes() { return hairMeshes; },
+            get forestMeshes() { return forestMeshes; },
+            get layerManager() { return layerManager; },
+            get jsmodVisibilityOwnedByLayer() { return jsmodVisibilityOwnedByLayer; },
+        });
+        const {
+            rememberMaterialEmissiveBase,
+            applyMaterialSelectionState,
+            applyMeshShadowState,
+            applyNodeProps,
+            applyJsmodSyncState,
+            applyUserPropsSyncState,
+            setObjectSelfVisibleLayer,
+            restoreRenderableMaterialVisibility,
+            applyMaxObjectVisibility,
+            applyBridgeVisibility,
+            applyInstanceSyncState,
+            getSSSRoughnessInfluence,
+            applySSSRoughnessInfluence,
+            applySSSMaterialNodes,
+            createBackdropUtilityMaterial,
+            normalizeMaxVertexColorChannel,
+            maxVertexColorAttributeName,
+            createUtilityMaterial,
+            materialIdentityValue,
+            materialIdentityKey,
+            materialTemplateCacheKey,
+            getMaterialPayloads,
+            countMaterialTextureSlots,
+            getOrCreateMaterialRegistryEntry,
+            refreshMaterialRegistry,
+            materialRegistryHudStats,
+            getMaterialRegistryStats,
+            getMaterialRegistryEntries,
+            resolveSnapshotMaterialRefs,
+            shouldRouteBlackSpecularToLambert,
+            createMaterial,
+            createSceneMaterial,
+            createDefaultSceneMaterial,
+            materialPayloadHasHTMLAutoFit,
+            nodePayloadHasHTMLAutoFit,
+            disposeSceneMaterial,
+            collectMaterialRefs,
+            collectLiveSceneMaterials,
+            flushMaterialDisposals,
+            createSceneLineMaterial,
+            sceneMaterialSignature,
+            isCachedMaterialTemplate,
+            createSceneRenderableMaterial,
+            cloneGeometryGroups,
+            applyGeometryGroups,
+            geometryGroupsMatch,
+            resolveInstancedNodeGeometry,
+            isGeometrySharedByAnotherMesh,
+            syncGeometryGroupsForNode,
+            applyFastMaterialPayload,
+            stampSceneMaterial,
+            ensureSceneRenderableMaterial,
+        } = materials;
+        const environment = createEnvironment({
+            textureLoader,
+            rgbeLoader,
+            exrLoader,
+            getTextureExtension,
+            colorSpaceForTextureExtension,
+            maxjsDebugWarn,
+            maxjsHdriDiffuseIntensity,
+            applyViewportBackdropColor,
+            setDefaultLightsVisible: (...args) => setDefaultLightsVisible(...args),
+            syncMaterialEnvMaps,
+            clearLightProbe: (...args) => clearLightProbe(...args),
+            markLightProbeMaterialsDirty: (...args) => markLightProbeMaterialsDirty(...args),
+            applyLightProbeState: (...args) => applyLightProbeState(...args),
+            isLightProbeGridActive: () => isLightProbeGridActive(),
+            updateLightProbeFromHDRI: (...args) => updateLightProbeFromHDRI(...args),
+            scheduleLightProbeFromCurrentScene: (...args) => scheduleLightProbeFromCurrentScene(...args),
+            markPathTracingEnvironmentDirty: () => markPathTracingEnvironmentDirty(),
+            setBackgroundColor,
+            applyCoreToneMappingState: (options) => applyCoreToneMappingState(options),
+            savePostFxState: () => savePostFxState(),
+            hasAuthoredEnvironmentActive: () => hasAuthoredEnvironmentActive(),
+            restoreAuthoredEnvironmentAfterLocalHDRIChange: () => restoreAuthoredEnvironmentAfterLocalHDRIChange(),
+            get renderer() { return renderer; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get scene() { return scene; },
+            get pmremGenerator() { return pmremGenerator; },
+            get maxjsFx() { return maxjsFx; },
+            get hiddenBackgroundColor() { return hiddenBackgroundColor; },
+            get envVisible() { return envVisible; },
+            get lightHandleMap() { return lightHandleMap; },
+            get skyActive() { return skyActive; },
+            get lightProbeEnabled() { return lightProbeEnabled; },
+            get hasLightProbeData() { return hasLightProbeData; },
+            get currentHdriUrl() { return currentHdriUrl; },
+            set currentHdriUrl(value) { currentHdriUrl = value; },
+            get currentHdriProbeSignature() { return currentHdriProbeSignature; },
+            set currentHdriProbeSignature(value) { currentHdriProbeSignature = value; },
+            get currentEnvParams() { return currentEnvParams; },
+            set currentEnvParams(value) { currentEnvParams = value; },
+            get hdriLoadGeneration() { return hdriLoadGeneration; },
+            set hdriLoadGeneration(value) { hdriLoadGeneration = value; },
+            get localHdriFile() { return localHdriFile; },
+            set localHdriFile(value) { localHdriFile = value; },
+            get localHdriEnabled() { return localHdriEnabled; },
+            set localHdriEnabled(value) { localHdriEnabled = value; },
+            get localHdriFileName() { return localHdriFileName; },
+            set localHdriFileName(value) { localHdriFileName = value; },
+            get localHdriRotation() { return localHdriRotation; },
+            set localHdriRotation(value) { localHdriRotation = value; },
+            get localHdriIntensity() { return localHdriIntensity; },
+            set localHdriIntensity(value) { localHdriIntensity = value; },
+            get localHdriShowBg() { return localHdriShowBg; },
+            set localHdriShowBg(value) { localHdriShowBg = value; },
+            get localHdriBlur() { return localHdriBlur; },
+            set localHdriBlur(value) { localHdriBlur = value; },
+            get localHdriFlip() { return localHdriFlip; },
+            set localHdriFlip(value) { localHdriFlip = value; },
+            get localHdriReflectionOnly() { return localHdriReflectionOnly; },
+            set localHdriReflectionOnly(value) { localHdriReflectionOnly = value; },
+        });
+        const {
+            retainPMREMTexture,
+            loadEnvironmentTexture,
+            getEnvironmentBackgroundMap,
+            syncViewportBackdrop,
+            syncEnvironmentDisplay,
+            syncDefaultLightsVisibility,
+            resetEnvironmentLighting,
+            isLocalHdriLoaded,
+            isLocalHdriActive,
+            isHdriReflectionOnlyEffective,
+            applyHdriReflectionOnlyState,
+            clearCurrentHdriEnvMap,
+            refreshLightProbeFromCurrentHDRI,
+            loadHDRI,
+            restoreStashedHdri,
+            loadLocalHDRIFile,
+            applyLocalHDRIToScene,
+            applyLocalHDRISettings,
+            toggleLocalHDRI,
+            clearLocalHDRI,
+            syncHdriPanel,
+        } = environment;
+
+        // ── Sky Environment ──────────────────────────────────
+        let skyActive = false;
+        const sky = createSky({
+            copyMaxComponentsToWorld,
+            retainPMREMTexture,
+            syncMaterialEnvMaps,
+            clearLightProbe: (...args) => clearLightProbe(...args),
+            applyLightProbeState: (...args) => applyLightProbeState(...args),
+            applyHdriReflectionOnlyState,
+            clearCurrentHdriEnvMap,
+            applyCoreToneMappingState: (options) => applyCoreToneMappingState(options),
+            syncDefaultLightsVisibility,
+            syncHdriPanel,
+            loadHDRI,
+            scheduleLightProbeFromCurrentScene: (...args) => scheduleLightProbeFromCurrentScene(...args),
+            get renderer() { return renderer; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get scene() { return scene; },
+            get camera() { return camera; },
+            get pmremGenerator() { return pmremGenerator; },
+            get maxjsFx() { return maxjsFx; },
+            get hiddenBackgroundColor() { return hiddenBackgroundColor; },
+            get lightProbe() { return lightProbe; },
+            get lightHandleMap() { return lightHandleMap; },
+            get isPathTracingMode() { return isPathTracingMode; },
+            get currentEnvParams() { return currentEnvParams; },
+            get skyActive() { return skyActive; },
+            set skyActive(value) { skyActive = value; },
+            get hasLightProbeData() { return hasLightProbeData; },
+            set hasLightProbeData(value) { hasLightProbeData = value; },
+            get currentHdriUrl() { return currentHdriUrl; },
+            set currentHdriUrl(value) { currentHdriUrl = value; },
+            get currentHdriProbeSignature() { return currentHdriProbeSignature; },
+            set currentHdriProbeSignature(value) { currentHdriProbeSignature = value; },
+        });
+        const {
+            addSkyProbeSample,
+            sampleSkyProbeRadiance,
+            sampleSkyReflectionRadiance,
+            disposeSkyReflectionEnvironment,
+            disposeSkyPathTraceEnvironment,
+            updateSkyPathTraceEnvironment,
+            buildProceduralSkyReflectionEnvironment,
+            updateSkyReflectionEnvironment,
+            updateSkyAmbientLightProbe,
+            skyNumber,
+            hasAuthoredEnvironmentActive,
+            restoreAuthoredEnvironmentAfterLocalHDRIChange,
+            normalizeSkyParams,
+            getSkySunDirectionWorld,
+            isSkyLinkCandidateLight,
+            getDirectionalLightSunVector,
+            findSkyLinkedSunDirection,
+            withLinkedSkySun,
+            refreshSkyFromLinkedSun,
+            refreshSkyAmbientLightProbeFromCurrentSky,
+            applySky,
+            removeSky,
+            refreshSkyForPathTracing,
+            withSunDiscHidden,
+        } = sky;
+        refreshSkyForPathTracingNow = refreshSkyForPathTracing;
+
+        function materialListHasRawShader(material) {
+            if (Array.isArray(material)) return material.some((entry) => entry?.isRawShaderMaterial);
+            return !!material?.isRawShaderMaterial;
+        }
+
+        function removeWebGPUIncompatibleSceneMaterials() {
+            if (rendererBackendLabel !== 'WebGPU') return;
+            const removals = [];
+            scene.traverse((object) => {
+                if (!object?.parent) return;
+                if (
+                    materialListHasRawShader(object.material)
+                    || materialListHasRawShader(object.customDepthMaterial)
+                    || materialListHasRawShader(object.customDistanceMaterial)
+                ) {
+                    removals.push(object);
+                }
+            });
+            for (const object of removals) {
+                object.parent?.remove(object);
+                if (!object.userData?.maxjsRawShaderPurgeLogged) {
+                    object.userData.maxjsRawShaderPurgeLogged = true;
+                    console.warn('[max.js] removed WebGPU-incompatible RawShaderMaterial object:', object.name || object.type || '(unnamed)');
+                }
+            }
+        }
+
+        function removeAuthoredEnvironment() {
+            // Idempotent: every settle full-sync re-sends "no environment".
+            // Tearing down an environment that is not there resets env
+            // lighting, which dirties EVERY material — a one-frame full
+            // pipeline recompile on each timeline scrub release.
+            if (!skyActive && !currentHdriUrl && !currentEnvParams && !scene.environment) return;
+            removeSky();
+            currentHdriUrl = null;
+            currentHdriProbeSignature = '';
+            currentEnvParams = null;
+            clearCurrentHdriEnvMap();
+            scene.environment = null;
+            syncMaterialEnvMaps();
+            scene.environmentIntensity = 1.0;
+            applyHdriReflectionOnlyState();
+            scene.environmentRotation.set(0, 0, 0);
+            scene.backgroundRotation.set(0, 0, 0);
+            scene.backgroundBlurriness = 0;
+            syncEnvironmentDisplay();
+            resetEnvironmentLighting();
+            if (isLocalHdriLoaded()) {
+                applyLocalHDRIToScene();
+            }
+            syncHdriPanel();
+        }
+
+        // ── Max Bridge ────────────────────────────────────── (core in ./host_bridge.js — the host seam)
+        const ctx = createEditorContext();
+        const hostBridge = createHostBridge({
+            setInfoText: text => setInfoText(text),
+            // Restore Studio manifest state now that lights + meshes are populated.
+            onFirstSync: () => { restoreStudioState(); restoreBakeState(); },
+            onBeforeReady: () => sendPathTracingRuntimeState(),
+        });
+        const bridge = hostBridge.bridge;
+        pathTracingBridge = bridge;
+        const { requestHostAction, toBase64Utf8, bytesToBase64, reportBridgeError,
+                startBridgeHandshake, markInitialSync } = hostBridge;
+        const bridgeHasInitialSync = hostBridge.hasInitialSync;
+        ctx.hostBridge = hostBridge;
+        ctx.bridge = bridge;
+
+        // Relay is a hard opt-in boundary. Until the RELAY button (or the
+        // public relay facade) is enabled, the relay module is not imported,
+        // preferences are not read, no producer identity exists, and no host
+        // transport observer, timer, encoder, or network request is installed.
+        let relayRenderFrame = null;
+        let relayResetRenderTimer = () => { lastRenderTimestamp = 0; };
+        let relayRenderingSuspended = false;
+        function setRelayReadyConsumers(count) {
+            const shouldSuspend = Number(count) > 0;
+            if (shouldSuspend === relayRenderingSuspended) return;
+            relayRenderingSuspended = shouldSuspend;
+            if (!relayRenderFrame) return;
+            if (shouldSuspend) {
+                // Host ingestion is event-driven. Stop the GPU loop completely
+                // while an external consumer owns the view.
+                renderer.setAnimationLoop(null);
+            } else {
+                // Exactly one restoration on the 1 -> 0 transition; reset the
+                // simulation timer so headless time is not folded into one dt.
+                relayResetRenderTimer();
+                renderer.setAnimationLoop(relayRenderFrame);
+            }
+        }
+        const RELAY_OFF_STATE = Object.freeze({
+            state: 'off',
+            enabled: false,
+            readyConsumers: 0,
+            lastError: '',
+        });
+        const relaySubscribers = new Set();
+        let relayState = RELAY_OFF_STATE;
+        let relayController = null;
+        let relayControllerLoad = null;
+        let relayDesiredEnabled = false;
+        let relayActivationGeneration = 0;
+        let relayPageHideInstalled = false;
+
+        function publishRelayState(nextState = RELAY_OFF_STATE) {
+            relayState = nextState;
+            for (const listener of relaySubscribers) {
+                try { listener(relayState); }
+                catch (error) { console.warn('[max.js relay subscriber]', error); }
+            }
+        }
+
+        function disposeRelayController() {
+            relayDesiredEnabled = false;
+            relayActivationGeneration += 1;
+            const current = relayController;
+            relayController = null;
+            current?.dispose();
+            setRelayReadyConsumers(0);
+            publishRelayState(RELAY_OFF_STATE);
+            return current != null;
+        }
+
+        async function loadRelayController() {
+            if (relayController) return relayController;
+            if (relayControllerLoad) return relayControllerLoad;
+
+            relayControllerLoad = import('../live_relay_tap.js')
+                .then(relayModule => {
+                    if (!relayDesiredEnabled) return null;
+
+                    let endpoint = relayModule.DEFAULT_RELAY_URL;
+                    let streamId = relayModule.DEFAULT_STREAM_ID;
+                    let producerId;
+                    try {
+                        const endpointOverride = localStorage.getItem('maxjs.liveRelayUrl');
+                        if (endpointOverride) {
+                            try {
+                                endpoint = relayModule.validateRelayEndpoint(endpointOverride);
+                            } catch (error) {
+                                localStorage.removeItem('maxjs.liveRelayUrl');
+                                console.warn('[max.js relay] Ignoring unsafe endpoint override:', error);
+                            }
+                        }
+                        streamId = localStorage.getItem('maxjs.liveRelayStream') || streamId;
+                        producerId = sessionStorage.getItem('maxjs.liveRelayProducerId') || undefined;
+                    } catch {}
+
+                    const controller = relayModule.createLiveRelayController({
+                        hostBridge,
+                        endpoint,
+                        streamId,
+                        producerId,
+                        requestScene: details => bridge.send('relay_resync', details),
+                        onReadyConsumersChange: count => setRelayReadyConsumers(count),
+                    });
+                    if (!relayDesiredEnabled) {
+                        controller.dispose();
+                        return null;
+                    }
+
+                    relayController = controller;
+                    controller.subscribe(nextState => publishRelayState(nextState));
+                    try {
+                        sessionStorage.setItem(
+                            'maxjs.liveRelayProducerId',
+                            controller.getState().producerId,
+                        );
+                    } catch {}
+                    if (!relayPageHideInstalled) {
+                        relayPageHideInstalled = true;
+                        window.addEventListener('pagehide', () => disposeRelayController(), { once: true });
+                    }
+                    return controller;
+                })
+                .finally(() => { relayControllerLoad = null; });
+            return relayControllerLoad;
+        }
+
+        const relayFacade = Object.freeze({
+            enable: () => setRelayEnabled(true),
+            disable: () => setRelayEnabled(false),
+            toggle: () => setRelayEnabled(!relayDesiredEnabled),
+            emit: data => relayController?.emit(data) ?? false,
+            subscribe(listener, { immediate = true } = {}) {
+                if (typeof listener !== 'function') throw new TypeError('relay subscriber must be a function');
+                relaySubscribers.add(listener);
+                if (immediate) listener(relayState);
+                return () => relaySubscribers.delete(listener);
+            },
+            dispose: () => disposeRelayController(),
+            getState: () => relayState,
+            get state() { return relayState.state; },
+            get enabled() { return relayState.enabled === true; },
+            get readyConsumers() { return Number(relayState.readyConsumers) || 0; },
+        });
+
+        const lightProbeGlue = createLightProbeGlue({
+            maxTimeline,
+            bridge,
+            relayEmit: data => relayFacade.emit(data),
+            maxjsDebugWarn,
+            savePostFxState: () => savePostFxState(),
+            isHdriReflectionOnlyEffective: () => isHdriReflectionOnlyEffective(),
+            onLightProbeGridActiveChanged: () => applyHdriReflectionOnlyState({ markOutput: true }),
+            setGiLightmaps: (...args) => setGiLightmaps(...args),
+            // Captures see the scene, not the editor: hide overlays, the sky's sun
+            // disc and the bounce already baked into GI lightmaps.
+            wrapCapture(fn) {
+                const overlaysVisible = overlayRoot.visible;
+                overlayRoot.visible = false;
+                try {
+                    return withGiLightmapsMuted(() => withSunDiscHidden(fn));
+                } finally {
+                    overlayRoot.visible = overlaysVisible;
+                }
+            },
+            get renderer() { return renderer; },
+            get scene() { return scene; },
+            get camera() { return camera; },
+            get nodeMap() { return nodeMap; },
+            get lightProbe() { return lightProbe; },
+            get lightProbeEnabled() { return lightProbeEnabled; },
+            get lightProbeIntensity() { return lightProbeIntensity; },
+            get hasLightProbeData() { return hasLightProbeData; },
+            set hasLightProbeData(value) { hasLightProbeData = value; },
+            get currentHdriProbeSignature() { return currentHdriProbeSignature; },
+            get hdriLoadGeneration() { return hdriLoadGeneration; },
+        });
+        const {
+            lightProbes,
+            lightmapsSupported,
+            getSpeedballStatus,
+            getLightmapCount,
+            isLightmapBakePending,
+            serializeRelayProbeGrids,
+            isLightProbeGridActive,
+            applyLightProbeState,
+            setLightProbesSuspended,
+            clearLightProbe,
+            markLightProbeMaterialsDirty,
+            rebakeLightProbes,
+            scheduleLightProbeFromCurrentScene,
+            updateLightProbeFromHDRI,
+            getLightProbeSettings,
+            applyLightProbeSettings,
+            serializeSnapshotLightProbes,
+            updateLightProbes,
+        } = lightProbeGlue;
+        // While PowerShot infrared / NightShot sense NIR the scene renders as three
+        // NIR bands; probe GI baked in visible light sits out.
+        const nirBandView = createNirBandView({
+            scene,
+            onActiveChange: (active) => {
+                maxjsFx.setPowerShotNirBands(active);
+                setLightProbesSuspended(active);
+            },
+        });
+        notifyMaterialStructureChanged = () => {
+            scheduleLightProbeFromCurrentScene();
+            schedulePathTracingLiveRebuild('material');
+        };
+
+        const SYNC_MODE_UI = {
+            'live-fast': {
+                label: 'LIVE',
+                title: 'Live fast sync enabled',
+                aria: 'Switch to FLOW paced sync',
+                status: 'live fast sync',
+            },
+            'flow': {
+                label: 'FLOW',
+                title: `FLOW: paced geometry sync — even ${getHostProfile().app}-side load, smoother ${getHostProfile().appFull} viewport`,
+                aria: 'Switch to slow JSON sync',
+                status: 'flow paced sync',
+            },
+            'slow-json': {
+                label: 'SLOW',
+                title: 'Slow JSON sync: fastsync callbacks disabled',
+                aria: 'Switch to live fast sync',
+                status: 'slow JSON sync',
+            },
+        };
+
+        function syncLiveSyncButtonUi() {
+            const button = document.getElementById('btnLiveSync');
+            if (!button) return;
+            const ui = SYNC_MODE_UI[syncMode] || SYNC_MODE_UI['live-fast'];
+            button.textContent = ui.label;
+            button.classList.toggle('active', !slowJsonSyncMode);
+            button.classList.toggle('is-gated', slowJsonSyncMode);
+            button.setAttribute('aria-pressed', slowJsonSyncMode ? 'false' : 'true');
+            button.title = ui.title;
+            button.setAttribute('aria-label', ui.aria);
+        }
+
+        function applyLiveSyncSettings(next = {}, { notify = false, sendHost = false } = {}) {
+            if (next.mode != null && SYNC_MODES.includes(next.mode)) {
+                syncMode = next.mode;
+            } else if (next.disabled != null) {
+                // Pre-FLOW payload: the boolean only distinguishes SLOW from
+                // live, so it must not silently knock FLOW back to LIVE.
+                const wantSlow = next.disabled === true;
+                if (wantSlow) syncMode = 'slow-json';
+                else if (syncMode === 'slow-json') syncMode = 'live-fast';
+            }
+            slowJsonSyncMode = syncMode === 'slow-json';
+            syncLiveSyncButtonUi();
+            if (sendHost && window.chrome?.webview) {
+                bridge.send('live_sync_settings', { disabled: slowJsonSyncMode, mode: syncMode });
+            }
+            if (notify) {
+                const ui = SYNC_MODE_UI[syncMode] || SYNC_MODE_UI['live-fast'];
+                perfHud.setStatus(`max.js - ${ui.status}`);
+            }
+        }
+
+        document.getElementById('btnLiveSync')?.addEventListener('click', () => {
+            const nextMode = SYNC_MODES[(SYNC_MODES.indexOf(syncMode) + 1) % SYNC_MODES.length];
+            applyLiveSyncSettings({ mode: nextMode }, { notify: true, sendHost: true });
+        });
+
+        const relayButton = document.getElementById('btnRelay');
+        const relayLabel = document.getElementById('relayMenuLabel');
+        const RELAY_UI = {
+            off: ['Relay Off', 'Relay the live scene to a standalone Three.js project'],
+            connecting: ['Relay Connecting', 'Connecting to the local max.js relay'],
+            streaming: ['Relay Streaming', 'Live scene relay is streaming'],
+            recovering: ['Relay Recovering', 'Relay is requesting a fresh scene baseline'],
+            error: ['Relay Error', 'Relay unavailable - click to turn relay off'],
+        };
+        async function setRelayEnabled(enabled) {
+            const next = enabled === true;
+            const activationGeneration = ++relayActivationGeneration;
+            relayDesiredEnabled = next;
+            if (!next) return disposeRelayController();
+            if (relayController?.enabled) return false;
+
+            publishRelayState({
+                ...RELAY_OFF_STATE,
+                state: 'connecting',
+                enabled: true,
+            });
+            try {
+                const controller = await loadRelayController();
+                if (!relayDesiredEnabled
+                    || activationGeneration !== relayActivationGeneration
+                    || !controller) return false;
+                controller.enable();
+                controller.emit({
+                    type: 'lightProbeSettings',
+                    settings: { ...getLightProbeSettings() },
+                });
+                controller.emit(serializeRelayProbeGrids());
+                return true;
+            } catch (error) {
+                if (!relayDesiredEnabled) return false;
+                const message = error?.message || String(error);
+                relayDesiredEnabled = false;
+                relayActivationGeneration += 1;
+                relayController?.dispose();
+                relayController = null;
+                setRelayReadyConsumers(0);
+                publishRelayState({
+                    ...RELAY_OFF_STATE,
+                    state: 'error',
+                    lastError: message,
+                });
+                console.warn('[max.js relay] Failed to enable:', error);
+                return false;
+            }
+        }
+        relayFacade.subscribe(nextRelayState => {
+            const [label, title] = RELAY_UI[nextRelayState.state] || RELAY_UI.off;
+            if (relayLabel) relayLabel.textContent = label;
+            if (!relayButton) return;
+            relayButton.dataset.relayState = nextRelayState.state;
+            relayButton.classList.toggle('active', nextRelayState.enabled);
+            relayButton.setAttribute('aria-pressed', nextRelayState.enabled ? 'true' : 'false');
+            const stateTitle = nextRelayState.lastError ? `${title}: ${nextRelayState.lastError}` : title;
+            relayButton.title = nextRelayState.readyConsumers > 0
+                ? `${stateTitle} (${nextRelayState.readyConsumers} ready consumer${nextRelayState.readyConsumers === 1 ? '' : 's'}; local renderer stopped)`
+                : stateTitle;
+        });
+        relayButton?.addEventListener('click', () => {
+            void setRelayEnabled(!relayDesiredEnabled);
+        });
+
+        bridge.on('live_sync_settings', msg => {
+            applyLiveSyncSettings(
+                { mode: msg.mode, disabled: msg.disabled === true },
+                { notify: true, sendHost: false });
+        });
+
+        // Animation-gate telemetry. swept/deform are what the playback sweeps
+        // still walk each tick; parked is what the gate removed from them.
+        // parked staying 0 on a heavy scene means the gate found nothing
+        // static and FLOW cannot help there. promoted climbing means validity
+        // intervals are lying and the audit is catching it.
+        bridge.on('flow_stats', msg => {
+            if (syncMode !== 'flow') return;
+            const swept = Number(msg.swept) || 0;
+            const deform = Number(msg.deform) || 0;
+            const parked = Number(msg.parked) || 0;
+            const promoted = Number(msg.promoted) || 0;
+            perfHud.setStatus(
+                `max.js - flow · sweep ${swept}+${deform} · parked ${parked}`
+                + (promoted ? ` · promoted ${promoted}` : ''));
+        });
+
+        applyLiveSyncSettings({ mode: syncMode }, { sendHost: true });
+
+        bridge.on('render_output_settings', msg => {
+            const width = Math.max(1, Math.round(Number(msg.width) || 0));
+            const height = Math.max(1, Math.round(Number(msg.height) || 0));
+            const aspect = Math.max(0, Number(msg.aspect) || 0);
+            if (
+                renderOutputSettings.width === width &&
+                renderOutputSettings.height === height &&
+                Math.abs((renderOutputSettings.aspect || 0) - aspect) < 1.0e-4
+            ) {
+                syncSafeFrameButtonUi();
+                return;
+            }
+            renderOutputSettings.width = width;
+            renderOutputSettings.height = height;
+            renderOutputSettings.aspect = aspect;
+            if (safeFrameEnabled) {
+                applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: true });
+            } else {
+                syncSafeFrameButtonUi();
+            }
+        });
+
+        bridge.on('pathtracing_settings', msg => {
+            applyPathTracingSettings({
+                bounces: msg.bounces,
+                giClamp: msg.giClamp,
+                freezeSync: msg.freezeSync,
+            }, { notify: true });
+        });
+
+        let transportMode = 'waiting';
+        let latestAppliedSyncFrame = 0;
+        let latestAppliedSyncSerial = 0;
+
+        function setInfoText(text) {
+            perfHud.setStatus(text);
+        }
+
+        function setTransportMode(mode) {
+            transportMode = mode;
+        }
+
+        function countInstances() {
+            const sharedGeoms = new Set();
+            let count = 0;
+            for (const [handle, mesh] of nodeMap) {
+                if (!mesh?.geometry) continue;
+                if (maxInstanceHandleToBucket.has(handle)) continue; // counted via bucket below
+                // Explicit Max instance (instOf from C++)
+                if (Number.isFinite(mesh.userData?.maxjsInstOf) && mesh.userData.maxjsInstOf > 0) {
+                    count++;
+                    continue;
+                }
+                // Implicit: multiple meshes sharing same BufferGeometry
+                if (sharedGeoms.has(mesh.geometry)) count++;
+                else sharedGeoms.add(mesh.geometry);
+            }
+            // Max instance GPU buckets
+            for (const [, bucket] of maxInstanceBuckets) {
+                count += bucket.handles.size;
+            }
+            for (const [, entry] of hairMeshes) {
+                count += entry?.mesh?.count ?? 0;
+            }
+            // Forest Pack GPU instances
+            for (const [, im] of forestMeshes) {
+                count += im.count;
+            }
+            return count;
+        }
+
+        function updateSyncHud(partial = {}) {
+            if (partial.countAsAppliedSync !== false) {
+                latestAppliedSyncSerial += 1;
+            }
+            if (Number.isFinite(partial.frameId) && partial.frameId > 0) {
+                latestAppliedSyncFrame = Math.max(latestAppliedSyncFrame, partial.frameId);
+            }
+            // Release / static snapshot: no HUD churn (perfHud.updateSync repaints + countInstances).
+            if (!debugMode || buildMode === 'release') return;
+            perfHud.updateSync({
+                transport: partial.transport ?? transportMode,
+                frameId: partial.frameId ?? 0,
+                producerBytes: partial.producerBytes ?? 0,
+                decodeMs: partial.decodeMs ?? 0,
+                applyMs: partial.applyMs ?? 0,
+                nodeCount: nodeMap.size,
+                instanceCount: countInstances(),
+                ...materialRegistryHudStats(),
+                textureCount: textureCache.size,
+            });
+        }
+
+        bridge.on('debug', msg => {
+            if (!bridgeHasInitialSync()) {
+                setInfoText('max.js - ' + (msg.msg || 'debug'));
+            } else {
+                maxjsDebugLog('[max.js debug]', msg.msg || 'debug');
+            }
+        });
+
+        const sceneSync = createSceneSync({
+            hostBridge,
+            bridge,
+            setTransportMode,
+            updateSyncHud,
+            markInitialSync,
+            resolveSnapshotMaterialRefs,
+            applyJsmodSyncState,
+            applyUserPropsSyncState,
+            applyInstanceSyncState,
+            applyBridgeVisibility,
+            applyMeshShadowState,
+            applyNodeProps,
+            matrixScaleSignature,
+            ensureSceneRenderableMaterial,
+            applyGeometryGroups,
+            syncGeometryGroupsForNode,
+            resolveInstancedNodeGeometry,
+            isGeometrySharedByAnotherMesh,
+            createSceneRenderableMaterial,
+            stampSceneMaterial,
+            disposeSceneMaterial,
+            materialIdentityKey,
+            sceneMaterialSignature,
+            isSceneProfilingEnabled,
+            getMaterialRegistryStats,
+            refreshMaterialRegistry,
+            applyFastMaterialPayload,
+            cloneGeometryGroups,
+            nodePayloadHasHTMLAutoFit,
+            shouldRouteBlackSpecularToLambert,
+            createMaterial,
+            isCachedMaterialTemplate,
+            applySSSRoughnessInfluence,
+            rememberMaterialEmissiveBase,
+            applyMaterialSelectionState,
+            normalizeMaxVertexColorChannel,
+            maxVertexColorAttributeName,
+            resetPathTracingStartupWarmup: (...args) => resetPathTracingStartupWarmup(...args),
+            markPathTracingSceneDirtyNow: (...args) => markPathTracingSceneDirtyNow(...args),
+            scheduleLightProbeFromCurrentScene,
+            schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
+            applyCamera: (...args) => applyCamera(...args),
+            applySky: (...args) => applySky(...args),
+            removeSky: (...args) => removeSky(...args),
+            loadHDRI: (...args) => loadHDRI(...args),
+            removeAuthoredEnvironment: (...args) => removeAuthoredEnvironment(...args),
+            applyLights: (...args) => applyLights(...args),
+            updateSceneCameraList: (...args) => updateSceneCameraList(...args),
+            applyHairInstances: (...args) => applyHairInstances(...args),
+            applyForestInstances: (...args) => applyForestInstances(...args),
+            applyHairTransform: (...args) => applyHairTransform(...args),
+            applyHairVisibility: (...args) => applyHairVisibility(...args),
+            applyLightData: (...args) => applyLightData(...args),
+            refreshSkyFromLinkedSun: (...args) => refreshSkyFromLinkedSun(...args),
+            applyLightUpdates: (...args) => applyLightUpdates(...args),
+            get nodeMap() { return nodeMap; },
+            get maxInstanceBuckets() { return maxInstanceBuckets; },
+            get maxInstanceHandleToBucket() { return maxInstanceHandleToBucket; },
+            get layerManager() { return layerManager; },
+            get performanceSettings() { return performanceSettings; },
+            get maxRoot() { return maxRoot; },
+            get debugMode() { return debugMode; },
+            get buildMode() { return buildMode; },
+            get maxjsFx() { return maxjsFx; },
+            get scene() { return scene; },
+            get lightLinking() { return lightLinking; },
+            get pathTracingFx() { return pathTracingFx; },
+            get camLock() { return camLock; },
+            get renderer() { return renderer; },
+            get lightHandleMap() { return lightHandleMap; },
+            get audioSystem() { return audioSystem; },
+            get gltfSystem() { return gltfSystem; },
+            get animationSystem() { return animationSystem; },
+            get camera() { return camera; },
+            get sceneLoadGate() { return sceneLoadGate; },
+            get longTaskMonitor() { return longTaskMonitor; },
+            reportBridgeError: (...args) => reportBridgeError(...args),
+            maxjsDebugLog,
+            maxjsDebugWarn,
+        });
+        const {
+            finalizeSceneNode,
+            applyIncrementalNodeUpdate,
+            buildNodeGeometryRefCounts,
+            retainGeometryRef,
+            releaseGeometryRef,
+            disposeMaxInstanceBuckets,
+            setLightLinkTargetHandles,
+            disposeFlattenedGroups,
+            getMaxInstanceBucketForHandle,
+            matrixArraysAlmostEqual,
+            updateMaxInstanceBucketTransform,
+            updateMaxInstanceBucketNode,
+            planMaxInstanceBuckets,
+            buildMaxInstanceBuckets,
+            profileSceneNodes,
+            findSnapshotSkySunDirection,
+            withSnapshotLinkedSkySun,
+            finalizeSceneSnapshot,
+            handleBinaryScene,
+            handleBinaryDelta,
+            normalizeVertexColorDescriptors,
+            setGeometryVertexColorAttributes,
+            buildGeometry,
+            isFiniteArray,
+            removeMaxNodeObject,
+            getNodeParentObject,
+            syncNodeParent,
+            ensureTransformOnlyNode,
+            applyTransform,
+            applySelection,
+            applyMaterialScalar,
+        } = sceneSync;
+
+        const sceneExtras = createSceneExtras({
+            bridge,
+            countMaterialTextureSlots,
+            buildGeometry,
+            scheduleLightProbeFromCurrentScene,
+            schedulePathTracingLiveRebuild: (...args) => schedulePathTracingLiveRebuild(...args),
+            updateSyncHud,
+            maxjsDebugLog,
+            get hairMeshes() { return hairMeshes; },
+            set hairMeshes(value) { hairMeshes = value; },
+            get forestMeshes() { return forestMeshes; },
+            set forestMeshes(value) { forestMeshes = value; },
+            get disposeSceneMaterial() { return disposeSceneMaterial; },
+            get createMaterial() { return createMaterial; },
+            get maxRoot() { return maxRoot; },
+            get renderer() { return renderer; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get scene() { return scene; },
+            get layerManager() { return layerManager; },
+            get maxjsFx() { return maxjsFx; },
+            get transportMode() { return transportMode; },
+        });
+        const {
+            createHairBladeGeometry,
+            disposeHairEntry,
+            disposeHairInstances,
+            applyHairTransform,
+            applyHairVisibility,
+            buildHairEntry,
+            applyHairInstances,
+            getForestBinaryFloatView,
+            getForestGeometryPayload,
+            getForestTransformPayload,
+            setForestInstanceMatrix,
+            writeForestInstanceMatrixAt,
+            nextForestBuildFrame,
+            disposeForestBuildMaterial,
+            disposeForestBuildResources,
+            usingWebGpuInstanceMaterials,
+            copyInstanceTextureSlot,
+            webGpuSafeInstanceMaterialDescriptor,
+            dominantForestMaterialIndex,
+            shouldCollapseForestMaterialsForWebGpu,
+            createForestInstanceMaterial,
+            applyForestInstances,
+        } = sceneExtras;
+
+        const cameraSystem = createCameraSystem({
+            bridge,
+            updateSyncHud,
+            getRenderOutputAspect,
+            getViewportFrameRect,
+            applySyncedCameraClip,
+            applyCameraClipOverrides,
+            applyRenderViewportLayout,
+            updateCameraProjectionForViewportRect,
+            copyMaxArrayToWorld,
+            syncPostFxPanel: (...args) => syncPostFxPanel(...args),
+            syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
+            maxjsDebugLog,
+            isFiniteArray,
+            DEFAULT_CAMERA_NEAR,
+            get camera() { return camera; },
+            set camera(value) { camera = value; },
+            get controls() { return controls; },
+            set controls(value) { controls = value; },
+            get camLock() { return camLock; },
+            set camLock(value) { camLock = value; },
+            get physicalCameraDofActive() { return physicalCameraDofActive; },
+            set physicalCameraDofActive(value) { physicalCameraDofActive = value; },
+            get renderToImageActive() { return renderToImageActive; },
+            get pendingRenderToImage() { return pendingRenderToImage; },
+            get safeFrameEnabled() { return safeFrameEnabled; },
+            get scene() { return scene; },
+            get perspCamera() { return perspCamera; },
+            get orthoCamera() { return orthoCamera; },
+            get cameraTargetWorld() { return cameraTargetWorld; },
+            get maxjsFx() { return maxjsFx; },
+            get webglBasicFx() { return webglBasicFx; },
+            get shaderLabFx() { return shaderLabFx; },
+            get pathTracingFx() { return pathTracingFx; },
+            get layerManager() { return _layerManagerRef; },
+            get xrRuntime() { return xrRuntime; },
+            get nodeMap() { return nodeMap; },
+        });
+        const {
+            updateSceneCameraList,
+            syncCameraLockButtonUi,
+            syncCameraControlAvailability,
+            applyLayerCameraMode,
+            getCameraProjectionAspect,
+            applyCameraProjectionFromMax,
+            syncCameraConsumersAfterSwap,
+            applyCamera,
+            computeVisibleSceneBounds,
+            serializeCurrentCameraState,
+            applyStandaloneCameraState,
+            syncOrbitNavigationFeel,
+            getKnownSceneCameras,
+        } = cameraSystem;
+
+        hostBridge.installHostWiring();
+        window.maxJS = bridge;
+        window.maxJS.relay = relayFacade;
+        bridge.materials = {
+            getStats() {
+                return { ...getMaterialRegistryStats() };
+            },
+            getEntries() {
+                return getMaterialRegistryEntries();
+            },
+        };
+
+        const DEFAULT_BAKE_STATE = Object.freeze({
+            version: 1,
+            enabled: false,
+            mode: 'lightmap',
+            match: 'scene',
+            folder: '',
+            sceneName: 'scene',
+            lightSuffix: '_lightmap',
+            beautySuffix: '_beauty',
+            extension: 'png',
+            intensity: 1.0,
+            bakeExposure: 0,
+            proxyDisplay: false,
+        });
+        let bakeOverrides = { ...DEFAULT_BAKE_STATE };
+
+        const bakeSystem = createBakeSystem({
+            DEFAULT_BAKE_STATE,
+            maxMapChannelFromMapName,
+            textureWithUvChannel,
+            loadBakeTextureFromCandidates,
+            bakeExposureScale,
+            isDisplayBakedBeautyProxy,
+            clearBakeTextureLoadFailures,
+            isWebGLTexturePathActive,
+            getTextureExtension,
+            colorSpaceForTextureExtension,
+            textureLoader,
+            exrLoader,
+            rgbeLoader,
+            isCachedMaterialTemplate,
+            rememberMaterialEmissiveBase,
+            disposeSceneMaterial,
+            ensureSceneRenderableMaterial,
+            stampSceneMaterial,
+            scheduleLightProbeFromCurrentScene,
+            requestHostAction,
+            bytesToBase64,
+            reportBridgeError,
+            maxjsDebugWarn,
+            get bakeOverrides() { return bakeOverrides; },
+            set bakeOverrides(value) { bakeOverrides = value; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get nodeMap() { return nodeMap; },
+            get layerManager() { return layerManager; },
+            get maxjsFx() { return maxjsFx; },
+            get lightLinking() { return lightLinkingRef; },
+            get bridge() { return bridge; },
+            get perfHud() { return perfHud; },
+            get projectRuntime() { return _projectRuntimeRef; },
+            get currentToneMapping() { return currentToneMapping; },
+            get currentExposure() { return currentExposure; },
+        });
+        const {
+            normalizeBakeState,
+            serializeBakeState,
+            serializeSnapshotBakeState,
+            bakeStateSignature,
+            stripWrappingQuotes,
+            encodeAssetPath,
+            normalizeBakeFolderUrl,
+            sanitizeBakeFileStem,
+            getMaterialBakeName,
+            getBakeTargetName,
+            getBakeTextureUrl,
+            bakeFilenameHasExplicitUvChannel,
+            getBakeFilenameCandidates,
+            getBakeTextureCandidates,
+            hasGeometryUV2,
+            getBakeMaxMapChannel,
+            hasGeometryMaxMapChannel,
+            restoreWebGpuLightMapUvContext,
+            applyWebGpuLightMapUvContext,
+            markBakeMissingUv,
+            clearBakeMissingUv,
+            maybeRequestBakeUv2Resync,
+            createBeautyBakeMaterial,
+            bakeOverrideOwnerKey,
+            stampBakeOverrideOwner,
+            ensureBakeOverrideMaterialInstance,
+            applyBakeOverrideToMaterial,
+            applyBakeOverridesToSceneMaterial,
+            withBakePersistenceSuppressed,
+            escapeBakeHtml,
+            getBakeSceneStats,
+            getBakeUv2RequirementStats,
+            mutateLightmapBakeOnMaterial,
+            reapplyBakeOverridesToScene,
+            setGiLightmaps,
+            withGiLightmapsMuted,
+            applyBakeState,
+            saveBakeState,
+            restoreBakeState,
+            syncProjectBakeState,
+            setBakePanelVisible,
+            readBakeStateFromPanel,
+            updateBakePanelPreview,
+            getBakeTargetPreviewRows,
+            renderBakeTargetPreview,
+            getAllBakeProxyTargets,
+            loadProxySourceTexture,
+            cloneProxyTextureForWebGL,
+            getBakeProxyRenderer,
+            stdToneMappingForCurrentMode,
+            renderBakeTextureProxy,
+            encodeBeautyBakeProxyMaps,
+            isBakeTextInput,
+            updateBakeStateFromPanel,
+            rebuildBakePanel,
+        } = bakeSystem;
+
+        // ── Environment live update (standalone, change-only) ──
+        bridge.on('env_update', msg => {
+            let pathTraceSceneChanged = false;
+            if (msg.env) {
+                if (msg.env.sky) {
+                    applySky(msg.env.sky);
+                    scheduleLightProbeFromCurrentScene();
+                    pathTraceSceneChanged = true;
+                } else if (msg.env.hdri) {
+                    removeSky();
+                    loadHDRI(msg.env);
+                    pathTraceSceneChanged = true;
+                } else if (msg.env.enabled === false || msg.env.type === 'none') {
+                    removeAuthoredEnvironment();
+                    pathTraceSceneChanged = true;
+                }
+                maxjsFx.markEnvironmentChanged?.();
+            }
+            if (pathTraceSceneChanged) schedulePathTracingLiveRebuild();
+        });
+
+
+
+
+        // Audio param edits ride a standalone JSON message because the binary
+        // delta's UpdateAudio command only carries transform + visibility.
+        bridge.on('audio_update', msg => {
+            if (Array.isArray(msg?.audios)) audioSystem?.applyAudioUpdates(msg.audios);
+        });
+
+        // Same pattern for glTF param edits (file path, rootScale, autoplay, displayName).
+        // Binary UpdateGLTF carries transform + visibility only.
+        bridge.on('gltf_update', msg => {
+            if (Array.isArray(msg?.gltfs)) gltfSystem?.applyGLTFUpdates(msg.gltfs);
+        });
+
+        const lightsSystem = createLights({
+            MAXJS_SELF_HIDDEN_LAYER,
+            LIGHT_LINK_STORAGE_KEY,
+            setObjectSelfVisibleLayer,
+            syncDefaultLightsVisibility,
+            scheduleLightProbeFromCurrentScene,
+            refreshSkyFromLinkedSun,
+            saveStudioState: (...args) => saveStudioState(...args),
+            isWebGLPipelineActive: (...args) => isWebGLPipelineActive(...args),
+            restartWithRendererBackend: (...args) => restartWithRendererBackend(...args),
+            setPathTracingActive: (...args) => setPathTracingActive(...args),
+            get isPathTracingMode() { return isPathTracingMode; },
+            hasActiveLightLinks: () => lightLinkingRef?.hasActiveLinks?.() === true,
+            get defaultLights() { return defaultLights; },
+            get defaultAmbient() { return defaultAmbient; },
+            get defaultKey() { return defaultKey; },
+            get defaultFill() { return defaultFill; },
+            get lightHandleMap() { return lightHandleMap; },
+            get lightHelpersVisible() { return lightHelpersVisible; },
+            set lightHelpersVisible(value) { lightHelpersVisible = value; },
+            get lastLightsSignature() { return lastLightsSignature; },
+            set lastLightsSignature(value) { lastLightsSignature = value; },
+            get lightLinkPanelVisible() { return lightLinkPanelVisible; },
+            set lightLinkPanelVisible(value) { lightLinkPanelVisible = value; },
+            get nodeMap() { return nodeMap; },
+            get maxInstanceBuckets() { return maxInstanceBuckets; },
+            setLightLinkTargetHandles,
+            get maxRoot() { return maxRoot; },
+            get scene() { return scene; },
+            get camera() { return camera; },
+            get maxjsFx() { return maxjsFx; },
+            get layerManager() { return layerManager; },
+            get perfHud() { return perfHud; },
+        });
+        const {
+            setDefaultLightsVisible,
+            isShadowMapOriginObject,
+            getShadowMapOriginRadiusFromName,
+            configureShadowMapOriginObject,
+            findShadowMapOriginObject,
+            getShadowMapOriginFocus,
+            getShadowSceneFocus,
+            setObjectWorldPosition,
+            applyDirectionalShadowOrigin,
+            updateLightShadowCamera,
+            createLightHelper,
+            clearLightHelpers,
+            updateLightHelpers,
+            setLightHelpersVisible,
+            clearLights,
+            getLightParentObject,
+            syncLightParent,
+            setLightPositionFromMaxRoot,
+            setLightTargetFromData,
+            applyLightEmitterClass,
+            applyLightData,
+            createLightFromData,
+            finalizeLightState,
+            sceneLightsSignature,
+            applyLights,
+            lightLinking,
+            setLightLinkPanelVisible,
+            rebuildLightLinkPanel,
+            applyLightUpdates,
+        } = lightsSystem;
+        lightLinkingRef = lightLinking;
+        setDefaultLightsVisible(true);
+
+        let asciiActive = false;
+        let asciiEffect = null;
+        let asciiSettings = { resolution: 0.15, color: 'white', invert: false };
+        let postPanelVisible = false;
+        let _layerManagerRef = null;
+        let _projectRuntimeRef = null;
+
+        const panelsMisc = createPanelsMisc({
+            applyFrameElementStyle,
+            getViewportFrameRect,
+            syncPostFxPanel: (...args) => syncPostFxPanel(...args),
+            syncCameraLockButtonUi,
+            syncCameraControlAvailability,
+            applyLocalHDRIToScene,
+            syncEnvironmentDisplay,
+            applyLightProbeState,
+            refreshLightProbeFromCurrentHDRI,
+            savePostFxState: (...args) => savePostFxState(...args),
+            setAudioMuted,
+            hexColorInputValue,
+            parseHexColorInput,
+            setBackgroundColor,
+            maxjsDebugWarn,
+            reportBridgeError,
+            syncProjectBakeState: (...args) => syncProjectBakeState(...args),
+            syncProjectPostFxState: (...args) => syncProjectPostFxState(...args),
+            setLightHelpersVisible,
+            applyPathTracingSettings: (...args) => applyPathTracingSettings(...args),
+            setPathTracingActive: (...args) => setPathTracingActive(...args),
+            isPathTracingAvailable: () => pathTracingFx.supported,
+            setLightLinkPanelVisible,
+            rebuildLightLinkPanel,
+            get renderer() { return renderer; },
+            get scene() { return scene; },
+            get controls() { return controls; },
+            get maxjsFx() { return maxjsFx; },
+            get shaderLabFx() { return shaderLabFx; },
+            get perfHud() { return perfHud; },
+            get renderToImageActive() { return renderToImageActive; },
+            get bridge() { return bridge; },
+            get lightLinking() { return lightLinking; },
+            get lightLinkPanelVisible() { return lightLinkPanelVisible; },
+            isWebGLPipelineActive: (...args) => isWebGLPipelineActive(...args),
+            get isPathTracingMode() { return isPathTracingMode; },
+            get pathTracingSettings() { return pathTracingSettings; },
+            get ptPauseUiSync() { return ptPauseUiSync; },
+            set ptPauseUiSync(value) { ptPauseUiSync = value; },
+            get lightProbeEnabled() { return lightProbeEnabled; },
+            set lightProbeEnabled(value) { lightProbeEnabled = value; },
+            get camLock() { return camLock; },
+            set camLock(value) { camLock = value; },
+            get envVisible() { return envVisible; },
+            set envVisible(value) { envVisible = value; },
+            get lightMode() { return lightMode; },
+            set lightMode(value) { lightMode = value; },
+            get audioMuted() { return audioMuted; },
+            get hiddenBackgroundColor() { return hiddenBackgroundColor; },
+            get compositionOverlay() { return compositionOverlay; },
+            get _layerManagerRef() { return _layerManagerRef; },
+            set _layerManagerRef(value) { _layerManagerRef = value; },
+            get _projectRuntimeRef() { return _projectRuntimeRef; },
+            set _projectRuntimeRef(value) { _projectRuntimeRef = value; },
+            get projectRuntime() { return projectRuntime; },
+            get lightHelpersVisible() { return lightHelpersVisible; },
+            get postPanelVisible() { return postPanelVisible; },
+            set postPanelVisible(value) { postPanelVisible = value; },
+            get asciiActive() { return asciiActive; },
+            set asciiActive(value) { asciiActive = value; },
+            get asciiEffect() { return asciiEffect; },
+            set asciiEffect(value) { asciiEffect = value; },
+            get asciiSettings() { return asciiSettings; },
+            set asciiSettings(value) { asciiSettings = value; },
+            isLocalHdriActive: (...args) => isLocalHdriActive(...args),
+        });
+        const {
+            setRailButtonMeta,
+            setViewportMenuItemHidden,
+            syncAudioMuteButtonUi,
+            syncBackgroundColorSlot,
+            syncEnvButtonUi,
+            enterAsciiMode,
+            exitAsciiMode,
+            rebuildAsciiEffect,
+            serializeStudioState,
+            saveStudioState,
+            restoreStudioState,
+            syncProjectStudioState,
+            isShaderLabBackendAvailable,
+            syncShaderLabAvailability,
+            attachLayerPanelSubscriptions,
+            queueLayersPanelRefresh,
+            setRightDockWidth,
+            clampDockWidth,
+            btnLightProbe,
+            setLightProbesEnabled,
+            btnPostFxPanel,
+            rightDock,
+            postPanel,
+            isClayModeActive,
+            setClayPreFxSnapshot,
+        } = panelsMisc;
+        syncRendererButtonUi();
+
+        // ── Hair And Fur GPU Instancing ─────────────────────
+        let hairMeshes = new Map(); // handle -> { root, mesh }
+
+        // ── ForestPack GPU Instancing ───────────────────────
+        let forestMeshes = new Map(); // key → InstancedMesh
+        let renderToImageActive = false;
+        let pendingRenderToImage = null;
+        let renderToImageForcePathTracing = false;
+
+        // ── UI Controls ─────────────────────────────────────
+        document.getElementById('btnKill').onclick = () => {
+            bridge.send('kill');
+        };
+
+        document.getElementById('btnRefresh').onclick = () => {
+            if (window.chrome?.webview) {
+                bridge.send('refresh');
+            } else {
+                location.reload();
+            }
+        };
+
+        // Instance producers (Point Instance / Forest / RailClone)
+        // are not change-detected host-side — this is their manual pull.
+        // scene_dirty asks the host for a full resend without a panel reload.
+        document.getElementById('btnRefreshInstances').onclick = () => {
+            bridge.send('scene_dirty');
+        };
+
+        document.getElementById('btnSafeFrame')?.addEventListener('click', () => {
+            safeFrameEnabled = !safeFrameEnabled;
+            try {
+                localStorage.setItem(SAFE_FRAME_STORAGE_KEY, safeFrameEnabled ? 'true' : 'false');
+            } catch {}
+            applyRenderViewportLayout({ resizeBuffers: true, resizePostFx: true });
+            perfHud.setStatus(safeFrameEnabled
+                ? 'max.js - safe frame crop on'
+                : 'max.js - safe frame crop off');
+        });
+        syncSafeFrameButtonUi();
+
+        const snapshotExport = createSnapshotExport({
+            bridge,
+            requestHostAction,
+            toBase64Utf8,
+            bytesToBase64,
+            reportBridgeError,
+            maxjsDebugWarn,
+            setInfoText,
+            serializeSnapshotUiState: (...args) => serializeSnapshotUiState(...args),
+            serializeSnapshotBakeState: (...args) => serializeSnapshotBakeState(...args),
+            isLocalHdriLoaded: (...args) => isLocalHdriLoaded(...args),
+            get skyActive() { return skyActive; },
+            get currentEnvParams() { return currentEnvParams; },
+            get localHdriFile() { return localHdriFile; },
+            get localHdriFileName() { return localHdriFileName; },
+            get layerManager() { return layerManager; },
+        });
+        const {
+            SNAPSHOT_SETTINGS_DEFAULTS,
+            sanitizeSnapshotSettings,
+            getSnapshotExportSettings,
+            loadSnapshotSettings,
+            saveSnapshotSettings,
+            setSnapshotPanelVisible,
+            updateSnapshotSetting,
+            resetSnapshotSettings,
+            buildSnapshotPanel,
+            syncSnapshotPanel,
+            escapeSnapshotDiagnosticHtml,
+            snapshotDiagnosticRow,
+            renderSnapshotDiagnosticsOverlay,
+            closeSnapshotDiagnosticsOverlay,
+            handleSnapshotDiagnosticsKeydown,
+            showSnapshotDiagnosticsOverlay,
+            analyzeSnapshotFromHost,
+            exportSnapshotWithSettings,
+            serveSnapshotWithSettings,
+        } = snapshotExport;
+
+        // Toon outline is automatic — no UI button needed
+
+        // Tone mapping modes
+        const DEFAULT_TONE_MAPPING = 'AgX';
+        const toneMappingModes = {
+            'None': THREE.NoToneMapping,
+            'Linear': THREE.LinearToneMapping,
+            'Reinhard': THREE.ReinhardToneMapping,
+            'Cineon': THREE.CineonToneMapping,
+            'AgX': THREE.AgXToneMapping,
+            'Neutral': THREE.NeutralToneMapping,
+        };
+        let currentToneMapping = DEFAULT_TONE_MAPPING;
+        let currentExposure = 1.0;
+        let currentAAMode = 'off'; // 'traa' | 'off' (MSAA option removed — was a no-op with the deferred MRT pipeline)
+
+        const postFxGlue = createPostFxGlue({
+            bridge,
+            onShaderLabSnapshotChange,
+            applyCameraClipOverrides,
+            applyHdriReflectionOnlyState,
+            applyLightProbeState,
+            applyLocalHDRISettings,
+            applyLocalHDRIToScene,
+            applyRendererPerformanceSettings,
+            clampDockWidth,
+            clearLocalHDRI,
+            computeVisibleSceneBounds,
+            disposeMaxInstanceBuckets,
+            disposeFlattenedGroups,
+            enterAsciiMode,
+            exitAsciiMode,
+            getEffectivePixelRatio,
+            getEffectivePostFxResolutionScale,
+            getLightProbeSettings,
+            applyLightProbeSettings,
+            rebakeLightProbes,
+            toggleLightProbes: () => setLightProbesEnabled(!lightProbeEnabled),
+            lightProbes,
+            lightmapsSupported,
+            getSpeedballStatus,
+            getLightmapCount,
+            isLightmapBakePending,
+            isLocalHdriActive,
+            loadLocalHDRIFile,
+            maxjsDebugWarn,
+            rebuildAsciiEffect,
+            refreshLightProbeFromCurrentHDRI,
+            reportBridgeError,
+            setBackgroundColor,
+            setRightDockWidth,
+            setShaderLabSnapshot,
+            syncCameraLockButtonUi,
+            syncCameraControlAvailability,
+            syncEnvButtonUi,
+            syncEnvironmentDisplay,
+            syncHdriPanel,
+            syncShaderLabAvailability,
+            toggleLocalHDRI,
+            updateShaderLabEnabled,
+            serializeSnapshotUiState: (...args) => serializeSnapshotUiState(...args),
+            DEFAULT_CAMERA_NEAR,
+            DEFAULT_TONE_MAPPING,
+            PERFORMANCE_DEFAULTS,
+            toneMappingModes,
+            btnLightProbe,
+            btnPostFxPanel,
+            postPanel,
+            rightDock,
+            isClayModeActive,
+            setClayPreFxSnapshot,
+            get _projectRuntimeRef() { return _projectRuntimeRef; },
+            get asciiActive() { return asciiActive; },
+            get asciiSettings() { return asciiSettings; },
+            set asciiSettings(value) { asciiSettings = value; },
+            get camera() { return camera; },
+            get cameraClip() { return cameraClip; },
+            get camLock() { return camLock; },
+            set camLock(value) { camLock = value; },
+            get controls() { return controls; },
+            get currentAAMode() { return currentAAMode; },
+            set currentAAMode(value) { currentAAMode = value; },
+            get currentExposure() { return currentExposure; },
+            set currentExposure(value) { currentExposure = value; },
+            get currentToneMapping() { return currentToneMapping; },
+            set currentToneMapping(value) { currentToneMapping = value; },
+            get envVisible() { return envVisible; },
+            set envVisible(value) { envVisible = value; },
+            get lastRenderTimestamp() { return lastRenderTimestamp; },
+            set lastRenderTimestamp(value) { lastRenderTimestamp = value; },
+            get lightMode() { return lightMode; },
+            set lightMode(value) { lightMode = value; },
+            get lightProbeEnabled() { return lightProbeEnabled; },
+            set lightProbeEnabled(value) { lightProbeEnabled = value; },
+            get localHdriBlur() { return localHdriBlur; },
+            set localHdriBlur(value) { localHdriBlur = value; },
+            get localHdriEnabled() { return localHdriEnabled; },
+            set localHdriEnabled(value) { localHdriEnabled = value; },
+            get localHdriFlip() { return localHdriFlip; },
+            set localHdriFlip(value) { localHdriFlip = value; },
+            get localHdriIntensity() { return localHdriIntensity; },
+            set localHdriIntensity(value) { localHdriIntensity = value; },
+            get localHdriReflectionOnly() { return localHdriReflectionOnly; },
+            set localHdriReflectionOnly(value) { localHdriReflectionOnly = value; },
+            get localHdriRotation() { return localHdriRotation; },
+            set localHdriRotation(value) { localHdriRotation = value; },
+            get localHdriShowBg() { return localHdriShowBg; },
+            set localHdriShowBg(value) { localHdriShowBg = value; },
+            get maxjsFx() { return maxjsFx; },
+            get pathTracingFx() { return pathTracingFx; },
+            get performanceSettings() { return performanceSettings; },
+            set performanceSettings(value) { performanceSettings = value; },
+            get perfHud() { return perfHud; },
+            get postPanelVisible() { return postPanelVisible; },
+            set postPanelVisible(value) { postPanelVisible = value; },
+            get renderer() { return renderer; },
+            get rendererBackendLabel() { return rendererBackendLabel; },
+            get scene() { return scene; },
+            get shaderLabFx() { return shaderLabFx; },
+            get webglBasicFx() { return webglBasicFx; },
+        });
+        const {
+            applyCoreToneMappingState,
+            computePathTracingApertureRadius,
+            syncPathTracingDofFromPostFx,
+            buildPostFxPanel,
+            syncPostFxPanel,
+            savePostFxState,
+            restorePostFxState,
+            syncProjectPostFxState,
+        } = postFxGlue;
+
+        function serializeSnapshotFxState() {
+            // Full state including powershot — the snapshot viewer replays it
+            // via fx/final/powershot.js when runtimeFeatures.post_fx lists
+            // 'powershot' (the exporter detects fx.powershot.enabled).
+            return maxjsFx.getState();
+        }
+
+        function serializeSnapshotUiState({ includeDebug = false } = {}) {
+            const snapshotRendererBackend = rendererBackendLabel;
+            const authoredEnvironmentActive = !!(skyActive || currentEnvParams?.hdri);
+            const payload = {
+                buildMode: includeDebug ? 'dev' : 'release',
+                rendererBackend: snapshotRendererBackend,
+                toneMapping: currentToneMapping,
+                exposure: currentExposure,
+                aaMode: currentAAMode,
+                envVisible,
+                camLock,
+                lightProbeEnabled,
+                lightMode,
+                background: hiddenBackgroundColor,
+                fx: serializeSnapshotFxState(),
+                webglBasicFx: webglBasicFx.getState?.(),
+                camera: serializeCurrentCameraState(),
+                hdri: {
+                    rotation: localHdriRotation,
+                    intensity: localHdriIntensity,
+                    showBg: envVisible,
+                    blur: localHdriBlur,
+                    flip: localHdriFlip,
+                    reflectionOnly: localHdriReflectionOnly,
+                    enabled: authoredEnvironmentActive ? false : localHdriEnabled,
+                    fileName: !authoredEnvironmentActive && isLocalHdriLoaded() ? localHdriFileName : '',
+                },
+                lightProbes: serializeSnapshotLightProbes(),
+                performance: {
+                    fpsCap: performanceSettings.fpsCap,
+                    renderScale: performanceSettings.renderScale,
+                    postFxScale: getEffectivePostFxResolutionScale(),
+                    optimizeMaxInstances: performanceSettings.optimizeMaxInstances,
+                    maxInstanceBucketThreshold: performanceSettings.maxInstanceBucketThreshold,
+                    flattenGroups: performanceSettings.flattenGroups === true,
+                },
+                cameraClip: { near: cameraClip.near, far: cameraClip.far },
+                ascii: { enabled: asciiActive, ...asciiSettings },
+                shaderLab: getShaderLabSnapshot(),
+                studio: lightLinking.hasPortableState() ? serializeStudioState() : null,
+                bake: serializeBakeState(),
+                timeline: {
+                    fps: maxTimeline.fps(),
+                    startFrame: 0,
+                    endFrame: 0,
+                    defaultPlaying: true,
+                },
+            };
+            if (includeDebug) {
+                payload.debug = {
+                    buildMode, debugMode, standalone: isStandalone,
+                    backend: snapshotRendererBackend,
+                    nodeMapSize: nodeMap.size,
+                    memory: renderer?.info?.memory ?? null,
+                };
+            }
+            return payload;
+        }
+
+
+        buildPostFxPanel();
+        // NOTE: Do NOT call syncPostFxPanel here — it would save defaults and overwrite stored settings.
+        // restoreInteractiveBrowserState() handles restore then sync.
+
+        // ── Resize + Render ─────────────────────────────────
+        // WebGPU pipelines bound to the canvas swap chain get duplicated every
+        // time canvas.width / canvas.height change (forces context reconfigure
+        // and orphans the old swap-chain textures the pipelines reference).
+        // `renderer.setSize` touches canvas.width — so dragging a panel resize
+        // handle at 60fps used to fire 60 full pipeline rebuilds across every
+        // post-FX pass. The Inspector's "(not in use)" cascade on every pass
+        // was that churn being observed in-flight.
+        //
+        // Strategy: update camera + CSS immediately so the canvas visually
+        // tracks the drag (browser scales stale pixels smoothly), but defer
+        // the drawing-buffer resize + post-FX rebuild until dragging settles.
+        // One pipeline churn event per resize gesture instead of dozens.
+        let resizeTimer = null;
+        addEventListener('resize', () => {
+            // CSS-only update keeps the canvas visually filling the viewport
+            // during drag. No drawing-buffer resize → no swap chain churn.
+            applyRenderViewportLayout({ resizeBuffers: false, resizePostFx: false });
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(() => {
+                applyRendererPerformanceSettings({ resizePostFx: false });
+                maxjsFx.resize();
+                webglBasicFx.resize?.();
+            }, 150);
+        });
+
+        // ── Headset runtime ──────────────────────────────────
+        // Fragile integration: this path is intentionally isolated from snapshots/export
+        // and has only been tested on Quest 3 via Virtual Desktop (VDXR).
+        const xrRuntime = !window.chrome?.webview
+            ? { active: false, shouldBypassPostFx: false, update() {} }
+            : createWebXRRuntime({
+                renderer, scene, controls, perfHud, cameraDefaultPosition,
+                rendererBackendLabel, computeVisibleSceneBounds,
+                isWgl2FallbackBackendActive, syncCameraControlAvailability,
+                get camera() { return camera; },
+                get camLock() { return camLock; },
+            });
+
+        // "Enter VR" menu button: proxies the (hidden) three.js XRButton and
+        // mirrors its state. VR is hidden in the simple WebGL pipeline and only
+        // surfaced for renderer modes where we intentionally support it.
+        (function wireEnterVrButton() {
+            const vrBtn = document.getElementById('btnEnterVR');
+            if (!vrBtn) return;
+            const vrRow = vrBtn.closest('.vpmenu-row');
+            const vrLabel = vrBtn.closest('.vpmenu-row')?.querySelector('.vpmenu-label');
+            const setLabel = (text) => { if (vrLabel) vrLabel.textContent = text; };
+            function syncVrState() {
+                if (isWebGLPipelineActive()) {
+                    setViewportMenuItemHidden(vrRow, true);
+                    vrBtn.disabled = true;
+                    vrBtn.classList.add('is-gated');
+                    vrBtn.classList.remove('active');
+                    vrBtn.title = 'VR is unavailable in the WebGL/pathtracing pipeline';
+                    setLabel('VR Unavailable');
+                    return;
+                }
+                setViewportMenuItemHidden(vrRow, false);
+                const xrButton = xrRuntime?.xrButton;
+                const ready = !!xrRuntime?.supportsXR && !!xrButton && xrButton.isConnected;
+                if (!ready) {
+                    setViewportMenuItemHidden(vrRow, !isWgl2FallbackBackendActive());
+                    vrBtn.disabled = true;
+                    vrBtn.classList.add('is-gated');
+                    vrBtn.classList.remove('active');
+                    vrBtn.title = 'VR unavailable — needs a supported WebGL pipeline and a headset';
+                    setLabel('VR Unavailable');
+                    return;
+                }
+                setViewportMenuItemHidden(vrRow, false);
+                vrBtn.disabled = false;
+                vrBtn.classList.remove('is-gated');
+                const presenting = !!renderer.xr?.isPresenting
+                    || String(xrButton.textContent || '').trim().toUpperCase().includes('EXIT');
+                vrBtn.classList.toggle('active', presenting);
+                vrBtn.title = presenting ? 'Exit VR' : 'Enter VR';
+                setLabel(presenting ? 'Exit VR' : 'Enter VR');
+            }
+            vrBtn.addEventListener('click', () => {
+                const xrButton = xrRuntime?.xrButton;
+                if (xrButton && !vrBtn.disabled) xrButton.click();
+            });
+            if (xrRuntime?.xrButton && typeof MutationObserver === 'function') {
+                new MutationObserver(syncVrState).observe(xrRuntime.xrButton, {
+                    childList: true, characterData: true, subtree: true,
+                });
+            }
+            renderer.xr?.addEventListener?.('sessionstart', syncVrState);
+            renderer.xr?.addEventListener?.('sessionend', syncVrState);
+            // Initial + after three.js resolves async support detection.
+            syncVrState();
+            setTimeout(syncVrState, 600);
+            setTimeout(syncVrState, 2100);
+        })();
+
+        const renderLoop = createRenderLoop({
+            nirBandView,
+            flushMaterialDisposals: (...args) => flushMaterialDisposals(...args),
+            syncOrbitNavigationFeel: (...args) => syncOrbitNavigationFeel(...args),
+            scheduleLightProbeFromCurrentScene,
+            updateLightProbes,
+            lightProbes,
+            isLightmapBakePending,
+            syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
+            getActiveCameraWorldPosition: (...args) => getActiveCameraWorldPosition(...args),
+            updateLightHelpers: (...args) => updateLightHelpers(...args),
+            removeWebGPUIncompatibleSceneMaterials: (...args) => removeWebGPUIncompatibleSceneMaterials(...args),
+            isPathTracingViewActive: (...args) => isPathTracingViewActive(...args),
+            renderPathTracingFallbackFrame: (...args) => renderPathTracingFallbackFrame(...args),
+            canStartPathTracingNow: (...args) => canStartPathTracingNow(...args),
+            bridgeHasInitialSync: (...args) => bridgeHasInitialSync(...args),
+            renderPathTracingLiveFrame: (...args) => renderPathTracingLiveFrame(...args),
+            reportBridgeError: (...args) => reportBridgeError(...args),
+            renderCurrentFrameOnce: (...args) => renderCurrentFrameOnce(...args),
+            sendCurrentCanvasRenderFile: (...args) => sendCurrentCanvasRenderFile(...args),
+            syncPostFxPanel: (...args) => syncPostFxPanel(...args),
+            get webglBasicFx() { return webglBasicFx; },
+            get renderer() { return renderer; },
+            get scene() { return scene; },
+            get camera() { return camera; },
+            get maxjsFx() { return maxjsFx; },
+            get sceneLoadGate() { return sceneLoadGate; },
+            get longTaskMonitor() { return longTaskMonitor; },
+            get renderToImageActive() { return renderToImageActive; },
+            get pendingRenderToImage() { return pendingRenderToImage; },
+            set pendingRenderToImage(value) { pendingRenderToImage = value; },
+            get performanceSettings() { return performanceSettings; },
+            get lastRenderTimestamp() { return lastRenderTimestamp; },
+            set lastRenderTimestamp(value) { lastRenderTimestamp = value; },
+            get inlineTimer() { return inlineTimer; },
+            get inlineClock() { return inlineClock; },
+            get xrRuntime() { return xrRuntime; },
+            get animationSystem() { return animationSystem; },
+            get controls() { return controls; },
+            get physicalCameraDofActive() { return physicalCameraDofActive; },
+            get defaultLights() { return defaultLights; },
+            get defaultKey() { return defaultKey; },
+            get cameraPositionWorld() { return cameraPositionWorld; },
+            get lightLinking() { return lightLinking; },
+            get lightHelpersVisible() { return lightHelpersVisible; },
+            get layerManager() { return layerManager; },
+            get audioSystem() { return audioSystem; },
+            get gltfSystem() { return gltfSystem; },
+            get perfHud() { return perfHud; },
+            get pathTracingFx() { return pathTracingFx; },
+            get pathTracingRasterWarmupFrames() { return pathTracingRasterWarmupFrames; },
+            set pathTracingRasterWarmupFrames(value) { pathTracingRasterWarmupFrames = value; },
+            get asciiActive() { return asciiActive; },
+            get asciiEffect() { return asciiEffect; },
+            get lightHandleMap() { return lightHandleMap; },
+            get isPathTracingMode() { return isPathTracingMode; },
+            get blobOverlayCtx() { return blobOverlayCtx; },
+            get blobOverlayCvs() { return blobOverlayCvs; },
+            get latestAppliedSyncSerial() { return latestAppliedSyncSerial; },
+            get pendingTextureLoads() { return pendingTextureLoads; },
+            get renderToImageForcePathTracing() { return renderToImageForcePathTracing; },
+            set renderToImageForcePathTracing(value) { renderToImageForcePathTracing = value; },
+            get bridge() { return bridge; },
+            get postPanelVisible() { return postPanelVisible; },
+            get debugMode() { return debugMode; },
+            get buildMode() { return buildMode; },
+        });
+        const { renderViewerFrame, renderFrame } = renderLoop;
+
+        // ── Runtime Script Layer Manager ─────────────────────
+        const inlineTimer = new THREE.Timer();
+        inlineTimer.connect?.(document);
+        const inlineClock = inlineTimer;
+        let lightLinkSceneRefreshQueued = false;
+        let runtimeTransformRefreshQueued = false;
+        let runtimeTransformLightsChanged = false;
+        let runtimeTransformSurfacesChanged = false;
+        const queueLightLinkSceneRefresh = () => {
+            if (lightLinkSceneRefreshQueued) return;
+            lightLinkSceneRefreshQueued = true;
+            queueMicrotask(() => {
+                lightLinkSceneRefreshQueued = false;
+                lightLinking.refreshSceneBindings?.();
+            });
+        };
+        const queueRuntimeTransformRefresh = (event) => {
+            if (lightHandleMap.has(event?.handle)) runtimeTransformLightsChanged = true;
+            else runtimeTransformSurfacesChanged = true;
+            if (runtimeTransformRefreshQueued) return;
+            runtimeTransformRefreshQueued = true;
+            queueMicrotask(() => {
+                runtimeTransformRefreshQueued = false;
+                const lightsChanged = runtimeTransformLightsChanged;
+                const surfacesChanged = runtimeTransformSurfacesChanged;
+                runtimeTransformLightsChanged = false;
+                runtimeTransformSurfacesChanged = false;
+
+                // Runtime pose writes do not change mesh/material topology. In
+                // particular, markSceneChanged() refreshes SSR's scene-derived
+                // caches, so calling it for every animated node made scripted
+                // rigs hitch only while SSR was enabled. Keep the pose-aware probe
+                // and PT invalidations, coalesced once per runtime update.
+                if (surfacesChanged) schedulePathTracingLiveRebuild('transform');
+                if (lightsChanged) schedulePathTracingLiveRebuild('light');
+                if (surfacesChanged || lightsChanged) {
+                    scheduleLightProbeFromCurrentScene({ delay: 350 });
+                }
+            });
+        };
+        const layerManager = createLayerManager({
+            scene,
+            camera,
+            renderer,
+            THREE,
+            nodeMap,
+            lightHandleMap,
+            maxRoot,
+            jsRoot,
+            overlayRoot,
+            space: sceneSpace,
+            controls,
+            getCamera: () => camera,
+            getCameraTarget: (target) => target?.copy(cameraTargetWorld) ?? cameraTargetWorld.clone(),
+            getSceneCameras: () => getKnownSceneCameras(),
+            onCameraModeChange: applyLayerCameraMode,
+            getGLTFSystem: () => gltfSystem,
+            getAnimationSystem: () => animationSystem,
+            getAudioSystem: () => audioSystem,
+            whenSceneReady: () => hostBridge.whenInitialSync(),
+            debugLog: maxjsDebugLog,
+            debugWarn: maxjsDebugWarn,
+            onRuntimeSceneChanged: (event) => {
+                if (event?.type === 'transform') {
+                    queueRuntimeTransformRefresh(event);
+                    return;
+                }
+                queueLightLinkSceneRefresh();
+                maxjsFx.markSceneChanged?.();
+                scheduleLightProbeFromCurrentScene({ delay: 350 });
+                schedulePathTracingLiveRebuild(event?.type === 'spectralMaterial' ? 'material' : 'full');
+            },
+        });
+        jsmodVisibilityOwnedByLayer = (handle) => layerManager.hasRuntimeVisibilityOverride(handle);
+        animationSystem = createMaxJSAnimationSystem({
+            THREE,
+            renderer,
+            nodeMap,
+            lightHandleMap,
+            getCamera: () => camera,
+            getControls: () => controls,
+            getJsRoot: () => jsRoot,
+            getOverlayRoot: () => overlayRoot,
+            getViewportAspect: () => getCameraProjectionAspect(),
+            buildGeometry,
+            applyMaterialScalar,
+            onSceneChange(change) {
+                scheduleLightProbeFromCurrentScene();
+                if (change?.topology) {
+                    schedulePathTracingLiveRebuild('full');
+                    return;
+                }
+                if (change?.transforms?.size) schedulePathTracingLiveRebuild('transform');
+                if (change?.materials?.size) schedulePathTracingLiveRebuild('material');
+                if (change?.deform) schedulePathTracingLiveRebuild('deform');
+                if (change?.lights) schedulePathTracingLiveRebuild('light');
+            },
+        });
+        audioSystem = createMaxJSAudioSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getActiveCamera: () => renderer.xr?.isPresenting ? renderer.xr.getCamera(camera) : camera,
+        });
+        setAudioMuted(audioMuted, { persist: false });
+        gltfSystem = createMaxJSGLTFSystem({
+            THREE,
+            parent: maxBasisRoot,
+            getBus: () => layerManager?.getBus?.(),
+            debugWarn: maxjsDebugWarn,
+            onSceneChange(change) {
+                scheduleLightProbeFromCurrentScene();
+                if (change?.type === 'topology') schedulePathTracingLiveRebuild('full');
+                else if (change?.type === 'transform') schedulePathTracingLiveRebuild(change.deform === true ? 'deform' : 'transform');
+            },
+        });
+        layerManager.subscribe?.(() => {
+            animationSystem.invalidateTargets();
+            queueLightLinkSceneRefresh();
+            // Layer mutations can add/remove meshes — cheap scene refresh.
+            maxjsFx.markSceneChanged?.();
+            scheduleLightProbeFromCurrentScene({ delay: 350 });
+            schedulePathTracingLiveRebuild();
+        });
+        const projectRuntime = window.chrome?.webview
+            ? createProjectRuntime({ layerManager, bridge, perfHud, debugLog: maxjsDebugLog, debugWarn: maxjsDebugWarn })
+            : null;
+        if (projectRuntime) {
+            layerManager.bindProjectRuntime(projectRuntime);
+        }
+        window.maxJSProjectRuntime = projectRuntime;
+        window.maxJS.layers = layerManager;
+        window.maxJS.animation = animationSystem;
+        window.maxJS.time = maxTimeline;
+        window.maxJS.audio = audioSystem;
+        window.maxJS.gltf = gltfSystem;
+
+        // Viewer-only inspection surface (globalThis.__maxjs). The renderer,
+        // scene and camera live in this function's scope and hang off no
+        // global, so an attached CDP session could not reach them at all.
+        // Handed as thunks, never values: a backend switch REBUILDS renderer
+        // and camera, and a captured reference would read a dead device (the
+        // RULE in context.js). Snapshot builds never import js/editor/, so
+        // this cannot reach a published scene.
+        installDebugBridge({
+            ctx,
+            getRenderer: () => renderer,
+            getScene: () => scene,
+            getCamera: () => camera,
+            getControls: () => controls,
+            getFx: () => maxjsFx,
+            THREE,
+        });
+        _layerManagerRef = layerManager;
+        _projectRuntimeRef = projectRuntime;
+        attachLayerPanelSubscriptions();
+        queueLayersPanelRefresh();
+
+
+        const renderCapture = createRenderCapture({
+            PATH_TRACING_CAPTURE_DEFAULT_SAMPLES,
+            PATH_TRACING_TEXTURE_WAIT_MS,
+            getActiveCameraWorldPosition: (...args) => getActiveCameraWorldPosition(...args),
+            isPathTracingViewActive: (...args) => isPathTracingViewActive(...args),
+            renderPathTracingLiveFrame: (...args) => renderPathTracingLiveFrame(...args),
+            renderViewerFrame: (...args) => renderViewerFrame(...args),
+            reportBridgeError: (...args) => reportBridgeError(...args),
+            getEnvironmentBackgroundMap: (...args) => getEnvironmentBackgroundMap(...args),
+            isLocalHdriActive: (...args) => isLocalHdriActive(...args),
+            applyLocalHDRIToScene: (...args) => applyLocalHDRIToScene(...args),
+            resetPathTracingStartupWarmup: (...args) => resetPathTracingStartupWarmup(...args),
+            applyFrameElementStyle: (...args) => applyFrameElementStyle(...args),
+            applyRendererPerformanceSettings: (...args) => applyRendererPerformanceSettings(...args),
+            syncEnvButtonUi: (...args) => syncEnvButtonUi(...args),
+            syncEnvironmentDisplay: (...args) => syncEnvironmentDisplay(...args),
+            syncPathTracingDofFromPostFx: (...args) => syncPathTracingDofFromPostFx(...args),
+            get bridge() { return bridge; },
+            get renderer() { return renderer; },
+            get maxjsFx() { return maxjsFx; },
+            get scene() { return scene; },
+            get camera() { return camera; },
+            get controls() { return controls; },
+            get xrRuntime() { return xrRuntime; },
+            get physicalCameraDofActive() { return physicalCameraDofActive; },
+            get defaultLights() { return defaultLights; },
+            get defaultKey() { return defaultKey; },
+            get cameraPositionWorld() { return cameraPositionWorld; },
+            get inlineClock() { return inlineClock; },
+            get layerManager() { return layerManager; },
+            get animationSystem() { return animationSystem; },
+            get gltfSystem() { return gltfSystem; },
+            get renderToImageForcePathTracing() { return renderToImageForcePathTracing; },
+            set renderToImageForcePathTracing(value) { renderToImageForcePathTracing = value; },
+            get renderToImageActive() { return renderToImageActive; },
+            set renderToImageActive(value) { renderToImageActive = value; },
+            get webglBasicFx() { return webglBasicFx; },
+            get pathTracingSettings() { return pathTracingSettings; },
+            get pendingRenderToImage() { return pendingRenderToImage; },
+            set pendingRenderToImage(value) { pendingRenderToImage = value; },
+            get latestAppliedSyncSerial() { return latestAppliedSyncSerial; },
+            get envVisible() { return envVisible; },
+            set envVisible(value) { envVisible = value; },
+            get hiddenBackgroundColor() { return hiddenBackgroundColor; },
+            get performanceSettings() { return performanceSettings; },
+            set performanceSettings(value) { performanceSettings = value; },
+            get localHdriShowBg() { return localHdriShowBg; },
+            set localHdriShowBg(value) { localHdriShowBg = value; },
+            get pathTracingFx() { return pathTracingFx; },
+        });
+        const {
+            sendCurrentCanvasRenderFile,
+            renderCurrentFrameOnce,
+            beginRenderImageFrame,
+            finishRenderImageFrame,
+        } = renderCapture;
+
+        // ── Build mode / Standalone / Debug ──
+        // buildMode / isStandalone / urlMode are initialized near perfHud (early).
+        // three.js Inspector — lazily created, gated by debug mode.
+        const passiveRendererInspector = renderer.inspector;
+        let threeInspector = null;
+        let inspectorSyncGeneration = 0;
+        function placeThreeInspectorToggle() {
+            const shell = threeInspector?.domElement;
+            const toggle = shell?.querySelector?.('#profiler-toggle');
+            const miniPanel = shell?.querySelector?.('#profiler-mini-panel');
+            if (toggle) {
+                toggle.style.top = 'auto';
+                toggle.style.right = 'auto';
+                toggle.style.bottom = '15px';
+                toggle.style.left = '15px';
+            }
+            if (miniPanel) {
+                miniPanel.style.top = 'auto';
+                miniPanel.style.right = 'auto';
+                miniPanel.style.bottom = '60px';
+                miniPanel.style.left = '15px';
+            }
+        }
+        function syncInspector() {
+            const syncGeneration = ++inspectorSyncGeneration;
+            if (debugMode && buildMode !== 'release') {
+                if (!threeInspector) {
+                    threeInspector = new Inspector();
+                    const parent = renderer.domElement.parentElement;
+                    if (parent && !threeInspector.domElement.parentElement) {
+                        parent.appendChild(threeInspector.domElement);
+                    }
+                    placeThreeInspectorToggle();
+                }
+                if (renderer.inspector !== threeInspector) renderer.inspector = threeInspector;
+                threeInspector.domElement.style.display = '';
+                placeThreeInspectorToggle();
+            } else if (threeInspector) {
+                threeInspector.domElement.style.display = 'none';
+                // Inspector.setRenderer() turns GPU timestamp tracking on. A
+                // hidden inspector used to remain attached forever, retaining
+                // its profiler work during ordinary playback and eventually
+                // exhausting WebGPU's query pool. Wait for its current async
+                // resolve before restoring the renderer's passive inspector.
+                const detachWhenIdle = () => {
+                    if (syncGeneration !== inspectorSyncGeneration ||
+                        (debugMode && buildMode !== 'release') ||
+                        renderer.inspector !== threeInspector) {
+                        return;
+                    }
+                    const pendingResolve = threeInspector._resolveTimestampPromise;
+                    if (pendingResolve?.then) {
+                        void pendingResolve.then(
+                            () => queueMicrotask(detachWhenIdle),
+                            () => queueMicrotask(detachWhenIdle),
+                        );
+                        return;
+                    }
+                    renderer.inspector = passiveRendererInspector;
+                    if (renderer.backend) renderer.backend.trackTimestamp = false;
+                };
+                queueMicrotask(detachWhenIdle);
+            }
+        }
+
+        async function restoreInteractiveBrowserState() {
+            restorePostFxState();
+            syncPostFxPanel(true, { persist: false });
+
+            const file = await restoreStashedHdri();
+            if (file && !isLocalHdriLoaded()) loadLocalHDRIFile(file, { preserveEnabled: true, persist: false });
+        }
+
+        function applyBuildMode() {
+            const hud = document.getElementById('hud');
+            const rail = document.getElementById('viewportMenu');
+            const railHandle = document.querySelector('.rail-drag-handle');
+            const dockHandle = document.querySelector('.dock-drag-handle');
+            const info = document.getElementById('info');
+            const debugBtn = document.getElementById('btnDebug');
+            // Perf HUD + sync stats: only when not in static release mode (localStorage debug alone must not cost frames).
+            perfHud.setDebugEnabled(debugMode && buildMode !== 'release');
+            if (buildMode === 'release') {
+                hud.style.display = 'none';
+                if (rail) rail.style.display = 'none';
+                if (railHandle) railHandle.style.display = 'none';
+                if (dockHandle) dockHandle.style.display = 'none';
+                return;
+            }
+            hud.style.display = '';
+            if (rail) rail.style.display = '';
+            if (railHandle) railHandle.style.display = '';
+            if (dockHandle) dockHandle.style.display = '';
+            info.style.display = debugMode ? '' : 'none';
+            debugBtn.classList.toggle('active', debugMode);
+            syncInspector();
+        }
+
+        function setDebugMode(enabled) {
+            debugMode = enabled;
+            try { localStorage.setItem(DEBUG_STORAGE_KEY, String(debugMode)); } catch {}
+            applyBuildMode();
+        }
+
+        void restoreInteractiveBrowserState();
+
+        addEventListener('focus', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true, { persist: false });
+        });
+        addEventListener('blur', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true, { persist: false });
+        });
+        document.addEventListener('visibilitychange', () => {
+            lastRenderTimestamp = 0;
+            syncPostFxPanel(true, { persist: false });
+        });
+
+        if (buildMode !== 'release') {
+            const debugBtn = document.getElementById('btnDebug');
+            debugBtn.style.display = '';
+            debugBtn.onclick = () => setDebugMode(!debugMode);
+        }
+
+        installDockDragHide();
+
+        applyBuildMode();
+
+        relayRenderFrame = renderFrame;
+        relayResetRenderTimer = () => {
+            lastRenderTimestamp = 0;
+            inlineTimer.reset();
+        };
+        if (!relayRenderingSuspended) renderer.setAnimationLoop(renderFrame);
+
+        startBridgeHandshake();

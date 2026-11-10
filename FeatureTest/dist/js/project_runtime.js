@@ -1,0 +1,1481 @@
+// project_runtime.js — file-backed Three.js project host for MaxJS.
+// Loads JS-authored layers from an external project directory without touching Max-owned sync.
+
+function normalizeWindowsPath(path) {
+    return String(path ?? '').replace(/\//g, '\\');
+}
+
+function ensureTrailingSlash(path) {
+    return path.endsWith('\\') ? path : `${path}\\`;
+}
+
+function isAbsolutePath(path) {
+    return /^[a-zA-Z]:[\\/]/.test(path) || /^\\\\/.test(path);
+}
+
+function toAssetUrl(filePath) {
+    const normalized = String(filePath ?? '').replace(/\\/g, '/');
+    const segments = normalized.split('/').filter((segment, index) => segment.length > 0 || index === 0);
+    const encoded = segments.map(segment => encodeURIComponent(segment)).join('/');
+    return `https://maxjs-assets.local/${encoded}`;
+}
+
+function toProjectRootUrl(projectDir) {
+    return `${toAssetUrl(ensureTrailingSlash(normalizeWindowsPath(projectDir)))}`;
+}
+
+function projectUrl(projectRootUrl, relativePath, versionTag = '') {
+    const base = projectRootUrl.endsWith('/') ? projectRootUrl : `${projectRootUrl}/`;
+    const url = new URL(relativePath.replace(/\\/g, '/'), base);
+    if (versionTag) url.searchParams.set('v', versionTag);
+    return url.toString();
+}
+
+function resolveFactory(moduleNamespace) {
+    const directHooks = ['init', 'update', 'dispose'].some(key => typeof moduleNamespace?.[key] === 'function');
+    if (directHooks) return async () => moduleNamespace;
+
+    const candidate = moduleNamespace?.default
+        ?? moduleNamespace?.createLayer
+        ?? moduleNamespace?.mount;
+
+    if (typeof candidate === 'function') return candidate;
+    if (candidate && typeof candidate === 'object') return async () => candidate;
+
+    throw new Error('Project module must export default/createLayer/mount or layer hooks');
+}
+
+function resolveStaticParameters(moduleNamespace) {
+    const params = moduleNamespace?.parameters ?? moduleNamespace?.params;
+    return params && typeof params === 'object' ? params : null;
+}
+
+async function fetchText(url, fetchImpl) {
+    const response = await fetchImpl(url, { cache: 'no-store' });
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+    return response.text();
+}
+
+function stableStringify(value) {
+    if (Array.isArray(value)) {
+        return `[${value.map(item => stableStringify(item)).join(',')}]`;
+    }
+    if (value && typeof value === 'object') {
+        const keys = Object.keys(value).sort();
+        return `{${keys.map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value) ?? 'null';
+}
+
+function toBase64Utf8(text) {
+    const bytes = new TextEncoder().encode(text);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+}
+
+function cloneManifest(manifest) {
+    return JSON.parse(JSON.stringify(manifest));
+}
+
+function cloneJsonValue(value) {
+    return value == null ? value : JSON.parse(JSON.stringify(value));
+}
+
+const POSTFX_SETTINGS_KEY = '__maxjsSettings';
+const RUNTIME_LAYER_PARAMS_SETTINGS_KEY = 'runtimeLayerParams';
+const RUNTIME_LAYER_PARAMS_VERSION = 1;
+const BLOCKED_RUNTIME_PARAM_KEYS = new Set(['__proto__', 'prototype', 'constructor']);
+const LAYER_SOURCE_INLINE = 'inline';
+const LAYER_SOURCE_PROJECT = 'project';
+
+function normalizedRuntimeParamKey(raw) {
+    const key = String(raw ?? '').trim();
+    return key && !BLOCKED_RUNTIME_PARAM_KEYS.has(key) ? key : '';
+}
+
+function isPersistableRuntimeParamValue(value) {
+    return typeof value === 'string'
+        || typeof value === 'boolean'
+        || (typeof value === 'number' && Number.isFinite(value));
+}
+
+function normalizeRuntimeLayerParamValues(raw) {
+    const values = {};
+    const assign = (rawName, rawValue) => {
+        const name = normalizedRuntimeParamKey(rawName);
+        if (!name) return;
+        const value = rawValue && typeof rawValue === 'object'
+            && Object.prototype.hasOwnProperty.call(rawValue, 'value')
+            ? rawValue.value
+            : rawValue;
+        if (isPersistableRuntimeParamValue(value)) values[name] = value;
+    };
+
+    if (Array.isArray(raw)) {
+        for (const entry of raw) assign(entry?.name, entry);
+    } else if (raw && typeof raw === 'object') {
+        for (const [name, value] of Object.entries(raw)) assign(name, value);
+    }
+    return values;
+}
+
+function normalizeRuntimeLayerParamStore(raw) {
+    const rawLayers = raw && typeof raw === 'object' && !Array.isArray(raw)
+        ? (raw.layers && typeof raw.layers === 'object' && !Array.isArray(raw.layers)
+            ? raw.layers
+            : raw)
+        : {};
+    const layers = {};
+    for (const [rawLayerId, rawValues] of Object.entries(rawLayers)) {
+        const layerId = normalizedRuntimeParamKey(rawLayerId);
+        if (!layerId) continue;
+        const values = normalizeRuntimeLayerParamValues(rawValues);
+        if (Object.keys(values).length > 0) layers[layerId] = values;
+    }
+    return {
+        version: RUNTIME_LAYER_PARAMS_VERSION,
+        layers,
+    };
+}
+
+function manifest404(error) {
+    return String(error?.message || error).includes('404');
+}
+
+function deriveProjectName(projectDir) {
+    const normalized = String(projectDir ?? '').replace(/[\\/]+$/, '');
+    const parts = normalized.split(/[\\/]/).filter(Boolean);
+    return parts[parts.length - 1] || 'Active Project';
+}
+
+function normalizeInlineFolder(folder) {
+    return String(folder ?? '')
+        .replace(/\\/g, '/')
+        .replace(/^\/+|\/+$/g, '');
+}
+
+function buildInlineLayerKey(rawId, folder) {
+    const cleanId = String(rawId ?? '');
+    const cleanFolder = normalizeInlineFolder(folder);
+    return cleanFolder ? `${cleanFolder}/${cleanId}` : cleanId;
+}
+
+function splitInlineLayerKey(key) {
+    const normalized = String(key ?? '').replace(/\\/g, '/');
+    const slash = normalized.lastIndexOf('/');
+    if (slash < 0) {
+        return {
+            key: normalized,
+            rawId: normalized,
+            folder: '',
+        };
+    }
+    return {
+        key: normalized,
+        rawId: normalized.slice(slash + 1),
+        folder: normalizeInlineFolder(normalized.slice(0, slash)),
+    };
+}
+
+export function createProjectRuntime({
+    layerManager,
+    bridge,
+    perfHud,
+    debugLog = () => {},
+    debugWarn = () => {},
+    fetchImpl = (...args) => fetch(...args),
+    importModule = url => import(url),
+}) {
+    let projectDir = '';
+    let projectRootUrl = '';
+    // Optional host-provided base URL for project files. When the host serves
+    // the project directory itself (e.g. the Blender add-on's same-origin
+    // /maxjs/project/files/ endpoint), it sends `rootUrl` in project_config
+    // and toProjectRootUrl() is bypassed. The 3ds Max host never sends it.
+    let projectRootUrlOverride = '';
+    let manifestBaseUrl = '';
+    let inlineDir = '';
+    let scriptFolderName = 'scripts';
+    let pollMs = 0;
+    let sceneSaved = false;
+    let manifestExists = false;
+    let transientPostFxState = null;
+    let transientStudioState = null;
+    let transientBakeState = null;
+    let transientRuntimeLayerParamsState = null;
+    let postFxState = null;
+    let settingsState = null;
+    let lastManifestText = '';
+    let lastPostFxText = '';
+    let lastSettingsText = '';
+    let lastStatus = '';
+    let timer = 0;
+    let revision = 0;
+    let pollInFlight = false;
+    /** Serializes manifest application so persist + poll reload cannot interleave mounts/removes. */
+    let manifestApplyGate = Promise.resolve();
+    /** Serializes manifest read-modify-write saves so settings cannot overwrite each other. */
+    let manifestMutationGate = Promise.resolve();
+    let settingsWriteGate = Promise.resolve();
+    const pendingManifestSettingWrites = new Map();
+    const manifestSettingsSaveWaiters = [];
+    let manifestSettingsSaveInFlight = false;
+    let manifestSettingsSaveTimer = 0;
+    const MANIFEST_SETTINGS_SAVE_DEBOUNCE_MS = 180;
+    let manifestState = null;
+    let nextRequestId = 1;
+    let suppressProjectReloadCount = 0;
+    let projectLoadTask = Promise.resolve(false);
+
+    const activeProjectLayerIds = new Set();
+    const mountedProjectLayers = new Map();
+    const inlineLayerState = new Map();
+    const listeners = new Set();
+    const pendingHostActions = new Map();
+
+    function normalizeRootUrlOption(rootUrl) {
+        if (typeof rootUrl !== 'string' || !rootUrl.trim()) return '';
+        try {
+            const absolute = new URL(rootUrl.trim(), window.location.href).toString();
+            return absolute.endsWith('/') ? absolute : `${absolute}/`;
+        } catch {
+            return '';
+        }
+    }
+
+    function resolveProjectRootUrl(dir) {
+        if (!dir) return '';
+        return projectRootUrlOverride || toProjectRootUrl(dir);
+    }
+
+    function emitChange() {
+        for (const listener of listeners) {
+            try {
+                listener();
+            } catch (error) {
+                console.error('[ProjectRuntime] listener error', error);
+            }
+        }
+    }
+
+    function extractSettingsFromPostFx(payload) {
+        const value = payload?.[POSTFX_SETTINGS_KEY];
+        return value && typeof value === 'object' ? cloneJsonValue(value) : null;
+    }
+
+function stripSettingsFromPostFx(payload) {
+    const nextPayload = cloneJsonValue(payload);
+    if (nextPayload && typeof nextPayload === 'object') {
+        delete nextPayload[POSTFX_SETTINGS_KEY];
+    }
+    return nextPayload;
+}
+
+    function hasEmbeddedSettings(payload) {
+        const value = payload?.[POSTFX_SETTINGS_KEY];
+        return !!(value && typeof value === 'object');
+    }
+
+    function subscribe(listener) {
+        listeners.add(listener);
+        return () => listeners.delete(listener);
+    }
+
+    function getRuntimeLayerParamStore() {
+        return normalizeRuntimeLayerParamStore(
+            transientRuntimeLayerParamsState
+            ?? settingsState?.[RUNTIME_LAYER_PARAMS_SETTINGS_KEY]
+            ?? manifestState?.[RUNTIME_LAYER_PARAMS_SETTINGS_KEY]
+            ?? null,
+        );
+    }
+
+    function getLegacyManifestLayerParamValues(layerId) {
+        const identity = splitInlineLayerKey(layerId);
+        const entries = Array.isArray(manifestState?.layers) ? manifestState.layers : [];
+        for (const entry of entries) {
+            if (!entry || typeof entry !== 'object') continue;
+            const rawId = String(entry.id || entry.name || '');
+            const entryKey = String(entry.key || buildInlineLayerKey(rawId, entry.folder));
+            const matches = entryKey === layerId
+                || rawId === layerId
+                || (!identity.folder && rawId === identity.rawId);
+            if (!matches) continue;
+            return normalizeRuntimeLayerParamValues(
+                entry.paramValues ?? entry.parameters ?? entry.params,
+            );
+        }
+        return {};
+    }
+
+    function getLayerParameterValues(rawLayerId) {
+        const layerId = normalizedRuntimeParamKey(rawLayerId);
+        if (!layerId) return {};
+        const legacyValues = getLegacyManifestLayerParamValues(layerId);
+        const storedValues = getRuntimeLayerParamStore().layers[layerId] ?? {};
+        return cloneJsonValue({ ...legacyValues, ...storedValues });
+    }
+
+    async function persistLayerParameterValue(rawLayerId, rawName, value) {
+        const layerId = normalizedRuntimeParamKey(rawLayerId);
+        const name = normalizedRuntimeParamKey(rawName);
+        if (!layerId || !name) {
+            throw new TypeError('Runtime layer parameter persistence requires a valid layer id and parameter name');
+        }
+        if (!isPersistableRuntimeParamValue(value)) {
+            throw new TypeError(`Runtime layer parameter "${layerId}.${name}" is not JSON-safe`);
+        }
+
+        const store = getRuntimeLayerParamStore();
+        const currentValues = store.layers[layerId] ?? {};
+        store.layers[layerId] = { ...currentValues, [name]: value };
+        return setManifestSettingState(RUNTIME_LAYER_PARAMS_SETTINGS_KEY, store);
+    }
+
+    function setStatus(message) {
+        if (message === lastStatus) return;
+        lastStatus = message;
+        const line = `max.js - ${message}`;
+        if (typeof perfHud?.setProjectBanner === 'function') {
+            perfHud.setProjectBanner(line);
+        } else {
+            perfHud?.setStatus?.(line);
+        }
+        emitChange();
+    }
+
+    function trackProjectLoad(load, label) {
+        const previous = projectLoadTask;
+        const tracked = previous
+            .catch(() => false)
+            .then(() => load())
+            .catch(error => {
+                debugWarn(`[ProjectRuntime] ${label} failed`, error);
+                return false;
+            });
+        projectLoadTask = tracked;
+        return tracked;
+    }
+
+    async function waitForLatestProjectLoad() {
+        let pending;
+        do {
+            pending = projectLoadTask;
+            await pending;
+        } while (pending !== projectLoadTask);
+    }
+
+    function clearTimer() {
+        if (!timer) return;
+        clearInterval(timer);
+        timer = 0;
+    }
+
+    function schedulePolling() {
+        clearTimer();
+        if (!projectRootUrl || !Number.isFinite(pollMs) || pollMs <= 0) return;
+        timer = setInterval(() => {
+            void reload(false);
+        }, pollMs);
+    }
+
+    function removeProjectLayer(id) {
+        try {
+            layerManager.remove(id);
+        } catch (err) {
+            debugWarn('[ProjectRuntime] layer remove failed', id, err);
+        }
+        activeProjectLayerIds.delete(id);
+        mountedProjectLayers.delete(id);
+    }
+
+    function clearProjectLayers() {
+        for (const id of [...activeProjectLayerIds]) {
+            removeProjectLayer(id);
+        }
+    }
+
+    function defaultManifest() {
+        return {
+            name: 'Active Project',
+            pollMs: 0,
+            layers: [],
+        };
+    }
+
+    function implicitMainManifest() {
+        return {
+            name: deriveProjectName(projectDir),
+            pollMs,
+            layers: [
+                {
+                    id: 'main',
+                    name: 'main',
+                    entry: 'main.js',
+                    enabled: true,
+                },
+            ],
+            __implicit: true,
+        };
+    }
+
+    function buildManifestLayers(manifest) {
+        const rawLayers = Array.isArray(manifest?.layers)
+            ? manifest.layers
+            : (manifest?.entry || manifest?.name)
+                ? [{ id: 'main', name: manifest.name || 'main', entry: manifest.entry || 'main.js', enabled: true }]
+                : [];
+
+        return rawLayers.map((entry, index) => {
+            const layerId = entry?.id || entry?.name || `layer_${index}`;
+            const name = entry?.name || layerId;
+            const entryPath = entry?.entry || entry?.path || manifest?.entry || 'main.js';
+            return {
+                id: layerId,
+                name,
+                entryPath,
+                enabled: entry?.enabled !== false,
+                raw: entry && typeof entry === 'object' ? entry : {},
+                signature: stableStringify({
+                    ...(entry && typeof entry === 'object' ? entry : {}),
+                    id: layerId,
+                    name,
+                    entry: entryPath,
+                }),
+            };
+        });
+    }
+
+    function ensureMutableLayers(manifest) {
+        if (Array.isArray(manifest.layers)) return manifest.layers;
+        manifest.layers = buildManifestLayers(manifest).map(entry => ({
+            ...(entry.raw ?? {}),
+            id: entry.id,
+            name: entry.name,
+            entry: entry.entryPath,
+            enabled: entry.enabled,
+        }));
+        delete manifest.entry;
+        return manifest.layers;
+    }
+
+    async function requestHostAction(action, data = {}) {
+        const requestId = `host_${nextRequestId++}`;
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                pendingHostActions.delete(requestId);
+                reject(new Error(`${action} timed out`));
+            }, 10000);
+
+            pendingHostActions.set(requestId, { resolve, reject, timeout, action });
+            bridge.send(action, { requestId, ...data });
+        });
+    }
+
+    bridge.on('host_action_result', msg => {
+        const pending = pendingHostActions.get(msg.requestId);
+        if (!pending) return;
+        pendingHostActions.delete(msg.requestId);
+        clearTimeout(pending.timeout);
+
+        if (msg.ok) {
+            pending.resolve(msg);
+        } else {
+            pending.reject(new Error(msg.error || `${pending.action} failed`));
+        }
+    });
+
+    async function loadManifest(force = false) {
+        if (!projectRootUrl) return null;
+
+        const manifestUrl = projectUrl(projectRootUrl, 'project.maxjs.json', `${Date.now()}`);
+        try {
+            const manifestText = await fetchText(manifestUrl, fetchImpl);
+            if (!force && manifestText === lastManifestText) return null;
+
+            const manifest = JSON.parse(manifestText);
+            lastManifestText = manifestText;
+            manifestState = manifest;
+            manifestBaseUrl = new URL('./', manifestUrl).toString();
+            manifestExists = true;
+            emitChange();
+            return manifest;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+
+            // No manifest — don't try main.js fallback (avoids console 404 noise)
+            throw error;
+        }
+    }
+
+    async function loadPostFxState(force = false) {
+        if (!projectRootUrl) {
+            postFxState = null;
+            lastPostFxText = '';
+            return false;
+        }
+
+        const postFxUrl = projectUrl(projectRootUrl, 'postfx.maxjs.json', `${Date.now()}`);
+        try {
+            const text = await fetchText(postFxUrl, fetchImpl);
+            if (!force && text === lastPostFxText) return false;
+
+            lastPostFxText = text;
+            postFxState = cloneJsonValue(JSON.parse(text));
+            emitChange();
+            return true;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+
+            lastPostFxText = '';
+            const fallback = cloneJsonValue(manifestState?.postFx ?? null);
+            const changed = stableStringify(postFxState) !== stableStringify(fallback);
+            postFxState = fallback;
+            if (changed) emitChange();
+            return changed;
+        }
+    }
+
+    async function loadSettingsState(force = false) {
+        if (!projectRootUrl) {
+            settingsState = null;
+            lastSettingsText = '';
+            return false;
+        }
+
+        const settingsUrl = projectUrl(projectRootUrl, 'settings.maxjs.json', `${Date.now()}`);
+        try {
+            const text = await fetchText(settingsUrl, fetchImpl);
+            if (!force && text === lastSettingsText) return false;
+
+            lastSettingsText = text;
+            settingsState = cloneJsonValue(JSON.parse(text));
+            emitChange();
+            return true;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+
+            lastSettingsText = '';
+            const embedded = extractSettingsFromPostFx(postFxState);
+            if (embedded) {
+                const changed = stableStringify(settingsState) !== stableStringify(embedded);
+                settingsState = embedded;
+                if (changed) emitChange();
+                if (sceneSaved && manifestExists) {
+                    void persistSettings(embedded).catch(error => {
+                        debugWarn('[ProjectRuntime] embedded settings migration failed', error);
+                    });
+                }
+                return changed;
+            }
+            const fallback = {
+                studio: cloneJsonValue(manifestState?.studio ?? null),
+                bake: cloneJsonValue(manifestState?.bake ?? null),
+                [RUNTIME_LAYER_PARAMS_SETTINGS_KEY]: cloneJsonValue(
+                    manifestState?.[RUNTIME_LAYER_PARAMS_SETTINGS_KEY] ?? null,
+                ),
+            };
+            const next = (
+                fallback.studio
+                || fallback.bake
+                || fallback[RUNTIME_LAYER_PARAMS_SETTINGS_KEY]
+            ) ? fallback : null;
+            const changed = stableStringify(settingsState) !== stableStringify(next);
+            settingsState = next;
+            if (changed) emitChange();
+            return changed;
+        }
+    }
+
+    async function mountLayer(entry, manifest) {
+        const layerId = entry.id;
+        const entryPath = entry.entryPath;
+        const moduleVersion = ++revision;
+        const baseUrl = manifestBaseUrl || projectRootUrl;
+        const moduleUrl = isAbsolutePath(entryPath)
+            ? `${toAssetUrl(entryPath)}?v=${moduleVersion}`
+            : projectUrl(baseUrl, entryPath, `${moduleVersion}`);
+
+        let moduleNamespace;
+        try {
+            moduleNamespace = await importModule(moduleUrl);
+        } catch (error) {
+            const detail = error?.message || String(error);
+            throw new Error(`layer import failed: ${layerId} (${entryPath}) -> ${detail}`);
+        }
+        const factory = resolveFactory(moduleNamespace);
+
+        const result = await layerManager.mount(
+            layerId,
+            async (ctx, THREE) => {
+                const staticParams = resolveStaticParameters(moduleNamespace);
+                if (staticParams) ctx.params.define(staticParams);
+                return factory(ctx, THREE, { manifest, layer: entry });
+            },
+            {
+                name: entry.name || layerId,
+                code: moduleUrl,
+                source: LAYER_SOURCE_PROJECT,
+                entry: entryPath,
+                paramValues: getLayerParameterValues(layerId),
+            },
+        );
+
+        if (result?.error) {
+            throw new Error(result.error);
+        }
+
+        activeProjectLayerIds.add(layerId);
+        mountedProjectLayers.set(layerId, {
+            signature: entry.signature,
+            moduleUrl,
+        });
+    }
+
+    async function applyManifest(manifest, options = {}) {
+        // Layer discovery is now driven by the C++ inline-folder scan
+        // (inline_layers_state message), not by the manifest. We keep
+        // applyManifest as a no-op for the layers field so the manifest
+        // file can still carry name/pollMs/postFx without surprising us.
+        // Drop any project-source layers from the legacy active sets so
+        // they don't shadow the inline mount path.
+        manifestState = manifest;
+        if (activeProjectLayerIds.size > 0) {
+            for (const id of [...activeProjectLayerIds]) {
+                if (!mountedInlineLayers.has(id)) removeProjectLayer(id);
+            }
+        }
+        emitChange();
+    }
+
+    async function reload(force = false) {
+        if (!projectRootUrl || pollInFlight) return false;
+        pollInFlight = true;
+        try {
+            const manifest = await loadManifest(force);
+            if (!manifest) {
+                const pfxChanged = await loadPostFxState(force);
+                const settingsChanged = await loadSettingsState(force);
+                return pfxChanged || settingsChanged;
+            }
+
+            await applyManifest(manifest, { forceReload: force });
+            await loadPostFxState(force);
+            await loadSettingsState(force);
+
+            if (Number.isFinite(manifest.pollMs) && manifest.pollMs >= 0) {
+                pollMs = manifest.pollMs;
+                schedulePolling();
+            }
+
+            setStatus(`project loaded: ${manifest.name || projectDir}`);
+            return true;
+        } catch (error) {
+            clearProjectLayers();
+            manifestState = null;
+            postFxState = null;
+            settingsState = null;
+            lastManifestText = '';
+            lastPostFxText = '';
+            lastSettingsText = '';
+            emitChange();
+
+            const is404 = manifest404(error);
+            if (is404) {
+                manifestExists = false;
+                clearTimer();
+                setStatus('no project manifest');
+            } else {
+                setStatus(`project error: ${error?.message || String(error)}`);
+                console.error('[ProjectRuntime]', error);
+            }
+            return false;
+        } finally {
+            pollInFlight = false;
+        }
+    }
+
+    async function ensureManifestLoaded() {
+        if (manifestState) return manifestState;
+        try {
+            const manifest = await loadManifest(true);
+            if (manifest) return manifest;
+        } catch (error) {
+            if (!manifest404(error)) throw error;
+        }
+
+        manifestState = defaultManifest();
+        return manifestState;
+    }
+
+    async function persistManifest(nextManifest, options = {}) {
+        const text = `${JSON.stringify(nextManifest, null, 2)}\n`;
+        // Always reload:false: we apply `nextManifest` locally below. Asking the host to
+        // SendProjectReload in parallel races with this async applyManifest (and with poll
+        // reload), overlapping layer teardown/mount and crashing WebView2.
+        await requestHostAction('project_manifest_write', {
+            contentBase64: toBase64Utf8(text),
+            reload: false,
+        });
+
+        lastManifestText = text;
+        manifestExists = true;
+        if (options.apply !== false) {
+            await applyManifest(nextManifest);
+        } else {
+            manifestState = nextManifest;
+            emitChange();
+        }
+        if (!options.silent) {
+            setStatus(`project saved: ${nextManifest.name || projectDir}`);
+        }
+        return true;
+    }
+
+    function normalizeManifestSettingValue(value) {
+        return value && typeof value === 'object' ? value : {};
+    }
+
+    function setTransientManifestSetting(section, value) {
+        if (section === 'studio') transientStudioState = cloneJsonValue(value);
+        else if (section === 'bake') transientBakeState = cloneJsonValue(value);
+        else if (section === RUNTIME_LAYER_PARAMS_SETTINGS_KEY) {
+            transientRuntimeLayerParamsState = normalizeRuntimeLayerParamStore(value);
+        }
+    }
+
+    function clearTransientManifestSetting(section) {
+        if (section === 'studio') transientStudioState = null;
+        else if (section === 'bake') transientBakeState = null;
+        else if (section === RUNTIME_LAYER_PARAMS_SETTINGS_KEY) {
+            transientRuntimeLayerParamsState = null;
+        }
+    }
+
+    function resolveManifestSettingsWaiters(error, value) {
+        const waiters = manifestSettingsSaveWaiters.splice(0);
+        for (const waiter of waiters) {
+            if (error) waiter.reject(error);
+            else waiter.resolve(value);
+        }
+    }
+
+    function scheduleManifestSettingsFlush() {
+        const promise = new Promise((resolve, reject) => {
+            manifestSettingsSaveWaiters.push({ resolve, reject });
+        });
+        clearTimeout(manifestSettingsSaveTimer);
+        manifestSettingsSaveTimer = setTimeout(() => {
+            manifestSettingsSaveTimer = 0;
+            void flushManifestSettingsNow().catch(error => {
+                debugWarn('[ProjectRuntime] settings save failed', error);
+            });
+        }, MANIFEST_SETTINGS_SAVE_DEBOUNCE_MS);
+        return promise;
+    }
+
+    async function flushManifestSettingsNow() {
+        if (manifestSettingsSaveInFlight) return;
+        manifestSettingsSaveInFlight = true;
+        clearTimeout(manifestSettingsSaveTimer);
+        manifestSettingsSaveTimer = 0;
+
+        try {
+            while (pendingManifestSettingWrites.size > 0) {
+                const writes = new Map(pendingManifestSettingWrites);
+                pendingManifestSettingWrites.clear();
+
+                const settings = cloneJsonValue(settingsState) ?? {};
+                for (const [section, value] of writes) {
+                    settings[section] = normalizeManifestSettingValue(value);
+                }
+                await persistSettings(settings);
+
+                for (const section of writes.keys()) {
+                    if (!pendingManifestSettingWrites.has(section)) {
+                        clearTransientManifestSetting(section);
+                    }
+                }
+            }
+            resolveManifestSettingsWaiters(null, true);
+        } catch (error) {
+            resolveManifestSettingsWaiters(error);
+            throw error;
+        } finally {
+            manifestSettingsSaveInFlight = false;
+            if (pendingManifestSettingWrites.size > 0) {
+                void scheduleManifestSettingsFlush().catch(error => {
+                    debugWarn('[ProjectRuntime] queued settings save failed', error);
+                });
+            }
+        }
+    }
+
+    async function writePostFxToHost(nextPayload) {
+        const cleanPayload = stripSettingsFromPostFx(nextPayload) ?? {};
+        const text = `${JSON.stringify(cleanPayload, null, 2)}\n`;
+        await requestHostAction('project_postfx_write', {
+            contentBase64: toBase64Utf8(text),
+        });
+        lastPostFxText = text;
+        postFxState = cleanPayload;
+        return cleanPayload;
+    }
+
+    async function writeSettingsToHost(nextSettings) {
+        const settingsToWrite = cloneJsonValue(nextSettings) ?? {};
+        const text = `${JSON.stringify(settingsToWrite, null, 2)}\n`;
+        await requestHostAction('project_settings_write', {
+            contentBase64: toBase64Utf8(text),
+        });
+        lastSettingsText = text;
+        settingsState = settingsToWrite;
+
+        const currentPostFx = postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null;
+        if (hasEmbeddedSettings(currentPostFx)) {
+            await writePostFxToHost(currentPostFx);
+        }
+
+        emitChange();
+        return true;
+    }
+
+    async function persistSettings(nextSettings) {
+        const settingsToWrite = cloneJsonValue(nextSettings) ?? {};
+        const writeTask = settingsWriteGate.then(
+            () => writeSettingsToHost(settingsToWrite),
+            () => writeSettingsToHost(settingsToWrite));
+        settingsWriteGate = writeTask.catch(() => {});
+        return writeTask;
+    }
+
+    async function setManifestSettingState(section, nextState) {
+        const cloned = cloneJsonValue(nextState);
+        if (!sceneSaved) {
+            setTransientManifestSetting(section, cloned);
+            emitChange();
+            return false;
+        }
+
+        const normalized = normalizeManifestSettingValue(cloned);
+        pendingManifestSettingWrites.set(section, normalized);
+        const nextSettings = cloneJsonValue(settingsState) ?? {};
+        nextSettings[section] = normalized;
+        settingsState = nextSettings;
+        clearTransientManifestSetting(section);
+        emitChange();
+        await scheduleManifestSettingsFlush();
+        return true;
+    }
+
+    async function updateManifest(mutator, options = {}) {
+        const run = async () => {
+            const manifest = cloneManifest(await ensureManifestLoaded());
+            mutator(manifest);
+            if (!Array.isArray(manifest.layers)) manifest.layers = [];
+            await persistManifest(manifest, options);
+        };
+        const task = manifestMutationGate.then(run, run);
+        manifestMutationGate = task.catch(() => {});
+        return task;
+    }
+
+    async function setLayerEnabled(id, enabled) {
+        await updateManifest(manifest => {
+            const layers = ensureMutableLayers(manifest);
+            const entry = layers.find(layer => (layer?.id || layer?.name) === id);
+            if (!entry) throw new Error(`Project layer not found: ${id}`);
+            entry.enabled = !!enabled;
+        });
+    }
+
+    // Synchronous: flip the enabled flag in the in-memory manifest state so
+    // listEntries() reflects the change immediately. Does NOT touch disk and
+    // does NOT re-run applyManifest. Caller is responsible for actually
+    // mounting/unmounting the layer. Used by the instant disable path in the
+    // panel UI.
+    function markLayerEnabled(id, enabled) {
+        if (!manifestState) return false;
+        const layers = Array.isArray(manifestState.layers) ? manifestState.layers : null;
+        if (!layers) return false;
+        const entry = layers.find(layer => (layer?.id || layer?.name) === id);
+        if (!entry) return false;
+        entry.enabled = !!enabled;
+        emitChange();
+        return true;
+    }
+
+    // Async: write the manifest to disk without re-running applyManifest.
+    // Used together with markLayerEnabled in the instant-disable path so the
+    // project file stays in sync with the runtime state.
+    async function persistLayerEnabled(id, enabled) {
+        if (!manifestState) return false;
+        const nextManifest = cloneManifest(manifestState);
+        const layers = ensureMutableLayers(nextManifest);
+        const entry = layers.find(layer => (layer?.id || layer?.name) === id);
+        if (!entry) return false;
+        entry.enabled = !!enabled;
+        // apply:false so persistManifest writes the file without re-running
+        // applyManifest — we already applied state via the direct remove.
+        await persistManifest(nextManifest, { apply: false, silent: true });
+        return true;
+    }
+
+    async function removeLayer(id) {
+        await updateManifest(manifest => {
+            const layers = ensureMutableLayers(manifest);
+            const nextLayers = layers.filter(layer => (layer?.id || layer?.name) !== id);
+            if (nextLayers.length === layers.length) {
+                throw new Error(`Project layer not found: ${id}`);
+            }
+            manifest.layers = nextLayers;
+        });
+    }
+
+    async function clearPersistedLayers() {
+        await updateManifest(manifest => {
+            manifest.layers = [];
+            delete manifest.entry;
+        });
+    }
+
+    async function removeInlineLayer(id, options = {}) {
+        const identity = splitInlineLayerKey(id);
+        await requestHostAction('inline_layer_remove', {
+            id: identity.rawId,
+            folder: options.folder ?? identity.folder,
+        });
+    }
+
+    async function setInlineLayerEnabled(id, enabled) {
+        const nextEnabled = !!enabled;
+        // Best-effort persistence — the runtime active flag is the source
+        // of visual truth, set by the caller via layerManager.setActive.
+        // We update local state immediately so the UI reflects the change
+        // even if the host action is slow or fails.
+        const identity = splitInlineLayerKey(id);
+        const current = inlineLayerState.get(identity.key) || { key: identity.key, id: identity.rawId, folder: identity.folder, name: identity.rawId };
+        inlineLayerState.set(identity.key, { ...current, enabled: nextEnabled });
+        emitChange();
+        await requestHostAction('inline_layer_set_enabled', {
+            id: identity.rawId,
+            folder: identity.folder,
+            enabled: nextEnabled,
+        });
+    }
+
+    async function clearInlineLayers() {
+        await requestHostAction('inline_layer_clear');
+    }
+
+    function getPostFxState() {
+        return stripSettingsFromPostFx(postFxState ?? transientPostFxState ?? manifestState?.postFx ?? null);
+    }
+
+    function getStudioState() {
+        return cloneJsonValue(transientStudioState ?? settingsState?.studio ?? manifestState?.studio ?? null);
+    }
+
+    function getBakeState() {
+        return cloneJsonValue(transientBakeState ?? settingsState?.bake ?? manifestState?.bake ?? null);
+    }
+
+    async function setBakeState(nextState) {
+        return setManifestSettingState('bake', nextState);
+    }
+
+    async function setStudioState(nextState) {
+        return setManifestSettingState('studio', nextState);
+    }
+
+    async function setPostFxState(nextState) {
+        const cloned = stripSettingsFromPostFx(nextState) ?? {};
+        if (!sceneSaved || !manifestExists) {
+            transientPostFxState = cloned;
+            emitChange();
+            return false;
+        }
+
+        transientPostFxState = null;
+        await writePostFxToHost(cloned);
+        emitChange();
+        return true;
+    }
+
+    async function releaseManifest() {
+        const result = await requestHostAction('project_release_manifest');
+        sceneSaved = true;
+        manifestExists = true;
+        if (typeof result?.rootUrl === 'string' && result.rootUrl.trim()) {
+            projectRootUrlOverride = normalizeRootUrlOption(result.rootUrl);
+        }
+        if (result?.path) {
+            projectDir = normalizeWindowsPath(result.path).trim();
+            projectRootUrl = resolveProjectRootUrl(projectDir);
+            inlineDir = projectDir ? ensureTrailingSlash(`${projectDir}\\scripts`) : '';
+            scriptFolderName = 'scripts';
+        }
+        emitChange();
+        await reload(true);
+        if (transientPostFxState != null) {
+            await setPostFxState(transientPostFxState);
+        }
+        if (transientStudioState != null) {
+            await setStudioState(transientStudioState);
+        }
+        if (transientBakeState != null) {
+            await setBakeState(transientBakeState);
+        }
+        if (transientRuntimeLayerParamsState != null) {
+            await setManifestSettingState(
+                RUNTIME_LAYER_PARAMS_SETTINGS_KEY,
+                transientRuntimeLayerParamsState,
+            );
+        }
+        return true;
+    }
+
+    function listEntries() {
+        // Layer list is the union of everything the C++ inline-folder scan
+        // told us about. Each entry's enabled state is the layer's RUNTIME
+        // active flag (live truth), with a fallback to the scan flag when
+        // the layer hasn't been mounted yet (e.g. .js.disabled file).
+        const runtimeLayers = new Map(layerManager.list().map(layer => [layer.id, layer]));
+        const out = [];
+        for (const [key, state] of inlineLayerState.entries()) {
+            const runtime = runtimeLayers.get(key);
+            const mounted = mountedInlineLayers.has(key);
+            const enabled = mounted ? !!runtime?.active : state.enabled;
+            const folder = runtime?.folder ?? state.folder ?? '';
+            const priority = Number.isFinite(runtime?.priority)
+                ? runtime.priority
+                : Number.isFinite(state.priority) ? state.priority : 100;
+            out.push({
+                id: key,
+                rawId: state.id || splitInlineLayerKey(key).rawId,
+                name: runtime?.name || state.name || state.id || key,
+                entry: inlineEntryRelPath(state.id || splitInlineLayerKey(key).rawId, folder),
+                source: LAYER_SOURCE_INLINE,
+                persisted: true,
+                folder,
+                priority,
+                enabled,
+                active: !!runtime?.active,
+                loading: !!runtime?.loading,
+                error: runtime?.error ?? null,
+                parameters: runtime?.parameters ?? [],
+                anchors: runtime?.anchors ?? 0,
+                tracked: runtime?.tracked ?? 0,
+                profile: runtime?.profile ?? null,
+            });
+        }
+        out.sort((a, b) => {
+            if (a.priority !== b.priority) return a.priority - b.priority;
+            if (a.folder !== b.folder) return a.folder.localeCompare(b.folder);
+            return a.name.localeCompare(b.name);
+        });
+        return out;
+    }
+
+    function listInlineEntries() {
+        const runtimeLayers = new Map(
+            layerManager.list()
+                .filter(layer => layer.source === LAYER_SOURCE_INLINE)
+                .map(layer => [layer.id, layer]),
+        );
+
+        const entries = [];
+        for (const [key, state] of inlineLayerState.entries()) {
+            const runtime = runtimeLayers.get(key);
+            runtimeLayers.delete(key);
+            entries.push({
+                id: key,
+                rawId: state.id || splitInlineLayerKey(key).rawId,
+                name: runtime?.name || state.name || state.id || key,
+                source: LAYER_SOURCE_INLINE,
+                persisted: true,
+                enabled: state.enabled !== false,
+                active: runtime?.active ?? false,
+                loading: runtime?.loading ?? false,
+                error: runtime?.error ?? null,
+                parameters: runtime?.parameters ?? [],
+                anchors: runtime?.anchors ?? 0,
+                tracked: runtime?.tracked ?? 0,
+                profile: runtime?.profile ?? null,
+                folder: runtime?.folder ?? state.folder ?? '',
+                priority: Number.isFinite(runtime?.priority)
+                    ? runtime.priority
+                    : Number.isFinite(state.priority) ? state.priority : 100,
+            });
+        }
+
+        for (const runtime of runtimeLayers.values()) {
+            entries.push({
+                id: runtime.id,
+                name: runtime.name || runtime.id,
+                source: LAYER_SOURCE_INLINE,
+                persisted: false,
+                enabled: true,
+                active: runtime.active ?? true,
+                loading: runtime.loading ?? false,
+                error: runtime.error ?? null,
+                parameters: runtime.parameters ?? [],
+                anchors: runtime.anchors ?? 0,
+                tracked: runtime.tracked ?? 0,
+                profile: runtime.profile ?? null,
+            });
+        }
+
+        return entries;
+    }
+
+    async function setProjectDirectory(nextDir, options = {}) {
+        const normalized = normalizeWindowsPath(nextDir).trim();
+        const projectChanged = normalized !== projectDir;
+        projectDir = normalized;
+        if ('rootUrl' in options) {
+            projectRootUrlOverride = normalizeRootUrlOption(options.rootUrl);
+        }
+        projectRootUrl = resolveProjectRootUrl(normalized);
+        if (typeof options.inlineDir === 'string') {
+            inlineDir = normalizeWindowsPath(options.inlineDir).trim();
+        }
+        if (typeof options.scriptFolder === 'string' && options.scriptFolder) {
+            scriptFolderName = options.scriptFolder.toLowerCase() === 'inlines' ? 'inlines' : 'scripts';
+        } else if (inlineDir) {
+            const tail = inlineDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop()?.toLowerCase();
+            scriptFolderName = tail === 'inlines' ? 'inlines' : 'scripts';
+        }
+        if (typeof options.sceneSaved === 'boolean') {
+            sceneSaved = options.sceneSaved;
+        }
+        if (typeof options.manifestExists === 'boolean') {
+            manifestExists = options.manifestExists;
+        }
+        if (Number.isFinite(options.pollMs) && options.pollMs >= 0) {
+            pollMs = options.pollMs;
+        }
+
+        manifestState = null;
+        manifestBaseUrl = '';
+        postFxState = null;
+        settingsState = null;
+        lastSettingsText = '';
+        lastManifestText = '';
+        lastPostFxText = '';
+        if (projectChanged) clearProjectLayers();
+        if (projectChanged) transientPostFxState = null;
+        if (projectChanged) transientStudioState = null;
+        if (projectChanged) transientBakeState = null;
+        if (projectChanged) transientRuntimeLayerParamsState = null;
+        schedulePolling();
+        emitChange();
+
+        if (!projectRootUrl) {
+            clearProjectLayers();
+            setStatus('project runtime idle');
+            return false;
+        }
+
+        return reload(true);
+    }
+
+    bridge.on('project_config', msg => {
+        void trackProjectLoad(
+            () => setProjectDirectory(msg.dir || '', {
+                pollMs: msg.pollMs,
+                inlineDir: msg.inlineDir || '',
+                scriptFolder: msg.scriptFolder || '',
+                sceneSaved: msg.sceneSaved === true,
+                manifestExists: msg.manifestExists === true,
+                rootUrl: typeof msg.rootUrl === 'string' ? msg.rootUrl : '',
+            }),
+            'project config load',
+        );
+    });
+
+    bridge.on('project_reload', () => {
+        if (suppressProjectReloadCount > 0) {
+            suppressProjectReloadCount -= 1;
+            return;
+        }
+        void trackProjectLoad(() => reload(true), 'project reload');
+    });
+
+    // Auto-mount layers discovered by the host scanning the scripts/ folder.
+    // No manifest entry needed — drop a .js into scripts/ and it loads.
+    // Each call to inline_layers_state is the full current state of the
+    // folder; we mount what's new, drop what's gone, and apply the
+    // enabled flag as a runtime active state on what stays.
+    const mountedInlineLayers = new Map(); // id -> { signature, moduleUrl }
+
+    // Hosts that serve the project directory over HTTP announce it with
+    // project_config.rootUrl (the Blender add-on); the 3ds Max WebView2 host
+    // omits it and keeps the virtual-host mapping. The manifest, settings and
+    // postfx already honour it via projectUrl(), and per HOST_CONTRACT.md
+    // scripts/*.js must too — a maxjs-assets.local URL derived from the absolute
+    // inlineDir only resolves inside WebView2, so elsewhere the import 404s and
+    // the layer silently stays unmounted. With no override this returns exactly
+    // what toAssetUrl(inlineDir) always did, leaving the Max path untouched.
+    function inlineBaseUrl() {
+        if (!inlineDir) return null;
+        return projectRootUrlOverride
+            ? projectUrl(projectRootUrl, `${scriptFolderName}/`)
+            : toAssetUrl(inlineDir);
+    }
+
+    function inlineLayerUrl(id, version) {
+        const baseUrl = inlineBaseUrl();
+        if (!baseUrl) return null;
+        const sep = baseUrl.endsWith('/') ? '' : '/';
+        return `${baseUrl}${sep}${encodeURIComponent(id)}.js?v=${version}`;
+    }
+
+    function inlineEntryRelPath(id, folder) {
+        const f = folder ? `${folder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '')}/` : '';
+        return `${scriptFolderName}/${f}${id}.js`;
+    }
+
+    function inlineLayerUrlWithFolder(id, folder, version) {
+        const baseUrl = inlineBaseUrl();
+        if (!baseUrl) return null;
+        const sep = baseUrl.endsWith('/') ? '' : '/';
+        const f = folder ? `${folder.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '').split('/').map(encodeURIComponent).join('/')}/` : '';
+        return `${baseUrl}${sep}${f}${encodeURIComponent(id)}.js?v=${version}`;
+    }
+
+    async function mountInlineLayer(key, rawId, name, meta = {}) {
+        const moduleVersion = ++revision;
+        const folder = typeof meta.folder === 'string' ? meta.folder : '';
+        const priority = Number.isFinite(meta.priority) ? meta.priority : 100;
+        const signature = String(meta.signature || '');
+        const moduleUrl = inlineLayerUrlWithFolder(rawId, folder, moduleVersion) || inlineLayerUrl(rawId, moduleVersion);
+        if (!moduleUrl) throw new Error(`No scripts directory configured for ${rawId}`);
+
+        let moduleNamespace;
+        try {
+            moduleNamespace = await importModule(moduleUrl);
+        } catch (error) {
+            const detail = error?.message || String(error);
+            throw new Error(`runtime script import failed: ${rawId} -> ${detail}`);
+        }
+        const factory = resolveFactory(moduleNamespace);
+
+        const result = await layerManager.mount(
+            key,
+            async (ctx, THREE) => {
+                const staticParams = resolveStaticParameters(moduleNamespace);
+                if (staticParams) ctx.params.define(staticParams);
+                return factory(ctx, THREE, {
+                    layer: {
+                        id: key,
+                        baseId: rawId,
+                        name,
+                        folder,
+                        priority,
+                    },
+                });
+            },
+            {
+                name: name || rawId,
+                code: moduleUrl,
+                source: LAYER_SOURCE_INLINE,
+                entry: inlineEntryRelPath(rawId, folder),
+                folder,
+                priority,
+                paramValues: getLayerParameterValues(key),
+            },
+        );
+        if (result?.error) throw new Error(result.error);
+
+        mountedInlineLayers.set(key, { moduleUrl, folder, priority, signature });
+    }
+
+    function unmountInlineLayer(key) {
+        try { layerManager.remove(key); }
+        catch (err) { debugWarn('[ProjectRuntime] inline unmount failed', key, err); }
+        mountedInlineLayers.delete(key);
+    }
+
+    bridge.on('inline_layers_state', async msg => {
+        // project_config and inline_layers_state are consecutive native messages.
+        // Wait for project settings before mounting so restart-time parameter
+        // values are available to the layer factory on its first invocation.
+        await waitForLatestProjectLoad();
+        if (msg?.folderName === 'inlines' || msg?.folderName === 'scripts') {
+            scriptFolderName = msg.folderName;
+        }
+        const layersRaw = Array.isArray(msg?.layers) ? msg.layers : [];
+        const scanStamp = String(msg?.stamp || '');
+        // Augment with folder/priority and sort. C++ scanner emits these; older builds
+        // without them fall through to ('', 100, alpha) which reproduces the pre-upgrade order.
+        const layers = layersRaw
+            .filter(l => l?.id)
+            .map((l, originalIndex) => ({
+                id: String(l.id),
+                key: String(l.key || buildInlineLayerKey(l.id, l.folder)),
+                name: l.name || l.id,
+                enabled: l.enabled !== false,
+                folder: normalizeInlineFolder(l.folder),
+                stamp: String(l.stamp || ''),
+                priority: Number.isFinite(Number(l.priority)) ? Number(l.priority) : 100,
+                originalIndex,
+            }))
+            .map(layer => ({
+                ...layer,
+                signature: [
+                    layer.id,
+                    layer.name,
+                    layer.folder,
+                    layer.priority,
+                    layer.enabled ? 1 : 0,
+                    layer.stamp,
+                    scanStamp,
+                ].join('|'),
+            }))
+            .sort((a, b) => {
+                if (a.priority !== b.priority) return a.priority - b.priority;
+                if (a.folder !== b.folder) return a.folder.localeCompare(b.folder);
+                return a.name.localeCompare(b.name);
+            });
+
+        debugLog('[ProjectRuntime] inline_layers_state', {
+            inlineDir,
+            layerCount: layers.length,
+            layers: layers.map(l => ({ key: l.key, id: l.id, enabled: l.enabled, folder: l.folder, priority: l.priority })),
+        });
+
+        inlineLayerState.clear();
+        const seen = new Set();
+        for (const layer of layers) {
+            seen.add(layer.key);
+            inlineLayerState.set(layer.key, {
+                key: layer.key,
+                id: layer.id,
+                name: layer.name,
+                enabled: layer.enabled,
+                folder: layer.folder,
+                stamp: layer.stamp,
+                scanStamp,
+                signature: layer.signature,
+                priority: layer.priority,
+            });
+        }
+
+        // Drop layers whose files vanished from the folder.
+        for (const id of [...mountedInlineLayers.keys()]) {
+            if (!seen.has(id)) unmountInlineLayer(id);
+        }
+
+        // Mount whatever's new (in priority order). Skip disabled layers — file is
+        // renamed to .js.disabled and the URL would 404. Re-enable happens via
+        // rename host action which triggers a fresh inline_layers_state.
+        for (const layer of layers) {
+            if (layer.enabled === false) {
+                if (mountedInlineLayers.has(layer.key)) unmountInlineLayer(layer.key);
+                continue;
+            }
+            const mounted = mountedInlineLayers.get(layer.key);
+            if (!mounted) {
+                try {
+                    await mountInlineLayer(layer.key, layer.id, layer.name, {
+                        folder: layer.folder,
+                        priority: layer.priority,
+                        signature: layer.signature,
+                    });
+                    debugLog('[ProjectRuntime] mounted inline layer', layer.key);
+                } catch (err) {
+                    debugWarn('[ProjectRuntime] inline mount failed', layer.key, err);
+                }
+            } else if (mounted.signature !== layer.signature) {
+                unmountInlineLayer(layer.key);
+                try {
+                    await mountInlineLayer(layer.key, layer.id, layer.name, {
+                        folder: layer.folder,
+                        priority: layer.priority,
+                        signature: layer.signature,
+                    });
+                    debugLog('[ProjectRuntime] reloaded inline layer', layer.key);
+                } catch (err) {
+                    debugWarn('[ProjectRuntime] inline reload failed', layer.key, err);
+                }
+            }
+            // Apply the enabled flag as a runtime active state. For layers
+            // already mounted, this is just a flag flip — no remount.
+            layerManager.setActive?.(layer.key, true);
+        }
+
+        emitChange();
+    });
+
+    return {
+        subscribe,
+        listEntries,
+        listInlineEntries,
+        setLayerEnabled,
+        markLayerEnabled,
+        persistLayerEnabled,
+        removeLayer,
+        clearPersistedLayers,
+        setInlineLayerEnabled,
+        removeInlineLayer,
+        clearInlineLayers,
+        getPostFxState,
+        setPostFxState,
+        getStudioState,
+        setStudioState,
+        getBakeState,
+        setBakeState,
+        getLayerParameterValues,
+        persistLayerParameterValue,
+        releaseManifest,
+        setProjectDirectory,
+        reload,
+        clear() {
+            clearTimer();
+            clearProjectLayers();
+            manifestState = null;
+            settingsState = null;
+            lastSettingsText = '';
+            lastManifestText = '';
+            transientStudioState = null;
+            transientBakeState = null;
+            transientRuntimeLayerParamsState = null;
+            projectDir = '';
+            projectRootUrl = '';
+            projectRootUrlOverride = '';
+            manifestBaseUrl = '';
+            inlineDir = '';
+            scriptFolderName = 'scripts';
+            sceneSaved = false;
+            manifestExists = false;
+            projectLoadTask = Promise.resolve(false);
+            emitChange();
+            setStatus('project runtime cleared');
+        },
+        getState() {
+            return {
+                projectDir,
+                projectRootUrl,
+                inlineDir,
+                scriptFolderName,
+                pollMs,
+                sceneSaved,
+                manifestExists,
+                activeLayers: layerManager.list().filter(layer => layer.active).map(layer => layer.id),
+                activeInlineLayers: Array.from(mountedInlineLayers.keys()),
+                activeProjectLayers: Array.from(activeProjectLayerIds),
+                manifest: manifestState,
+                studio: getStudioState(),
+                bake: getBakeState(),
+                runtimeLayerParams: getRuntimeLayerParamStore(),
+            };
+        },
+    };
+}

@@ -1,0 +1,276 @@
+// Max → JS timeline oracle.
+//
+// Read-only surface for JS-side code (inline layers, project layers, TSL
+// entry points, HTML overlays, Canvas panel DOM) to know what time Max is
+// at. Does NOT drive authored-animation scene sync — that goes through the
+// existing delta transform/light/material pipeline. Purely a time scalar
+// that consumers can key their own generative motion to.
+//
+// Two modes:
+//  - Live Max: C++ packs an UpdateTime command into every delta_bin frame.
+//    onTime() is fed from the protocol decoder. now() extrapolates between
+//    pushes during playback so RAF-rate reads are smooth even when Max
+//    pushes at 30 or 24 Hz.
+//  - Standalone snapshot: no Max. initStandalone() kicks a local RAF clock
+//    so ctx.maxTime has the same API shape for exported viewers.
+
+const TICKS_PER_SECOND = 4800; // Max TimeValue unit.
+
+const state = {
+    ticks: 0,
+    tpf: 160,            // ticks per frame (Max default at 30fps)
+    fps: 30,
+    seconds: 0,
+    frame: 0,
+    playing: false,
+    source: 'none',      // 'live' | 'standalone' | 'none'
+    // Extrapolation anchors
+    _lastPushSeconds: 0,
+    _lastPushMono: 0,
+    // Timeline ACTIVITY stamp — decoupled from the extrapolation anchor
+    // above. Max re-pushes unchanged time with every sync burst (object and
+    // light edits, viewport redraws); _lastPushMono must keep moving for
+    // drift-snap, but only genuine motion (time change, play/pause flip,
+    // playback) may count as interaction, or every light drag pins the GI
+    // at its slashed post-interaction ray budget with light refresh held.
+    _lastActivityMono: 0,
+    // Geometry packets can trail the authored time packet while native
+    // deformation drains in bounded batches. GI uses the newer of the two so
+    // it cannot wake before the exact settle-normal packet arrives.
+    _lastSceneSyncMono: 0,
+    // Standalone mode bookkeeping
+    _standaloneRaf: 0,
+    _standaloneStartMono: 0,
+    _standaloneStartSeconds: 0,
+};
+
+const listeners = {
+    change: new Set(),
+    play: new Set(),
+    pause: new Set(),
+};
+let liveChangeRaf = 0;
+const liveTransitionQueue = [];
+
+function emit(event, eventSnapshot = snapshot()) {
+    const set = listeners[event];
+    if (!set) return;
+    for (const fn of set) {
+        try { fn(eventSnapshot); } catch (err) { console.warn('[maxTimeline] listener threw:', err); }
+    }
+}
+
+function flushLiveMailbox() {
+    liveChangeRaf = 0;
+    const transitions = liveTransitionQueue.splice(0);
+    for (const transition of transitions) {
+        emit(transition.event, transition.snapshot);
+    }
+    emit('change');
+}
+
+function emitChange(options = {}) {
+    const defer = options.defer === true;
+    if (defer && typeof requestAnimationFrame === 'function') {
+        if (liveChangeRaf) return;
+        liveChangeRaf = requestAnimationFrame(flushLiveMailbox);
+        return;
+    }
+    if (liveChangeRaf && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(liveChangeRaf);
+        liveChangeRaf = 0;
+    }
+    flushLiveMailbox();
+}
+
+function snapshot() {
+    return {
+        ticks: state.ticks,
+        fps: state.fps,
+        seconds: state.seconds,
+        frame: state.frame,
+        playing: state.playing,
+        source: state.source,
+    };
+}
+
+// Called by the protocol decoder for every UpdateTime command.
+function onTime({ ticks, tpf, stateFlags }) {
+    if (state.source !== 'live') state.source = 'live';
+    if (state._standaloneRaf) {
+        cancelAnimationFrame(state._standaloneRaf);
+        state._standaloneRaf = 0;
+    }
+
+    const wasPlaying = state.playing;
+    const nextPlaying = (stateFlags & 0x01) !== 0;
+    const safeTpf = tpf > 0 ? tpf : state.tpf;
+    const seconds = ticks / TICKS_PER_SECOND;
+    const fps = TICKS_PER_SECOND / safeTpf;
+    const frame = Math.round(ticks / safeTpf);
+
+    // Drift-snap: if we were extrapolating during playback and the
+    // authoritative value is off by more than 1.5 frames, trust it
+    // immediately rather than waiting for extrapolation to catch up.
+    if (wasPlaying && nextPlaying) {
+        const nowMono = performance.now();
+        const projected = state._lastPushSeconds + (nowMono - state._lastPushMono) / 1000;
+        const driftFrames = Math.abs(projected - seconds) * fps;
+        if (driftFrames < 1.5) {
+            // Within tolerance — converge toward the native clock instead of
+            // snapping the extrapolated value on every packet. Native Max
+            // messages are not perfectly cadence-stable under UI load, and
+            // hard-resetting here shows up as micro-jumps in timeline-driven
+            // layers even when the authoritative time is only a fraction of a
+            // frame away.
+            state._lastPushSeconds = projected + (seconds - projected) * 0.2;
+            state._lastPushMono = nowMono;
+        } else {
+            state._lastPushSeconds = seconds;
+            state._lastPushMono = nowMono;
+        }
+    } else {
+        state._lastPushSeconds = seconds;
+        state._lastPushMono = performance.now();
+    }
+
+    if (nextPlaying || nextPlaying !== wasPlaying || ticks !== state.ticks) {
+        state._lastActivityMono = performance.now();
+    }
+
+    state.ticks = ticks;
+    state.tpf = safeTpf;
+    state.fps = fps;
+    state.seconds = seconds;
+    state.frame = frame;
+    state.playing = nextPlaying;
+
+    if (!wasPlaying && nextPlaying) {
+        liveTransitionQueue.push({ event: 'play', snapshot: snapshot() });
+    } else if (wasPlaying && !nextPlaying) {
+        liveTransitionQueue.push({ event: 'pause', snapshot: snapshot() });
+    }
+
+    // Keep the authoritative state synchronous, but bound arbitrary layer/UI
+    // subscribers to one notification mailbox per animation frame for
+    // playback, paused scrub, frame-step, and stop alike. Transition snapshots
+    // retain play/pause ordering even when both arrive within the same frame.
+    emitChange({ defer: true });
+}
+
+// Current seconds with sub-frame extrapolation during playback.
+// During scrub / pause the authoritative push value is returned raw so
+// there's no perceptible drift while scrubbing.
+function now() {
+    if (!state.playing) return state.seconds;
+    const elapsed = (performance.now() - state._lastPushMono) / 1000;
+    return state._lastPushSeconds + elapsed;
+}
+
+function currentFrame() {
+    if (!state.playing) return state.frame;
+    return Math.round(now() * state.fps);
+}
+
+function fps() { return state.fps; }
+function playing() { return state.playing; }
+function getSource() { return state.source; }
+function noteSceneSync() { state._lastSceneSyncMono = performance.now(); }
+function lastUpdateMs() { return Math.max(state._lastActivityMono, state._lastSceneSyncMono); }
+
+function on(event, fn) {
+    const set = listeners[event];
+    if (!set) return () => {};
+    set.add(fn);
+    return () => set.delete(fn);
+}
+
+// Standalone snapshot viewer: no Max, tick a local clock with the same API.
+// Accepts { fps, startFrame, endFrame, defaultPlaying } from snapshot.json.
+function initStandalone(options = {}) {
+    state.source = 'standalone';
+    const sfps = Number.isFinite(options.fps) && options.fps > 0 ? options.fps : 30;
+    state.fps = sfps;
+    state.tpf = TICKS_PER_SECOND / sfps;
+    const startFrame = Number.isFinite(options.startFrame) ? options.startFrame : 0;
+    state.frame = startFrame;
+    state.seconds = startFrame / sfps;
+    state.ticks = Math.round(state.seconds * TICKS_PER_SECOND);
+    const wantsPlay = options.defaultPlaying !== false;
+    state.playing = !!wantsPlay;
+    state._standaloneStartMono = performance.now();
+    state._standaloneStartSeconds = state.seconds;
+    state._lastPushSeconds = state.seconds;
+    state._lastPushMono = state._standaloneStartMono;
+
+    if (state._standaloneRaf) cancelAnimationFrame(state._standaloneRaf);
+    const tick = () => {
+        if (state.source !== 'standalone') return;
+        if (state.playing) {
+            const elapsed = (performance.now() - state._standaloneStartMono) / 1000;
+            state.seconds = state._standaloneStartSeconds + elapsed;
+            state.frame = Math.round(state.seconds * state.fps);
+            state.ticks = Math.round(state.seconds * TICKS_PER_SECOND);
+            state._lastPushSeconds = state.seconds;
+            state._lastPushMono = performance.now();
+            state._lastActivityMono = state._lastPushMono;
+            emitChange();
+        }
+        state._standaloneRaf = requestAnimationFrame(tick);
+    };
+    state._standaloneRaf = requestAnimationFrame(tick);
+    emitChange();
+    if (wantsPlay) emit('play');
+}
+
+function standalonePlay() {
+    if (state.source !== 'standalone') return;
+    if (state.playing) return;
+    state._standaloneStartMono = performance.now();
+    state._standaloneStartSeconds = state.seconds;
+    state.playing = true;
+    state._lastActivityMono = state._standaloneStartMono;
+    emit('play');
+    emitChange();
+}
+
+function standalonePause() {
+    if (state.source !== 'standalone') return;
+    if (!state.playing) return;
+    state.playing = false;
+    state._lastActivityMono = performance.now();
+    emit('pause');
+    emitChange();
+}
+
+function standaloneSeek(seconds) {
+    if (state.source !== 'standalone') return;
+    state.seconds = Math.max(0, seconds);
+    state.frame = Math.round(state.seconds * state.fps);
+    state.ticks = Math.round(state.seconds * TICKS_PER_SECOND);
+    state._standaloneStartMono = performance.now();
+    state._standaloneStartSeconds = state.seconds;
+    state._lastPushSeconds = state.seconds;
+    state._lastPushMono = state._standaloneStartMono;
+    state._lastActivityMono = state._standaloneStartMono;
+    emitChange();
+}
+
+export const maxTimeline = {
+    onTime,
+    now,
+    frame: currentFrame,
+    fps,
+    playing,
+    noteSceneSync,
+    lastUpdateMs,
+    source: getSource,
+    on,
+    initStandalone,
+    standalonePlay,
+    standalonePause,
+    standaloneSeek,
+    snapshot,
+};
+
+export default maxTimeline;

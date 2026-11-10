@@ -1,0 +1,464 @@
+// Standalone snapshot post-FX wrapper. Dynamic-imports ONLY the enabled
+// effect descriptors (snapshot.json → runtimeFeatures.post_fx) and runs them
+// through the same fx/core.js frame graph as the editor — structural 1:1
+// parity with maxjs_fx.js. Final-stylize stages replay through the same
+// shared modules the editor uses:
+//   - 'powershot' → fx/final/powershot.js (TSL ISP, fully offline)
+//   - 'shaderLab' → fx/final/shaderlab.js + shader_lab_fx.js (React +
+//     @basementstudio/shader-lab from esm.sh — needs network; falls back to
+//     no-FX gracefully when offline)
+// Editor-only concerns that never replay here: clone overlay, UI setters.
+// colorGrading flows through applySnapshotCoreLook in snapshot_boot.js,
+// except when PowerShot is active (it grades its own output, matching the
+// editor's syncCanvasColorGrading behavior).
+import * as THREE from 'three';
+import { createFxCore } from './fx/core.js';
+import { loadEffects } from './fx/loader.js';
+
+// post_fx ids that are not TSL composite descriptors. 'clone' is a CPU
+// overlay with no snapshot module (outline only, future).
+const FINAL_STAGE_IDS = new Set(['powershot', 'shaderLab']);
+const SKIPPED_IDS = new Set(['clone']);
+
+function cloneEffectDefaults(defaults = {}) {
+    const copy = {};
+    for (const [key, value] of Object.entries(defaults)) {
+        copy[key] = Array.isArray(value) ? [...value] : value;
+    }
+    return copy;
+}
+
+export async function createSnapshotFx({
+    renderer,
+    scene,
+    camera,
+    postFx = [],
+    backendLabel = '',
+    environmentVisible = true,
+}) {
+    const supportsScreenSpaceEffects = backendLabel === 'WebGPU' || backendLabel === 'TSL_GL';
+    const descriptorIds = postFx.filter((id) => !FINAL_STAGE_IDS.has(id) && !SKIPPED_IDS.has(id));
+    const wantsPowerShot = postFx.includes('powershot');
+    const wantsShaderLab = postFx.includes('shaderLab');
+
+    const descriptors = await loadEffects(descriptorIds);
+
+    const descriptorDefaults = new Map();
+    const state = {};
+    for (const descriptor of descriptors) {
+        const defaults = cloneEffectDefaults(descriptor.defaults);
+        descriptorDefaults.set(descriptor.id, defaults);
+        state[descriptor.id] = cloneEffectDefaults(defaults);
+    }
+    const powerShotDefaults = Object.freeze({
+        enabled: false,
+        mode: 'digital',
+        preset: 'powershot',
+        freezeNoise: false,
+    });
+    state.powershot = { ...powerShotDefaults };
+
+    let mainLight = null;
+    let envVisible = environmentVisible !== false;
+    let resolutionScale = 1.0;
+    let shaderLabFx = null;
+    let shaderLabFinal = null;
+    let powerShotFinal = null;
+    let powerShotNirBands = false; // applied once the final stage exists
+
+    function isShaderLabEnabled() {
+        return !!shaderLabFinal?.isEnabled();
+    }
+
+    const core = createFxCore({
+        renderer,
+        scene,
+        descriptors,
+        state,
+        getCamera: () => camera,
+        getMainLight: () => mainLight,
+        supportsScreenSpaceEffects,
+        isShaderLabEnabled,
+        getResolutionScale: () => resolutionScale,
+    });
+
+    // Final-stylize stages — same shared modules the editor facade uses.
+    // Solar Flares sun: tagged layer light first, then any lit directional,
+    // then the contact-shadow mainLight (same policy as the editor facade).
+    let flareSun = null;
+    let flareSunScanIn = 0;
+    function findFlareSun() {
+        if (--flareSunScanIn > 0 && flareSun?.parent) return flareSun;
+        flareSunScanIn = 30;
+        let tagged = null;
+        let lit = null;
+        scene.traverse((obj) => {
+            if (!obj.isDirectionalLight) return;
+            if (!tagged && obj.userData?.solarFlareSun === true) tagged = obj;
+            if (!lit && obj.intensity > 0) lit = obj;
+        });
+        flareSun = tagged || lit || mainLight;
+        return flareSun;
+    }
+
+    if (wantsPowerShot && supportsScreenSpaceEffects) {
+        try {
+            const { createPowerShotFinal } = await import('./fx/final/powershot.js');
+            powerShotFinal = createPowerShotFinal({
+                renderer,
+                getOptions: () => state.powershot,
+                getScaledPostFxSize: core.getScaledPostFxSize,
+                supportsScreenSpaceEffects,
+                isShaderLabEnabled,
+                getCamera: () => camera,
+                getSun: findFlareSun,
+                getDepthTexture: () => (pipelineReady
+                    ? core.ctx.scenePass?.getTexture?.('depth') || null
+                    : null),
+            });
+            powerShotFinal.setNirBands(powerShotNirBands);
+        } catch (error) {
+            console.warn('[snapshot_fx] PowerShot module init failed', error);
+        }
+    }
+    if (wantsShaderLab && supportsScreenSpaceEffects) {
+        try {
+            const [{ createShaderLabFinal }, { createShaderLabFx }] = await Promise.all([
+                import('./fx/final/shaderlab.js'),
+                import('./shader_lab_fx.js'),
+            ]);
+            shaderLabFx = createShaderLabFx({ THREE, renderer, scene, camera });
+            shaderLabFinal = createShaderLabFinal({
+                renderer,
+                getShaderLabFx: () => shaderLabFx,
+                getScaledPostFxSize: core.getScaledPostFxSize,
+                supportsScreenSpaceEffects,
+            });
+        } catch (error) {
+            console.warn('[snapshot_fx] Shader Lab module init failed', error);
+        }
+    }
+
+    let pipelineReady = false;
+    let restored = false;
+    let disposed = false;
+    let lastWidth = 0;
+    let lastHeight = 0;
+    let lastPixelRatio = 1;
+
+    const drawBufferSize = new THREE.Vector2();
+
+    function readDrawBufferSize() {
+        if (typeof renderer.getDrawingBufferSize === 'function') {
+            return renderer.getDrawingBufferSize(drawBufferSize);
+        }
+        return renderer.getSize(drawBufferSize);
+    }
+
+    function snapshotRendererSize() {
+        readDrawBufferSize();
+        lastWidth = drawBufferSize.x;
+        lastHeight = drawBufferSize.y;
+        lastPixelRatio = Number.isFinite(renderer.getPixelRatio?.()) ? renderer.getPixelRatio() : 1;
+    }
+
+    function rendererSizeChanged() {
+        readDrawBufferSize();
+        const pixelRatio = Number.isFinite(renderer.getPixelRatio?.()) ? renderer.getPixelRatio() : 1;
+        return drawBufferSize.x !== lastWidth
+            || drawBufferSize.y !== lastHeight
+            || Math.abs(pixelRatio - lastPixelRatio) > 1.0e-6;
+    }
+
+    function findMainLight() {
+        mainLight = null;
+        scene.traverse((obj) => {
+            if (!mainLight && obj.isDirectionalLight) mainLight = obj;
+        });
+    }
+
+    function hasPipelineEffectEnabled() {
+        // PowerShot wraps the post pipeline output, so it forces a (possibly
+        // bare scene-pass) pipeline build — identical to the editor facade.
+        return core.anyEffectActive() || !!powerShotFinal?.isActive();
+    }
+
+    function topologySignature() {
+        const topology = descriptors.map((descriptor) => {
+            const effectState = state[descriptor.id] ?? {};
+            const keys = new Set(['enabled', ...(descriptor.topologyKeys ?? [])]);
+            for (const [key, value] of Object.entries(effectState)) {
+                if (typeof value === 'boolean' || typeof value === 'string') keys.add(key);
+            }
+            return [descriptor.id, [...keys].sort().map((key) => [key, effectState[key]])];
+        });
+        topology.push(['powershot', [
+            ['enabled', state.powershot?.enabled === true],
+            ['mode', String(state.powershot?.mode ?? 'digital')],
+            ['preset', String(state.powershot?.preset ?? 'powershot')],
+        ]]);
+        return JSON.stringify(topology);
+    }
+
+    // The editor clears the CSS colorGrading filter while PowerShot is active
+    // (PowerShot grades its own output). applySnapshotCoreLook may have set
+    // the filter from fx.colorGrading before we got here.
+    function syncCanvasFilterForPowerShot() {
+        const canvas = renderer?.domElement;
+        if (!canvas?.style) return;
+        if (powerShotFinal?.isActive() && canvas.style.filter) {
+            canvas.style.filter = '';
+        }
+    }
+
+    function rebuild() {
+        core.prepareRebuild();
+        if (!hasPipelineEffectEnabled()) {
+            pipelineReady = false;
+            core.teardownPipeline();
+            syncCanvasFilterForPowerShot();
+            return;
+        }
+        core.clearNodes();
+        syncCanvasFilterForPowerShot();
+        const result = core.buildPipeline();
+        if (result.ok) {
+            pipelineReady = true;
+            snapshotRendererSize();
+        } else {
+            pipelineReady = false;
+            core.handleBuildFailure();
+            console.warn('[snapshot_fx] post-FX pipeline build failed; falling back to plain render', result.error);
+        }
+    }
+
+    function refreshOutputSize() {
+        if (!pipelineReady) return;
+        core.refreshResolutionScales();
+        core.postProcessing.needsUpdate = true;
+        snapshotRendererSize();
+    }
+
+    // Shader Lab enable() resolves asynchronously (esm.sh fetch) and retro /
+    // PS1 wiggle yield to it — same listener contract as the editor facade.
+    if (typeof window !== 'undefined' && wantsShaderLab) {
+        window.addEventListener('maxjs-shader-lab-state', () => {
+            core.syncSharedSceneEffects(true);
+            if (supportsScreenSpaceEffects && state.retro?.enabled && restored) {
+                rebuild();
+            }
+        });
+    }
+
+    return {
+        /**
+         * Replay the exported editor post-FX state.
+         * @param fx      snapshotUi.fx (descriptor states + powershot)
+         * @param extras  { shaderLab } — snapshotUi.shaderLab ({config, enabled, passes})
+         */
+        restoreState(fx = {}, extras = {}) {
+            const previousTopology = topologySignature();
+            for (const descriptor of descriptors) {
+                const source = fx?.[descriptor.id];
+                const incoming = source && typeof source === 'object' ? source : {};
+                state[descriptor.id] = {
+                    ...cloneEffectDefaults(descriptorDefaults.get(descriptor.id)),
+                    ...incoming,
+                };
+                for (const [key, value] of Object.entries(state[descriptor.id])) {
+                    if (Array.isArray(value)) state[descriptor.id][key] = [...value];
+                }
+            }
+            state.powershot = {
+                ...powerShotDefaults,
+                ...(fx?.powershot && typeof fx.powershot === 'object' ? fx.powershot : {}),
+            };
+            if (powerShotFinal?.hasPipeline()) powerShotFinal.syncPipeline();
+
+            const shaderLabState = extras?.shaderLab;
+            if (shaderLabFx && shaderLabState && typeof shaderLabState === 'object') {
+                shaderLabFx.setState?.(shaderLabState);
+                if (shaderLabState.enabled && !shaderLabFx.isEnabled()) {
+                    shaderLabFx.enable(shaderLabState).catch((error) => {
+                        console.warn('[snapshot_fx] Shader Lab enable failed (offline?); continuing without it', error);
+                    });
+                } else if (shaderLabState.enabled === false && shaderLabFx.isEnabled()) {
+                    shaderLabFx.disable();
+                }
+            }
+
+            const shouldRebuild = !restored || previousTopology !== topologySignature();
+            restored = true;
+            findMainLight();
+            if (shouldRebuild) rebuild();
+            else {
+                core.syncSharedSceneEffects();
+                if (pipelineReady) core.updatePerFrame();
+                syncCanvasFilterForPowerShot();
+            }
+        },
+
+        /** Editor's environmentVisible flag (HDRI shown as backdrop). */
+        /**
+         * Live DOF param write. The dof* uniforms are shared TSL nodes, so the
+         * write reaches the running pipeline immediately (no rebuild); state is
+         * updated too so the next rebuild stays consistent. Lets site motion
+         * (zoom focus pulls) drive focus per frame.
+         */
+        setDofOptions(options = {}) {
+            const u = core.ctx?.uniforms;
+            const apply = (key, uniformName) => {
+                const value = Number(options[key]);
+                if (!Number.isFinite(value)) return;
+                state.dof[key] = value;
+                const node = u?.[uniformName];
+                if (node) node.value = value;
+            };
+            apply('focusDistance', 'dofFocusDistanceU');
+            apply('focalLength', 'dofFocalLengthU');
+            apply('bokehScale', 'dofBokehScaleU');
+            return { ...state.dof };
+        },
+        isDofEnabled() {
+            return state.dof?.enabled === true;
+        },
+        /**
+         * Live PowerShot param write — the ISP equivalent of setDofOptions.
+         *
+         * The PowerShot final stage holds `state.powershot` by reference
+         * (`getOptions`) and re-reads it every frame: render() calls
+         * ensureActivePipeline(), which syncs the active mode's pipeline from
+         * the live object. So mutating state here lands on the next frame with
+         * no rebuild and no shader recompile — unlike restoreState(), which
+         * tears the whole pipeline down and is meant for scene boots.
+         *
+         * Numeric keys only, which is all a per-frame driver needs (sensor
+         * noise, exposure, softness). Mode/preset/enabled changes still go
+         * through restoreState() because they DO change the graph.
+         */
+        setPowerShotOptions(options = {}) {
+            if (!options || typeof options !== 'object') return { ...state.powershot };
+            for (const [key, raw] of Object.entries(options)) {
+                if (key === 'mode' || key === 'preset' || key === 'enabled') continue;
+                const value = Number(raw);
+                if (Number.isFinite(value)) state.powershot[key] = value;
+            }
+            return { ...state.powershot };
+        },
+        isPowerShotEnabled() {
+            return state.powershot?.enabled === true;
+        },
+        // Match the editor facade: the standalone frame driver needs the
+        // active imager mode and IR illuminator gain to switch the scene into
+        // the same sensed band before it renders.
+        getPowerShotOptions() {
+            return state.powershot;
+        },
+        // The scene renders as three NIR bands (nir_band_view.js); the imager collapses them.
+        setPowerShotNirBands(on) {
+            powerShotNirBands = on === true;
+            powerShotFinal?.setNirBands(powerShotNirBands);
+        },
+        setEnvironmentVisible(visible) {
+            envVisible = visible !== false;
+        },
+
+        /** Editor's exported post-FX resolution scale (snapshotUi.performance.postFxScale). */
+        setResolutionScale(scale) {
+            const numeric = Number(scale);
+            if (!Number.isFinite(numeric)) return resolutionScale;
+            resolutionScale = THREE.MathUtils.clamp(numeric, 0.25, 1.0);
+            if (restored) refreshOutputSize();
+            return resolutionScale;
+        },
+
+        /**
+         * Call after scene.environment changes (the snapshot HDRI applies
+         * AFTER snapshotUi in boot, so the env-backdrop compensation needs
+         * one rebuild once the environment exists).
+         */
+        notifyEnvironmentChanged(visible) {
+            if (typeof visible === 'boolean') envVisible = visible;
+            if (restored && (pipelineReady || hasPipelineEffectEnabled())) rebuild();
+        },
+
+        isEnabled() {
+            return (pipelineReady && hasPipelineEffectEnabled())
+                || !!shaderLabFinal?.hasPassEnabled()
+                || !!powerShotFinal?.isActive();
+        },
+
+        render() {
+            if (pipelineReady && rendererSizeChanged()) {
+                refreshOutputSize();
+            }
+            core.updateFrameTimers();
+            syncCanvasFilterForPowerShot();
+
+            const shaderLabActive = !!shaderLabFinal?.hasPassEnabled();
+
+            if (!hasPipelineEffectEnabled() || !pipelineReady) {
+                if (shaderLabActive) {
+                    const consumed = shaderLabFinal.renderFinal(() => renderer.render(scene, camera));
+                    if (!consumed) renderer.render(scene, camera);
+                } else if (powerShotFinal?.isActive()) {
+                    const consumed = powerShotFinal.renderFinal(() => renderer.render(scene, camera));
+                    if (!consumed) renderer.render(scene, camera);
+                } else {
+                    renderer.render(scene, camera);
+                }
+                return;
+            }
+
+            try {
+                core.updatePerFrame();
+                if (shaderLabActive) {
+                    const consumed = shaderLabFinal.renderFinal(() => core.postProcessing.render());
+                    if (!consumed) core.postProcessing.render();
+                } else if (powerShotFinal?.isActive()) {
+                    const consumed = powerShotFinal.renderFinal(() => core.postProcessing.render());
+                    if (!consumed) core.postProcessing.render();
+                } else {
+                    core.postProcessing.render();
+                }
+            } catch (error) {
+                console.warn('[snapshot_fx] post pipeline render failed; disabling post-FX', error);
+                pipelineReady = false;
+                core.restoreSceneAfterPostPass();
+                core.handleBuildFailure();
+                renderer.render(scene, camera);
+            }
+        },
+
+        resize() {
+            if (!pipelineReady || !rendererSizeChanged()) return;
+            // A size change needs an OUTPUT refresh, not a rebuild: PassNode
+            // render targets resize themselves from the renderer dimensions.
+            // Rebuilding instead mints a second full set of effect targets and
+            // strands the first — measured on a resizing snapshot page as ~2
+            // textures plus ~170 NodeUniformsGroups leaked per resize, growing
+            // without bound (the viewer has never leaked here because
+            // maxjs_fx.js already does it this way; see
+            // syncRendererResizeState, which carries the same reasoning).
+            core.refreshResolutionScales();
+            core.postProcessing.needsUpdate = true;
+            // Recording the new size HERE is half the fix, not bookkeeping:
+            // render() below runs the same rendererSizeChanged() check and
+            // WOULD rebuild on the next frame. Consuming the change now leaves
+            // it nothing to react to. That ordering is exactly why the viewer
+            // is clean — its resize path snapshots the size before the frame
+            // loop's own check ever sees it.
+            snapshotRendererSize();
+        },
+
+        dispose() {
+            if (disposed) return;
+            disposed = true;
+            pipelineReady = false;
+            core.teardownPipeline();
+            powerShotFinal?.dispose?.();
+            shaderLabFinal?.dispose?.();
+            try { shaderLabFx?.disable?.(); } catch (_) {}
+        },
+    };
+}

@@ -1,0 +1,888 @@
+// scene_applier.js — minimal-viable applier for the maxjs binary scene
+// payload (`scene.m3`; legacy snapshots used `scene.bin`).
+//
+// Stage 3 deliverable from docs/SNAPSHOT_REFACTOR.md.
+//
+// Lifts a deliberately reduced version of `handleBinaryScene` from
+// web/index.html (lines 6329-6556) into a standalone module. The goal of
+// this stage is **visible geometry** for snapshot pages, not full live-
+// mode parity.
+//
+// SCOPE — what's IN
+// -----------------
+//   - Mesh / line / SkinnedMesh construction from the M3 payload via
+//     `js/scene_binary.js` helpers.
+//   - Transform from `nd.t` (16-float matrix).
+//   - Visibility from `nd.vis`.
+//   - Multi/sub material groups via `geom.addGroup`.
+//   - Forest Pack / RailClone instance groups from binary ranges
+//     in M3, with legacy JSON-array fallback.
+//   - Removal of stale nodes not present in the new payload.
+//   - Skeleton bind-pose calculation after the world matrix updates.
+//
+// SCOPE — what's OUT (by design, lifts in later stages)
+// -----------------------------------------------------
+//   - Real material building (PBR / VRay / OpenPBR / glTF / TSL / MaterialX).
+//     Replaced with a flat MeshStandardMaterial via `materialBuilder`.
+//   - Vertex color attribute updates.
+//   - jsmod (three.js Deform) sync state.
+//   - HTML auto-fit, selection state stamping.
+//   - Light linking / light probes / scene profiling.
+//   - `finalizeSceneSnapshot` side effects (camera fit, HDRI load, fog,
+//     audio, gltf, hairInstances).
+//
+// All of the above are wired through the `hooks` parameter so caller code
+// can opt in incrementally. The default hooks are no-ops.
+//
+// CONTRACT
+// --------
+//   applySceneBin({ buffer, meta, ctx, hooks?, options? })
+//
+// Returns:
+//   { sceneChanged, transformsChanged, applyMs, addedHandles, removedHandles }
+
+import * as THREE from 'three';
+import {
+    binInRange,
+    geometryFromNodeBinary,
+    attachSkinAttributes,
+    attachMorphAttributes,
+    applySkinRestPose,
+    chooseSkinBindBasis,
+    buildSkinnedMeshFromNd,
+    indexArrayFromBinary,
+    normalAttributeFromBinary,
+    uvAttributeFromBinary,
+} from './scene_binary.js';
+import {
+    getInstancedMeshBatchSize,
+    instanceGroupHasExactMaterialDescriptor,
+    instanceGroupKey,
+    isExactInstanceMaterialDescriptor,
+    isWebGpuInstancingPath,
+} from './instance_batching.js';
+import { ensureGeometryUv0ForMaterial } from './material_contract.js';
+import { markOwned, OWNER_MAX } from './layer_ownership.js';
+import { ordinaryM3GeometryStorageKey } from './instance_buckets.js';
+
+// ─── Default hooks ─────────────────────────────────────────────────────
+//
+// All hooks are best-effort opt-in. Snapshot pages with the simplest
+// scenes can run with the defaults; full parity needs each subsystem
+// (material registry, instance buckets, etc.) plugged in.
+const NOOP = () => {};
+const RETURNS_FALSE = () => false;
+const MAXJS_SELF_HIDDEN_LAYER = 31;
+
+const DEFAULT_HOOKS = Object.freeze({
+    /** ({ nd, geom, wantsLine }) → THREE.Material — required */
+    materialBuilder: ({ wantsLine }) =>
+        wantsLine
+            ? new THREE.LineBasicMaterial({ color: 0xcccccc })
+            : new THREE.MeshStandardMaterial({ color: 0xb0b0b0, roughness: 0.6, metalness: 0.0 }),
+
+    /** ({ grp, geom, materialDescriptor?, materialIndex? }) -> THREE.Material | THREE.Material[] */
+    instanceMaterialBuilder: () =>
+        new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 0.7, side: THREE.DoubleSide }),
+
+    /** ({ mesh, nd }) → bool changed — for incremental material edits */
+    materialUpdater: RETURNS_FALSE,
+
+    /** (material) → void — material disposal hook */
+    disposeMaterial: (mat) => {
+        if (!mat) return;
+        if (Array.isArray(mat)) mat.forEach((m) => m?.dispose?.());
+        else mat.dispose?.();
+    },
+
+    /** (nodes) → { signature, handles: Set<handle> } — instance bucket plan */
+    planInstanceBuckets: () => ({ signature: '', handles: new Set() }),
+
+    /** (handle) → bucket | null — lookup */
+    getInstanceBucketFor: () => null,
+
+    /** (handle, nd) → bool transformsChanged */
+    updateInstanceBucketNode: RETURNS_FALSE,
+
+    /** (mesh, isJsmod) → void — the three.js Deform flag that adapter.jsmod,
+     *  ctx.deform targets (n => n.jsmod) and simulate()'s guard read. The live
+     *  editor stamps it the same way (editor/materials.js applyJsmodSyncState);
+     *  a no-op default left every snapshot mesh unflagged. */
+    applyJsmodSyncState: (mesh, enabled) => {
+        if (!mesh?.userData) return;
+        if (enabled) mesh.userData.jsmod = true;
+        else delete mesh.userData.jsmod;
+    },
+
+    /** (mesh, instOfHandle) → void */
+    applyInstanceSyncState: NOOP,
+
+    /** (mesh, selected) → void */
+    applySelection: NOOP,
+
+    /** (geometry, vc, buffer) → void — vertex color attribute updates */
+    setVertexColors: NOOP,
+
+    /** ({ snapshot, transport, applyStart, producerBytes, options }) → void */
+    finalizeSceneSnapshot: NOOP,
+
+    /** Layer manager hooks (called when present) */
+    onMaterialApplied: NOOP, // (handle, mesh) → void; live calls layerManager.applyMaterialOverrides
+    markRuntimeTransformsDirty: NOOP,
+
+    /** (mesh, nd) → void — additional userData stamping (HTML autofit, signatures, etc.) */
+    stampMaterial: NOOP,
+
+    /** (mesh, nd) — visibility from nd.vis */
+    applyVisibility: (mesh, vis) => {
+        if (!mesh) return false;
+        const next = vis === undefined ? mesh.visible : !!vis;
+        mesh.userData ??= {};
+        let changed = mesh.userData.maxjsVisible !== next;
+        mesh.userData.maxjsVisible = next;
+        if (mesh.visible !== true) {
+            mesh.visible = true;
+            changed = true;
+        }
+        if (mesh.layers?.set) {
+            const layer = next ? 0 : MAXJS_SELF_HIDDEN_LAYER;
+            const mask = 2 ** layer;
+            if (mesh.layers.mask !== mask) {
+                mesh.layers.set(layer);
+                changed = true;
+            }
+        }
+        const materials = Array.isArray(mesh.material)
+            ? mesh.material
+            : (mesh.material ? [mesh.material] : []);
+        for (const material of materials) {
+            if (!material) continue;
+            if (material.visible !== true) {
+                material.visible = true;
+                changed = true;
+            }
+        }
+        return changed;
+    },
+});
+
+// ─── Geometry refcount tracking (lifted from index.html) ─────────────
+function buildNodeGeometryRefCounts(nodeMap) {
+    const counts = new Map();
+    for (const mesh of nodeMap.values()) {
+        const geom = mesh?.geometry;
+        if (!geom) continue;
+        counts.set(geom, (counts.get(geom) || 0) + 1);
+    }
+    return counts;
+}
+function retainGeometryRef(refCounts, geom) {
+    if (!refCounts || !geom) return;
+    refCounts.set(geom, (refCounts.get(geom) || 0) + 1);
+}
+function releaseGeometryRef(refCounts, geom) {
+    if (!refCounts || !geom) return;
+    const next = (refCounts.get(geom) || 0) - 1;
+    if (next <= 0) { refCounts.delete(geom); geom.dispose?.(); }
+    else { refCounts.set(geom, next); }
+}
+
+// ─── applyTransform (lifted) ──────────────────────────────────────────
+const I16 = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+function arraysAlmostEqual(a, b, eps = 1e-6) {
+    if (!a || !b || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > eps) return false;
+    return true;
+}
+function isFiniteArray(arr, len) {
+    if (!arr || (len != null && arr.length !== len)) return false;
+    for (let i = 0; i < arr.length; i++) if (!Number.isFinite(arr[i])) return false;
+    return true;
+}
+const transformScratch = {
+    raw: new THREE.Matrix4(),
+    parentInRoot: new THREE.Matrix4(),
+    parentInv: new THREE.Matrix4(),
+    rootInv: new THREE.Matrix4(),
+};
+function getParentObject(nd, obj, nodeMap, maxRoot) {
+    const parentHandle = Number(nd?.p);
+    const parent = Number.isFinite(parentHandle) && parentHandle > 0
+        ? nodeMap.get(parentHandle)
+        : null;
+    if (!parent || parent === obj) return maxRoot;
+    for (let cursor = parent; cursor; cursor = cursor.parent) {
+        if (cursor === obj) return maxRoot;
+    }
+    return parent;
+}
+function syncParent(obj, nd, nodeMap, maxRoot) {
+    if (!obj) return maxRoot;
+    const parent = getParentObject(nd, obj, nodeMap, maxRoot);
+    obj.userData ??= {};
+    obj.userData.maxjsParentHandle = parent === maxRoot ? 0 : (Number(nd?.p) || 0);
+    if (obj.parent !== parent) parent.add(obj);
+    return parent;
+}
+function removeNodeObject(obj) {
+    obj?.parent?.remove(obj);
+}
+function applyTransform(mesh, t, maxRoot) {
+    if (!isFiniteArray(t, 16)) {
+        if (arraysAlmostEqual(mesh.matrix.elements, I16)) return false;
+        mesh.matrix.identity();
+        mesh.position.set(0, 0, 0);
+        mesh.quaternion.identity();
+        mesh.scale.set(1, 1, 1);
+        mesh.matrixWorldNeedsUpdate = true;
+        return true;
+    }
+    transformScratch.raw.fromArray(t);
+    if (mesh.parent && maxRoot && mesh.parent !== maxRoot) {
+        maxRoot.updateMatrixWorld(true);
+        mesh.parent.updateMatrixWorld(true);
+        transformScratch.rootInv.copy(maxRoot.matrixWorld).invert();
+        transformScratch.parentInRoot
+            .copy(transformScratch.rootInv)
+            .multiply(mesh.parent.matrixWorld);
+        transformScratch.parentInv.copy(transformScratch.parentInRoot).invert();
+        transformScratch.raw.premultiply(transformScratch.parentInv);
+    }
+    if (arraysAlmostEqual(mesh.matrix.elements, transformScratch.raw.elements)) return false;
+    mesh.matrix.copy(transformScratch.raw);
+    mesh.matrixWorldNeedsUpdate = true;
+    return true;
+}
+
+// ─── Binary instance groups ───────────────────────────────────────────
+function binaryFloatView(buffer, off, n, label) {
+    if (!binInRange(buffer, off, n)) {
+        console.warn(`[scene_applier] Invalid ${label} float range`, { off, n });
+        return null;
+    }
+    return new Float32Array(buffer, off, n);
+}
+
+function vectorPayloadToFloat32(arrayLike) {
+    return Array.isArray(arrayLike) || ArrayBuffer.isView(arrayLike)
+        ? new Float32Array(arrayLike)
+        : null;
+}
+
+function vectorPayloadToUint32(arrayLike) {
+    return Array.isArray(arrayLike) || ArrayBuffer.isView(arrayLike)
+        ? new Uint32Array(arrayLike)
+        : null;
+}
+
+function buildInstanceGeometry(grp, buffer) {
+    const geo = grp?.geo;
+    let verts = null;
+    let indices = null;
+    let uvs = null;
+    let uvAttr = null;
+    let norms = null;
+
+    if (geo) {
+        const vView = binaryFloatView(buffer, geo.vOff, geo.vN, 'instance position');
+        const iView = indexArrayFromBinary(buffer, geo.iOff, geo.iN, geo.iType, {
+            copy: true,
+            label: 'instance index',
+        });
+        if (!vView || !iView) return null;
+        verts = new Float32Array(vView);
+        indices = iView;
+        if (geo.uvOff != null && geo.uvN) {
+            uvAttr = uvAttributeFromBinary(buffer, geo.uvOff, geo.uvN, geo.uvType, 'instance uv');
+        }
+    } else {
+        verts = vectorPayloadToFloat32(grp?.v);
+        indices = vectorPayloadToUint32(grp?.i);
+        uvs = vectorPayloadToFloat32(grp?.uv);
+        norms = vectorPayloadToFloat32(grp?.norm);
+    }
+
+    if (!verts?.length || !indices?.length) return null;
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(verts, 3));
+    geom.setIndex(new THREE.BufferAttribute(indices, 1));
+    if (uvAttr) geom.setAttribute('uv', uvAttr);
+    else if (uvs?.length) geom.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    let normalSet = false;
+    if (geo?.nOff != null && geo?.nN) {
+        const normalAttr = normalAttributeFromBinary(buffer, geo.nOff, geo.nN, geo.nType, 'instance normal');
+        if (normalAttr) {
+            geom.setAttribute('normal', normalAttr);
+            normalSet = true;
+        }
+    }
+    if (!normalSet) {
+        if (norms?.length) geom.setAttribute('normal', new THREE.BufferAttribute(norms, 3));
+        else geom.computeVertexNormals();
+    }
+
+    return geom;
+}
+
+function applyInstanceGeometryGroups(geom, groups) {
+    if (!geom || !Array.isArray(groups)) return false;
+    geom.clearGroups();
+    for (const group of groups) {
+        if (!Array.isArray(group) || group.length < 3) continue;
+        geom.addGroup(group[0], group[1], group[2]);
+    }
+    return true;
+}
+
+function instanceGeometryGroupsMatch(geom, groups) {
+    if (!geom || !Array.isArray(groups)) return false;
+    const current = Array.isArray(geom.groups) ? geom.groups : [];
+    if (current.length !== groups.length) return false;
+    for (let i = 0; i < groups.length; i++) {
+        const group = groups[i];
+        if (!Array.isArray(group) || group.length < 3) return false;
+        const currentGroup = current[i];
+        if (!currentGroup ||
+            currentGroup.start !== group[0] ||
+            currentGroup.count !== group[1] ||
+            currentGroup.materialIndex !== group[2]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function resolveInstancedNodeGeometry(nd, sourceGeometry, { cloneForJsmod = false } = {}) {
+    if (!sourceGeometry) return null;
+    if (!Array.isArray(nd?.groups)) return cloneForJsmod ? sourceGeometry.clone() : sourceGeometry;
+    if (!cloneForJsmod && instanceGeometryGroupsMatch(sourceGeometry, nd.groups)) return sourceGeometry;
+    const geom = sourceGeometry.clone();
+    applyInstanceGeometryGroups(geom, nd.groups);
+    return geom;
+}
+
+// Group tables live on the geometry, but instanced nodes share one
+// BufferGeometry — rewriting groups in place would scramble every sibling's
+// material-ID mapping (last node processed wins). Clone for this node instead.
+function syncNodeGeometryGroups(mesh, geom, groups, nodeMap) {
+    if (!geom || !Array.isArray(groups)) return geom;
+    if (instanceGeometryGroupsMatch(geom, groups)) return geom;
+    let shared = false;
+    for (const other of nodeMap.values()) {
+        if (other !== mesh && other.geometry === geom) { shared = true; break; }
+    }
+    const target = shared ? geom.clone() : geom;
+    applyInstanceGeometryGroups(target, groups);
+    return target;
+}
+
+function getInstanceTransformPayload(grp, buffer) {
+    if (Number.isInteger(grp?.xformOff) && Number.isInteger(grp?.xformN)) {
+        const values = binaryFloatView(buffer, grp.xformOff, grp.xformN, 'instance transform');
+        if (!values) return null;
+        const type = String(grp.xformType ?? 'f32m16').trim().toLowerCase();
+        const stride = type === 'affine12' ? 12 : 16;
+        return { values, type, stride };
+    }
+    if (Array.isArray(grp?.xforms) || ArrayBuffer.isView(grp?.xforms)) {
+        return { values: grp.xforms, type: 'f32m16', stride: 16 };
+    }
+    return null;
+}
+
+function setMatrixFromInstancePayload(matrix, payload, index) {
+    const values = payload?.values;
+    const off = index * (payload?.stride || 16);
+    if (payload?.type === 'affine12') {
+        matrix.set(
+            values[off + 0], values[off + 3], values[off + 6],  values[off + 9],
+            values[off + 1], values[off + 4], values[off + 7],  values[off + 10],
+            values[off + 2], values[off + 5], values[off + 8],  values[off + 11],
+            0,               0,               0,                1,
+        );
+        return;
+    }
+    // Instance payloads preserve Max row-major Matrix3 layout. Three's
+    // Matrix4.set takes row-major arguments and stores column-major internally.
+    matrix.set(
+        values[off + 0], values[off + 4], values[off + 8],  values[off + 12],
+        values[off + 1], values[off + 5], values[off + 9],  values[off + 13],
+        values[off + 2], values[off + 6], values[off + 10], values[off + 14],
+        values[off + 3], values[off + 7], values[off + 11], values[off + 15],
+    );
+}
+
+function disposeInstanceMeshes(ctx, hooks) {
+    const forestMeshes = ctx.forestMeshes;
+    if (!forestMeshes?.size) return 0;
+    let removed = 0;
+    const disposedGeometries = new Set();
+    const disposedMaterials = new Set();
+    for (const mesh of forestMeshes.values()) {
+        if (!mesh) continue;
+        mesh.parent?.remove(mesh);
+        if (mesh.geometry && !disposedGeometries.has(mesh.geometry)) {
+            disposedGeometries.add(mesh.geometry);
+            mesh.geometry.dispose?.();
+        }
+        const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        const pending = [];
+        for (const material of materials) {
+            if (!material || disposedMaterials.has(material)) continue;
+            disposedMaterials.add(material);
+            pending.push(material);
+        }
+        if (pending.length === 1) hooks.disposeMaterial(pending[0]);
+        else if (pending.length > 1) hooks.disposeMaterial(pending);
+        removed++;
+    }
+    forestMeshes.clear();
+    return removed;
+}
+
+function countMaterialTextureSlots(md) {
+    if (!md || typeof md !== 'object') return 0;
+    let count = 0;
+    for (const [key, value] of Object.entries(md)) {
+        if (typeof value !== 'string' || value.length === 0) continue;
+        if (key === 'model' || key === 'name' || key === 'materialXFile' || key === 'materialXInline') continue;
+        if (key.endsWith('Map') || key.endsWith('Tex') || key.endsWith('Path') || key.endsWith('File')) count++;
+    }
+    return count;
+}
+
+function usingWebGpuInstanceMaterials(ctx) {
+    return isWebGpuInstancingPath({
+        renderer: ctx?.renderer,
+        backendLabel: ctx?.rendererBackendLabel,
+    });
+}
+
+function copyInstanceTextureSlot(source, target, fromKey, toKey = fromKey) {
+    const url = source?.[fromKey];
+    if (typeof url === 'string' && url.length > 0) target[toKey] = url;
+    const xf = source?.[`${fromKey}Xf`];
+    if (xf != null) target[`${toKey}Xf`] = xf;
+}
+
+function webGpuSafeInstanceMaterialDescriptor(md, ctx) {
+    if (!usingWebGpuInstanceMaterials(ctx) || !md || typeof md !== 'object') return md;
+    if (isExactInstanceMaterialDescriptor(md)) return md;
+
+    const safe = {
+        model: 'MeshStandardMaterial',
+        name: md.name,
+        color: Array.isArray(md.color) ? md.color.slice(0, 3) : [0.8, 0.8, 0.8],
+        side: md.side,
+        rough: Number.isFinite(md.rough) ? md.rough : 0.65,
+        metal: Number.isFinite(md.metal) ? md.metal : 0.0,
+        envI: Number.isFinite(md.envI) ? md.envI : 1.0,
+    };
+
+    if (md.opacity != null) safe.opacity = md.opacity;
+    if (md.transparent === true) safe.transparent = true;
+    if (md.depthWrite != null) safe.depthWrite = md.depthWrite;
+    if (md.depthTest != null) safe.depthTest = md.depthTest;
+    if (Number.isFinite(md.alphaTest) && md.alphaTest > 0) safe.alphaTest = md.alphaTest;
+    if (Array.isArray(md.em) && md.emI > 0) {
+        safe.em = md.em.slice(0, 3);
+        safe.emI = md.emI;
+    }
+
+    copyInstanceTextureSlot(md, safe, 'map');
+    if (!safe.map) copyInstanceTextureSlot(md, safe, 'diffMap', 'map');
+    copyInstanceTextureSlot(md, safe, 'opMap');
+    if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'alphaMap', 'opMap');
+    if (!safe.opMap) copyInstanceTextureSlot(md, safe, 'opacityMap', 'opMap');
+
+    if (safe.opMap && !(Number.isFinite(safe.alphaTest) && safe.alphaTest > 0)) {
+        safe.alphaTest = 0.35;
+        safe.transparent = false;
+    }
+
+    return safe;
+}
+
+function dominantForestMaterialIndex(grp) {
+    if (!Array.isArray(grp?.groups) || grp.groups.length === 0) return 0;
+    let bestIndex = 0;
+    let bestCount = -1;
+    for (const group of grp.groups) {
+        const materialIndex = Number(group?.[2]);
+        const indexCount = Number(group?.[1]);
+        if (Number.isFinite(materialIndex) && Number.isFinite(indexCount) && indexCount > bestCount) {
+            bestIndex = materialIndex;
+            bestCount = indexCount;
+        }
+    }
+    return bestIndex;
+}
+
+function shouldCollapseForestMaterialsForWebGpu(grp, ctx) {
+    if (!usingWebGpuInstanceMaterials(ctx)) return false;
+    if (String(grp?.kind || '').toLowerCase() === 'railclone') return false;
+    if (!Array.isArray(grp?.mats) || !Array.isArray(grp?.groups)) return false;
+    if (instanceGroupHasExactMaterialDescriptor(grp)) return false;
+    const textureSlots = grp.mats.reduce((sum, material) => sum + countMaterialTextureSlots(material), 0);
+    return grp.groups.length > 8 || textureSlots > 4;
+}
+
+function buildInstanceMaterial(grp, geom, ctx, hooks) {
+    if (shouldCollapseForestMaterialsForWebGpu(grp, ctx)) {
+        const materialIndex = dominantForestMaterialIndex(grp);
+        const sourceMaterial = grp.mats?.[materialIndex] ?? grp.mats?.[0] ?? grp.mat;
+        if (!sourceMaterial) return hooks.instanceMaterialBuilder({ grp, geom });
+        return hooks.instanceMaterialBuilder({
+            grp,
+            geom,
+            materialDescriptor: webGpuSafeInstanceMaterialDescriptor(sourceMaterial, ctx),
+            materialIndex: null,
+            collapsedWebGpuForestMaterial: true,
+        });
+    }
+
+    if (Array.isArray(grp?.mats) && Array.isArray(grp?.groups)) {
+        applyInstanceGeometryGroups(geom, grp.groups);
+        return grp.mats.map((materialDescriptor, materialIndex) =>
+            hooks.instanceMaterialBuilder({
+                grp,
+                geom,
+                materialDescriptor: webGpuSafeInstanceMaterialDescriptor(materialDescriptor, ctx),
+                materialIndex,
+                collapsedWebGpuForestMaterial: false,
+            }),
+        );
+    }
+
+    if (grp?.mat) {
+        return hooks.instanceMaterialBuilder({
+            grp,
+            geom,
+            materialDescriptor: webGpuSafeInstanceMaterialDescriptor(grp.mat, ctx),
+            materialIndex: null,
+            collapsedWebGpuForestMaterial: false,
+        });
+    }
+
+    return hooks.instanceMaterialBuilder({ grp, geom });
+}
+
+function applyForestInstances(groups, buffer, ctx, hooks) {
+    ctx.forestMeshes ??= new Map();
+    const removed = disposeInstanceMeshes(ctx, hooks);
+    let added = 0;
+
+    if (!Array.isArray(groups) || groups.length === 0) {
+        return { sceneChanged: removed > 0, added, removed };
+    }
+
+    const matrix = new THREE.Matrix4();
+    for (const grp of groups) {
+        const xforms = getInstanceTransformPayload(grp, buffer);
+        const count = grp?.count || Math.floor((xforms?.values?.length || 0) / (xforms?.stride || 16));
+        if (!count || !xforms?.values || xforms.values.length < count * xforms.stride) continue;
+
+        const geom = buildInstanceGeometry(grp, buffer);
+        if (!geom) continue;
+
+        const groupKey = instanceGroupKey(grp, added);
+        const material = buildInstanceMaterial(grp, geom, ctx, hooks);
+        ensureGeometryUv0ForMaterial(geom, material);
+        const batchSize = Math.max(1, getInstancedMeshBatchSize({
+            renderer: ctx.renderer,
+            backendLabel: ctx.rendererBackendLabel,
+            count,
+        }));
+        const batchCount = Math.ceil(count / batchSize);
+
+        for (let batchIndex = 0, start = 0; start < count; batchIndex++, start += batchSize) {
+            const sliceCount = Math.min(batchSize, count - start);
+            const instMesh = new THREE.InstancedMesh(geom, material, sliceCount);
+            instMesh.matrixAutoUpdate = false;
+            instMesh.frustumCulled = false;
+            instMesh.castShadow = true;
+            instMesh.receiveShadow = true;
+            instMesh.name = batchCount > 1
+                ? `forest_${groupKey}_part${batchIndex + 1}_x${sliceCount}`
+                : `forest_${groupKey}_x${sliceCount}`;
+            instMesh.userData.maxjsInstanceGroup = true;
+            instMesh.userData.maxjsSource = groupKey;
+            instMesh.userData.maxjsInstanceStart = start;
+            instMesh.userData.maxjsInstanceTotal = count;
+
+            for (let i = 0; i < sliceCount; i++) {
+                setMatrixFromInstancePayload(matrix, xforms, start + i);
+                instMesh.setMatrixAt(i, matrix);
+            }
+            instMesh.instanceMatrix.needsUpdate = true;
+
+            markOwned(instMesh, OWNER_MAX);
+            ctx.maxRoot.add(instMesh);
+            ctx.forestMeshes.set(batchCount > 1 ? `${groupKey}:${batchIndex}` : groupKey, instMesh);
+            added++;
+        }
+    }
+
+    return { sceneChanged: removed > 0 || added > 0, added, removed };
+}
+
+// ─── applySceneBin ─────────────────────────────────────────────────────
+export async function applySceneBin({ buffer, meta, ctx, hooks: userHooks = {}, options = {} } = {}) {
+    if (!buffer) throw new Error('applySceneBin: buffer is required');
+    if (!meta || meta.type !== 'scene_bin') throw new Error('applySceneBin: meta.type must be "scene_bin"');
+    if (!ctx?.nodeMap || !ctx?.maxRoot) throw new Error('applySceneBin: ctx.nodeMap + ctx.maxRoot required');
+
+    const hooks = { ...DEFAULT_HOOKS, ...userHooks };
+    const { nodeMap, maxRoot, lastInstanceBucketSignature = '', scene } = ctx;
+
+    const applyStart = performance.now();
+    const incoming = new Set(meta.nodes.map((n) => n.h));
+    const bucketPlan = hooks.planInstanceBuckets(meta.nodes);
+    const stableBucketHandles = bucketPlan.signature === lastInstanceBucketSignature
+        ? bucketPlan.handles
+        : null;
+
+    let sceneChanged = false;
+    let transformsChanged = false;
+    const addedHandles = [];
+    const removedHandles = [];
+    const refCounts = buildNodeGeometryRefCounts(nodeMap);
+
+    // ─── Remove deleted nodes ───────────────────────────────────────
+    const toRemove = [];
+    for (const [handle, mesh] of nodeMap) {
+        if (!incoming.has(handle)) toRemove.push(handle);
+    }
+    for (const handle of toRemove) {
+        const mesh = nodeMap.get(handle);
+        if (mesh) {
+            removeNodeObject(mesh);
+            releaseGeometryRef(refCounts, mesh.geometry);
+            hooks.disposeMaterial(mesh.material);
+        }
+        nodeMap.delete(handle);
+        removedHandles.push(handle);
+        sceneChanged = true;
+    }
+
+    // Geometry caches for explicit instOf sharing and M3 storage aliases.
+    const geoByHandle = new Map();
+    const geometryByM3Storage = new Map();
+    let reusedM3GeometryCount = 0;
+    // Built lazily on the first skin node — bone rest poses resolve through it.
+    let ndByHandle = null;
+
+    for (const nd of meta.nodes) {
+        let mesh = nodeMap.get(nd.h);
+        if (nd.helper === true) {
+            if (mesh && mesh.userData?.maxjsHelper !== true) {
+                removeNodeObject(mesh);
+                releaseGeometryRef(refCounts, mesh.geometry);
+                hooks.disposeMaterial(mesh.material);
+                mesh = null;
+            }
+            if (!mesh) {
+                mesh = new THREE.Object3D();
+                mesh.matrixAutoUpdate = false;
+                mesh.frustumCulled = false;
+                nodeMap.set(nd.h, mesh);
+                addedHandles.push(nd.h);
+                sceneChanged = true;
+            }
+            mesh.name = nd.n ?? '';
+            mesh.userData ??= {};
+            mesh.userData.maxjsHandle = nd.h;
+            mesh.userData.maxjsHelper = true;
+            if (typeof nd.userProps === 'string' && nd.userProps) {
+                mesh.userData.maxjsUserProps = nd.userProps;
+            } else {
+                delete mesh.userData.maxjsUserProps;
+            }
+            syncParent(mesh, nd, nodeMap, maxRoot);
+            const visChanged = hooks.applyVisibility(mesh, nd.vis);
+            const xformChanged = applyTransform(mesh, nd.t, maxRoot);
+            if (nd.s != null) hooks.applySelection(mesh, nd.s);
+            markOwned(mesh, OWNER_MAX);
+            if (visChanged || xformChanged) transformsChanged = true;
+            continue;
+        }
+
+        // Instance buckets — early-out if this handle is currently bucketed.
+        if (stableBucketHandles?.has(nd.h) && hooks.getInstanceBucketFor(nd.h)) {
+            if (hooks.updateInstanceBucketNode(nd.h, nd)) transformsChanged = true;
+            if (mesh) {
+                hooks.applyJsmodSyncState(mesh, !!nd.jsmod);
+                hooks.applyInstanceSyncState(mesh, nd.instOf);
+                if (nd.s != null) hooks.applySelection(mesh, nd.s);
+            }
+            continue;
+        }
+
+        const jsmodFlag = !!nd.jsmod;
+        const instSrcMesh = nd.instOf ? nodeMap.get(nd.instOf) : null;
+        const sharesInstGeom = !!(mesh && instSrcMesh && mesh.geometry === instSrcMesh.geometry);
+        const jsmodSkipGeo = jsmodFlag && mesh && !sharesInstGeom;
+
+        // Geometry — instance share, fresh build, or reuse.
+        let geom = mesh?.geometry;
+        if (nd.instOf && !nd.geo) {
+            const srcGeom = geoByHandle.get(nd.instOf) || instSrcMesh?.geometry;
+            if (srcGeom) geom = resolveInstancedNodeGeometry(nd, srcGeom, { cloneForJsmod: jsmodFlag });
+        } else if (nd.geo && !jsmodSkipGeo) {
+            const reuseKey = ordinaryM3GeometryStorageKey(nd);
+            const reused = reuseKey ? geometryByM3Storage.get(reuseKey) : null;
+            if (reused) {
+                geom = reused;
+                reusedM3GeometryCount++;
+            } else {
+                const built = geometryFromNodeBinary(nd, buffer);
+                if (!built) continue;
+                geom = built;
+                hooks.setVertexColors(geom, nd.geo.vc, buffer);
+                applyInstanceGeometryGroups(geom, nd.groups);
+                if (nd.skin && !nd.spline) attachSkinAttributes(geom, nd, buffer);
+                if (!nd.spline) attachMorphAttributes(geom, nd, buffer);
+                if (reuseKey) geometryByM3Storage.set(reuseKey, geom);
+            }
+        } else if (geom && nd.groups) {
+            geom = syncNodeGeometryGroups(mesh, geom, nd.groups, nodeMap);
+        }
+
+        if (geom) geoByHandle.set(nd.h, geom);
+
+        const wantsLine = !!nd.spline;
+        const hasLineRenderable = !!(mesh?.isLine || mesh?.isLineSegments);
+        const renderableTypeMismatch = !!mesh && wantsLine !== hasLineRenderable;
+        const skinTypeMismatch = !!mesh && nd.skin && !mesh.isSkinnedMesh && !wantsLine;
+
+        if (renderableTypeMismatch || skinTypeMismatch) {
+            removeNodeObject(mesh);
+            releaseGeometryRef(refCounts, mesh.geometry);
+            hooks.disposeMaterial(mesh.material);
+            nodeMap.delete(nd.h);
+            mesh = null;
+            sceneChanged = true;
+        }
+
+        if (mesh) {
+            // Existing mesh — update geometry if changed, ask hooks if material changed.
+            if (!jsmodSkipGeo && geom && geom !== mesh.geometry) {
+                releaseGeometryRef(refCounts, mesh.geometry);
+                retainGeometryRef(refCounts, geom);
+                mesh.geometry = geom;
+                mesh.updateMorphTargets?.();
+                const infl = nd.morph?.infl;
+                if (Array.isArray(mesh.morphTargetInfluences) && infl?.length) {
+                    const n = Math.min(mesh.morphTargetInfluences.length, infl.length);
+                    for (let i = 0; i < n; i++) {
+                        const v = Number(infl[i]);
+                        mesh.morphTargetInfluences[i] = Number.isFinite(v) ? v : 0;
+                    }
+                }
+            }
+            if (hooks.materialUpdater({ mesh, nd, wantsLine, geom })) {
+                sceneChanged = true;
+                hooks.onMaterialApplied(nd.h, mesh);
+            }
+            if (!wantsLine) ensureGeometryUv0ForMaterial(mesh.geometry, mesh.material);
+        } else {
+            if (!geom) continue;
+            const material = hooks.materialBuilder({ nd, geom, wantsLine });
+            if (!wantsLine) ensureGeometryUv0ForMaterial(geom, material);
+            if (wantsLine) {
+                mesh = new THREE.LineSegments(geom, material);
+            } else if (nd.skin) {
+                ndByHandle ??= new Map(meta.nodes.map((n) => [n.h, n]));
+                mesh = buildSkinnedMeshFromNd({
+                    nd, geom, material, buffer, nodeMap,
+                    resolveNodeDescriptor: (handle) => ndByHandle.get(handle),
+                }) ?? new THREE.Mesh(geom, material);
+            } else {
+                mesh = new THREE.Mesh(geom, material);
+                // Plain mesh with morph targets: the Mesh ctor's updateMorphTargets()
+                // built morphTargetInfluences/Dictionary from geom.morphAttributes;
+                // seed the initial influences (the mixer drives them per-frame via
+                // `.morphTargetInfluences[i]`). Mutate in place so mixer bindings hold.
+                const infl = nd.morph?.infl;
+                if (Array.isArray(mesh.morphTargetInfluences) && infl?.length) {
+                    const n = Math.min(mesh.morphTargetInfluences.length, infl.length);
+                    for (let i = 0; i < n; i++) {
+                        const v = Number(infl[i]);
+                        mesh.morphTargetInfluences[i] = Number.isFinite(v) ? v : 0;
+                    }
+                }
+            }
+            mesh.matrixAutoUpdate = false;
+            mesh.frustumCulled = false;
+            mesh.name = nd.n ?? '';
+            mesh.userData.maxjsHandle = nd.h;
+            mesh.castShadow = nd.props?.cshadow !== false && nd.props?.cshadow !== 0;
+            mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
+            hooks.stampMaterial(mesh, nd);
+            syncParent(mesh, nd, nodeMap, maxRoot);
+            nodeMap.set(nd.h, mesh);
+            retainGeometryRef(refCounts, mesh.geometry);
+            addedHandles.push(nd.h);
+            sceneChanged = true;
+            hooks.onMaterialApplied(nd.h, mesh);
+        }
+
+        mesh.castShadow = nd.props?.cshadow !== false && nd.props?.cshadow !== 0;
+        mesh.receiveShadow = nd.props?.rshadow !== false && nd.props?.rshadow !== 0;
+
+        // Max user-defined properties (adapter.userProps reads this stamp).
+        // Full payloads omit the field when the buffer is empty.
+        if (typeof nd.userProps === 'string' && nd.userProps) mesh.userData.maxjsUserProps = nd.userProps;
+        else delete mesh.userData.maxjsUserProps;
+        hooks.applyJsmodSyncState(mesh, jsmodFlag);
+
+        // Transform + visibility (a tiny subset of finalizeSceneNode).
+        syncParent(mesh, nd, nodeMap, maxRoot);
+        const visChanged = hooks.applyVisibility(mesh, nd.vis);
+        const xformChanged = applyTransform(mesh, nd.t, maxRoot);
+        if (nd.s != null) hooks.applySelection(mesh, nd.s);
+        markOwned(mesh, OWNER_MAX);
+        if (visChanged || xformChanged) transformsChanged = true;
+    }
+
+    if (Object.prototype.hasOwnProperty.call(meta, 'forestInstances') || ctx.forestMeshes?.size) {
+        const instanced = applyForestInstances(meta.forestInstances ?? [], buffer, ctx, hooks);
+        if (instanced.sceneChanged) sceneChanged = true;
+    }
+
+    if (transformsChanged || sceneChanged) hooks.markRuntimeTransformsDirty();
+
+    // World matrix update + skinned bind pose pass.
+    scene?.updateMatrixWorld(true);
+    for (const mesh of nodeMap.values()) {
+        if (mesh?.isSkinnedMesh && mesh.skeleton && !mesh.userData._skelBound) {
+            mesh.skeleton.calculateInverses();
+            mesh.bind(mesh.skeleton, mesh.matrixWorld);
+            chooseSkinBindBasis(mesh, maxRoot);
+            // Inverses above captured the bind pose; only now may the bones
+            // move to the export-time stance (bones without animation tracks
+            // would otherwise stay frozen at bind pose).
+            applySkinRestPose(mesh);
+            mesh.userData._skelBound = true;
+        }
+    }
+
+    hooks.finalizeSceneSnapshot({
+        snapshot: meta,
+        transport: 'binary-scene',
+        applyStart,
+        producerBytes: meta.stats?.producerBytes ?? buffer.byteLength,
+        options: { ...options, bucketPlan, sceneChanged, reusedM3GeometryCount },
+    });
+
+    return {
+        sceneChanged,
+        transformsChanged,
+        applyMs: performance.now() - applyStart,
+        addedHandles,
+        removedHandles,
+        bucketSignature: bucketPlan.signature,
+        reusedM3GeometryCount,
+    };
+}

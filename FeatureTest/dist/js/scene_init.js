@@ -1,0 +1,294 @@
+// scene_init.js — renderer + scene + camera + controls bootstrap for
+// snapshot mode. Slim counterpart to the inline setup in web/index.html
+// lines ~1565-1875.
+//
+// Snapshot-mode scope (intentional differences from live):
+//   - No headset runtime. Snapshots support WebGL2, WebGPU, and TSL_GL.
+//   - No backend persistence (the snapshot wrapper declares the target).
+//   - No editor performance panel coupling — uses devicePixelRatio at 1×scale.
+//   - No grid helper, no postfx panel.
+//
+// Returns concrete handles only — no facades. The applier and layer manager
+// later reach into these directly the same way they do in live mode.
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+import { copyMaxComponentsToWorld } from './max_basis.js';
+import { resolveWebGPULimits } from './webgpu_limits.js';
+
+// ─── Renderer ─────────────────────────────────────────────────────────
+
+export function measureCanvasSize(canvas, width, height) {
+    const rect = canvas?.getBoundingClientRect?.();
+    const fallbackWidth = globalThis.innerWidth || canvas?.clientWidth || canvas?.width || 1;
+    const fallbackHeight = globalThis.innerHeight || canvas?.clientHeight || canvas?.height || 1;
+    const rawWidth = Number.isFinite(width) && width > 0
+        ? width
+        : (rect?.width || canvas?.clientWidth || fallbackWidth);
+    const rawHeight = Number.isFinite(height) && height > 0
+        ? height
+        : (rect?.height || canvas?.clientHeight || fallbackHeight);
+    return {
+        width: Math.max(1, Math.round(rawWidth)),
+        height: Math.max(1, Math.round(rawHeight)),
+    };
+}
+
+// Device pixel ratio, clamped by the cap the boot derives from the snapshot
+// (PowerShot's resolutionScale undersamples the frame on purpose — a >1 DPR
+// canvas above that ceiling is pure overdraw, worst on phones at DPR 3).
+function resolvePixelRatio(renderer) {
+    const cap = Number(renderer?.userData?.maxjsPixelRatioCap);
+    const dpr = devicePixelRatio || 1;
+    return Number.isFinite(cap) && cap > 0 ? Math.min(dpr, cap) : dpr;
+}
+
+function configureRenderer(renderer, canvas, pixelRatioCap) {
+    const { width, height } = measureCanvasSize(canvas);
+    renderer.userData ??= {};
+    if (Number.isFinite(pixelRatioCap) && pixelRatioCap > 0) {
+        renderer.userData.maxjsPixelRatioCap = pixelRatioCap;
+    }
+    renderer.setPixelRatio(resolvePixelRatio(renderer));
+    renderer.setSize(width, height, /* updateStyle */ false);
+    renderer.toneMapping = THREE.NeutralToneMapping;
+    renderer.toneMappingExposure = 1.0;
+    renderer.shadowMap.enabled = true;
+}
+
+async function initializeRenderer(renderer) {
+    if (typeof renderer.init === 'function') await renderer.init();
+}
+
+/**
+ * Picks the renderer backend.
+ *   backend === 'webgl'  → WebGLRenderer
+ *   backend === 'webgpu' → WebGPURenderer, native WebGPU required
+ *   backend === 'tsl_gl' → WebGPURenderer with the WebGL backend
+ *   default              → 'webgl'
+ *
+ * Always renders into the supplied canvas (no implicit DOM injection).
+ */
+export async function createRenderer(canvas, { backend = 'webgl', pixelRatioCap } = {}) {
+    if (!canvas) throw new Error('createRenderer: canvas is required');
+
+    const rawBackend = String(backend || 'webgl').toLowerCase();
+    const normalizedBackend = rawBackend.includes('webgpu')
+        ? 'webgpu'
+        : (rawBackend.includes('tsl') ? 'tsl_gl' : 'webgl');
+    const renderer = normalizedBackend === 'webgpu'
+        ? await createWebGpuRenderer(canvas)
+        : (normalizedBackend === 'tsl_gl'
+            ? createTslGlRenderer(canvas)
+            : createWebGlRenderer(canvas));
+    configureRenderer(renderer, canvas, pixelRatioCap);
+    await initializeRenderer(renderer);
+
+    // WebGPU's RectAreaLightNode does not lazily create its LTC lookup
+    // textures. The editor installs them during boot; snapshot hosts need the
+    // same one-time setup before compiling materials that see area lights.
+    if (THREE.RectAreaLightNode?.setLTC) {
+        const { RectAreaLightTexturesLib } = await import(
+            'three/addons/lights/RectAreaLightTexturesLib.js'
+        );
+        THREE.RectAreaLightNode.setLTC(RectAreaLightTexturesLib.init());
+    }
+
+    if (normalizedBackend === 'webgpu' && renderer.backend?.isWebGPUBackend !== true) {
+        renderer.dispose?.();
+        throw new Error(
+            '[scene_init] Native WebGPU is not available. ' +
+            'Open snapshot.html for the WebGL deploy target instead.',
+        );
+    }
+
+    return {
+        renderer,
+        backendLabel: normalizedBackend === 'webgpu'
+            ? 'WebGPU'
+            : (normalizedBackend === 'tsl_gl' ? 'TSL_GL' : 'WebGL2'),
+    };
+}
+
+function createWebGlRenderer(canvas) {
+    if (typeof THREE.WebGLRenderer !== 'function') {
+        throw new Error('[scene_init] THREE.WebGLRenderer is not available in this snapshot wrapper.');
+    }
+    return new THREE.WebGLRenderer({
+        canvas, antialias: true, alpha: true, powerPreference: 'high-performance',
+    });
+}
+
+function createTslGlRenderer(canvas) {
+    if (typeof THREE.WebGPURenderer !== 'function') {
+        throw new Error('[scene_init] WebGPURenderer is required for the TSL_GL snapshot target.');
+    }
+    return new THREE.WebGPURenderer({
+        canvas,
+        antialias: true,
+        alpha: true,
+        powerPreference: 'high-performance',
+        forceWebGL: true,
+    });
+}
+
+async function createWebGpuRenderer(canvas) {
+    if (typeof THREE.WebGPURenderer !== 'function') {
+        throw new Error(
+            '[scene_init] THREE.WebGPURenderer is not available in this snapshot wrapper. ' +
+            'Use snapshot_webgpu.html for the WebGPU deploy target.',
+        );
+    }
+    if (!globalThis.navigator?.gpu) {
+        throw new Error(
+            '[scene_init] Native WebGPU is not available. ' +
+            'Open snapshot.html for the WebGL deploy target instead.',
+        );
+    }
+    // Chromium ignores powerPreference for WebGPU adapter selection on Windows
+    // and warns once for this probe and again when WebGPURenderer initializes.
+    // Keep the hint on the WebGL paths, where it is honored, but let native
+    // WebGPU use the platform's adapter policy.
+    const adapter = await globalThis.navigator.gpu.requestAdapter().catch(() => null);
+    if (!adapter) {
+        throw new Error(
+            '[scene_init] Native WebGPU adapter is not available. ' +
+            'Open snapshot.html for the WebGL deploy target instead.',
+        );
+    }
+    const requiredLimits = await resolveWebGPULimits();
+    return new THREE.WebGPURenderer({ canvas, antialias: true, alpha: true, requiredLimits });
+}
+
+// ─── Scene + groups + cameras + controls ──────────────────────────────
+
+const MAXJS_LAYER_SSR_EXCLUDE = 1; // Mirrors index.html constant. Keep in sync.
+
+const DARK_BG = 0x353535;
+
+/**
+ * Creates the canonical max.js scene topology:
+ *
+ *   scene
+ *     └── maxBasisRoot   (rotation.x = -PI/2 — Max Z-up → Three Y-up)
+ *           ├── maxRoot       (synced Max content)
+ *           └── overlayRoot   (HUD-like world content rendered on top)
+ *     └── jsRoot          (runtime-owned, Y-up native)
+ *
+ * Returns concrete handles plus a perspective camera, OrbitControls, a
+ * default-lights group (hidden until the applier decides whether to show
+ * it), and a `resize(width, height)` helper.
+ */
+export function createScene({ renderer, canvas } = {}) {
+    if (!renderer) throw new Error('createScene: renderer is required');
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(DARK_BG);
+
+    const maxBasisRoot = new THREE.Group();
+    maxBasisRoot.name = '__maxjs_max_basis_root__';
+    maxBasisRoot.rotation.x = -Math.PI / 2;
+    scene.add(maxBasisRoot);
+
+    const maxRoot = new THREE.Group();
+    maxRoot.name = '__maxjs_max_root__';
+    maxBasisRoot.add(maxRoot);
+
+    const jsRoot = new THREE.Group();
+    jsRoot.name = '__maxjs_js_root__';
+    scene.add(jsRoot);
+
+    const overlayRoot = new THREE.Group();
+    overlayRoot.name = '__maxjs_overlay_root__';
+    maxBasisRoot.add(overlayRoot);
+
+    // One stable render camera is shared by post-FX and runtime consumers.
+    // Snapshots can export many portable scene-camera records and apply them
+    // onto this object without replacing consumer references. Orthographic
+    // projection remains a separate compatibility concern.
+    const cameraDefaultPosition = copyMaxComponentsToWorld(new THREE.Vector3(), 200, -200, 150);
+
+    const initialSize = measureCanvasSize(canvas ?? renderer.domElement);
+    const camera = new THREE.PerspectiveCamera(60, initialSize.width / initialSize.height, 1, 100000);
+    camera.up.set(0, 1, 0);
+    camera.position.copy(cameraDefaultPosition);
+    camera.layers.enable(MAXJS_LAYER_SSR_EXCLUDE);
+
+    const controls = new OrbitControls(camera, canvas ?? renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    // Snapshot navigation matches the live viewer: interactive orbit/pan is
+    // available, but the wheel never dollies the camera.
+    controls.enableZoom = false;
+    controls.zoomToCursor = true;
+    controls.screenSpacePanning = false;
+    controls.mouseButtons = {
+        LEFT: null,
+        MIDDLE: THREE.MOUSE.PAN,
+        RIGHT: null,
+    };
+    controls.zoomSpeed = 2.0;
+    controls.rotateSpeed = 0.5;
+    controls.panSpeed = 1.0;
+
+    // Alt+MMB = orbit (3ds Max style). Uses capture phase to beat OrbitControls.
+    const eventTarget = canvas ?? renderer.domElement;
+    eventTarget.addEventListener('pointerdown', e => {
+        if (e.button === 1 && controls.enabled) {
+            controls.mouseButtons.MIDDLE = e.altKey ? THREE.MOUSE.ROTATE : THREE.MOUSE.PAN;
+        }
+    }, true);
+    eventTarget.addEventListener('pointerup', e => {
+        if (e.button === 1) controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+    }, true);
+    // Snapshot pages default to *interactive* — opposite of live mode where
+    // cam-lock is on by default. Snapshots are demos; users expect to drag.
+    controls.enabled = true;
+
+    // Snapshot fallback lighting mirrors the live viewer headlight rig.
+    // It is only made visible when there are no authored lights/environment.
+    const defaultLights = new THREE.Group();
+    defaultLights.name = '__maxjs_default_lights__';
+    defaultLights.visible = false;
+    const defaultAmbient = new THREE.AmbientLight(0xffffff, 0.4);
+    defaultAmbient.userData.volumetricBypass = true;
+    defaultLights.add(defaultAmbient);
+    const defaultKey = new THREE.DirectionalLight(0xffffff, 2.5);
+    defaultKey.userData.volumetricBypass = true;
+    defaultKey.castShadow = false;
+    defaultKey.shadow.mapSize.set(2048, 2048);
+    defaultKey.shadow.camera.near = 0.1;
+    defaultKey.shadow.camera.far = 2000;
+    defaultKey.shadow.camera.left = -500;
+    defaultKey.shadow.camera.right = 500;
+    defaultKey.shadow.camera.top = 500;
+    defaultKey.shadow.camera.bottom = -500;
+    defaultKey.shadow.bias = -0.001;
+    defaultKey.shadow.normalBias = 0.02;
+    const defaultFill = new THREE.DirectionalLight(0xe8e8e8, 0.8);
+    defaultFill.userData.volumetricBypass = true;
+    defaultFill.position.set(-1, 1, 0.5);
+    defaultLights.add(defaultKey);
+    defaultLights.add(defaultFill);
+    scene.add(defaultLights);
+
+    // Resize handler — call from the wrapper on window resize / canvas changes.
+    function resize(width, height) {
+        const { width: w, height: h } = measureCanvasSize(canvas ?? renderer.domElement, width, height);
+        renderer.setPixelRatio(resolvePixelRatio(renderer));
+        renderer.setSize(w, h, /* updateStyle */ false);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        return { width: w, height: h, aspect: w / h };
+    }
+
+    return {
+        scene,
+        camera,
+        controls,
+        maxBasisRoot, maxRoot, jsRoot, overlayRoot,
+        defaultLights, defaultKey, defaultAmbient,
+        resize,
+    };
+}

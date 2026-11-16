@@ -909,12 +909,17 @@ export class GiProbeNode extends LightingNode {
             const sample = this.sampleIrradianceAndRough(P, reflectionP, stableNormal, detailNormal, R, reflectionWeight, roughLobeMix, stableTBN);
             const E = sample.get('irradiance').max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
             builder.context.irradiance.addAssign(E);
-            If(reflectionWeight.greaterThan(float(0.0)), () => {
-                const local = sample.get('roughRadiance').max(vec4(0.0)).toVar();
-                const covered = local.w.clamp(0.0, 1.0).mul(reflectionWeight);
-                builder.context.radiance.mulAssign(float(1.0).sub(covered));
-                builder.context.radiance.addAssign(local.rgb.mul(reflectionWeight));
-            });
+            // Composite without a branch. context.radiance belongs to Three's
+            // lighting context, which initializes it where it is first used. With
+            // no environment ahead of this node that first use was inside If(),
+            // and three r187 then initializes it a second time after the block,
+            // zeroing this layer: scenes without scene.environment lost their
+            // reflections. At weight 0 these two lines are the identity, and the
+            // atlas taps are already gated inside sampleIrradianceAndRough.
+            const local = sample.get('roughRadiance').max(vec4(0.0)).toVar();
+            const covered = local.w.clamp(0.0, 1.0).mul(reflectionWeight);
+            builder.context.radiance.mulAssign(float(1.0).sub(covered));
+            builder.context.radiance.addAssign(local.rgb.mul(reflectionWeight));
         } else {
             const E = this.sampleIrradiance(P, stableNormal, detailNormal, stableTBN).max(vec3(0.0)).mul(this.intensityNode).mul(this.enabledNode);
             builder.context.irradiance.addAssign(E);

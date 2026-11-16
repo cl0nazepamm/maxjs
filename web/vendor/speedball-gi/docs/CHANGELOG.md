@@ -3,6 +3,15 @@
 All notable changes to Speedball GI are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+- Fixed local reflections disappearing on three r187 in scenes with no
+  `scene.environment`. The reflection layer wrote `context.radiance` inside an
+  `If()`; when nothing had used that variable earlier, r187 initialized it
+  again after the block and discarded the layer. The composite is now
+  branchless (the identity at reflection intensity 0), so output on r185 and
+  r186 is unchanged.
+
 ## [0.13.0] — 2026-11-04
 
 - **Breaking:** the GI scene modules drop the name of the removed spectral

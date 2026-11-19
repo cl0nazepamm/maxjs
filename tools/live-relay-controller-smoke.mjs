@@ -277,21 +277,21 @@ function fakeResponse(status) {
     assert.equal(controller.state, RELAY_STATES.STREAMING);
 
     // Every sync lane the viewer consumes is forwarded: geometry fast-lane
-    // packets ride as ordered binary continuations, clay mode as an ordered JSON
+    // packets ride as ordered binary continuations, the camera as an ordered JSON
     // message.
     host.shared(Uint8Array.from([9, 9]).buffer, { type: 'geo_fast', h: 1 });
-    host.message({ type: 'clay_mode', enabled: true });
+    host.message({ type: 'cam', camera: { fov: 50 } });
     const geoFast = await waitFor(
         () => posts.find((entry) => entry.isBinary && entry.decoded.meta.type === 'geo_fast')?.decoded,
         'geo_fast forwarded');
-    const clay = await waitFor(
-        () => posts.find((entry) => entry.json?.data?.type === 'clay_mode')?.json,
-        'clay_mode forwarded');
+    const cam = await waitFor(
+        () => posts.find((entry) => entry.json?.data?.type === 'cam')?.json,
+        'cam forwarded');
     assert.equal(geoFast.relay.sceneRevision, 1);
     assert.ok(geoFast.relay.sequence > 0);
     assert.deepEqual([...geoFast.payload], [9, 9]);
-    assert.equal(clay.data.enabled, true);
-    assert.equal(clay.relay.sceneRevision, 1);
+    assert.equal(cam.data.camera.fov, 50);
+    assert.equal(cam.relay.sceneRevision, 1);
 
     relayStatus.needScene = true;
     relayStatus.sceneRequestId = 1;

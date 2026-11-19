@@ -973,6 +973,10 @@
     }
 
     void Destroy() {
+        // The viewport that shows this panel's frames goes back to 3ds Max's own shading.
+        if (vpStreamEnabled_) MaxJSViewportStream::OnPanelClosing();
+        vpStreamEnabled_ = false;
+        CloseViewportStreamBuffer();
         StopActiveShade();
         if (hwnd_) KillTimer(hwnd_, RENDER_SEQUENCE_TIMER_ID);
         FinishRenderSequence(false);
@@ -1076,6 +1080,9 @@
             return 0;
         case WM_RENDER_SEQUENCE_STEP:
             if (p) p->PumpRenderSequenceStep();
+            return 0;
+        case WM_VIEWPORT_FRAME:
+            if (p) p->OnViewportFramePosted();
             return 0;
         case WM_TIMER:
             if (wParam == SYNC_TIMER_ID && p) p->OnTimer();

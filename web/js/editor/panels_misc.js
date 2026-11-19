@@ -1,5 +1,4 @@
-// panels_misc.js - editor rail buttons, panel visibility, clay/ascii, and studio persistence glue.
-import * as THREE from 'three';
+// panels_misc.js - editor rail buttons, panel visibility, ascii, and studio persistence glue.
 import { AsciiEffect } from 'three/addons/effects/AsciiEffect.js';
 import { createCanvasPanel } from '../canvas_panel.js';
 import { createShaderLabPanel } from '../shader_lab_panel.js';
@@ -29,17 +28,6 @@ function createPanelsMisc(deps = {}) {
             button.setAttribute('aria-label', label);
         }
 
-
-        // ── Clay Mode ───────────────────────────────────
-        let clayModeActive = false;
-        const defaultShadingLabel = 'Default Shading';
-        const shadingMenuLabel = document.querySelector('[data-shading-label]');
-
-        function updateShadingMenuLabel(isClay) {
-            if (!shadingMenuLabel) return;
-            const label = isClay ? 'Clay' : defaultShadingLabel;
-            if (shadingMenuLabel.textContent !== label) shadingMenuLabel.textContent = label;
-        }
 
         // ── ASCII Effect (full takeover) ──
         let asciiPreFxSnapshot = null;
@@ -105,93 +93,6 @@ function createPanelsMisc(deps = {}) {
             deps.applyFrameElementStyle(deps.asciiEffect.domElement, rect);
             document.body.appendChild(deps.asciiEffect.domElement);
         }
-        let clayPreFxSnapshot = null;
-        const clayMat = new THREE.MeshStandardMaterial({
-            color: 0x9d3d31, roughness: 0.6, metalness: 0.05, side: THREE.DoubleSide,
-        });
-
-        function enterClayMode() {
-            if (!clayPreFxSnapshot) {
-                // Snapshot current FX state once. Forced native resends must not
-                // overwrite the user's restore target with the already-muted clay state.
-                clayPreFxSnapshot = {
-                    ssgi: deps.maxjsFx.isEnabled(),
-                    ssr: deps.maxjsFx.isSSREnabled(),
-                    gtao: deps.maxjsFx.isGTAOEnabled(),
-                    bloom: deps.maxjsFx.isBloomEnabled(),
-                    toonOutline: deps.maxjsFx.isToonOutlineEnabled(),
-                    motionBlur: deps.maxjsFx.isMotionBlurEnabled(),
-                    traa: deps.maxjsFx.isTRAAEnabled(),
-                    contactShadow: deps.maxjsFx.isContactShadowEnabled(),
-                    retro: deps.maxjsFx.isRetroEnabled(),
-                    volumetric: deps.maxjsFx.isVolumetricEnabled(),
-                    pixel: deps.maxjsFx.isPixelEnabled(),
-                    powershot: deps.maxjsFx.isPowerShotEnabled(),
-                    clone: deps.maxjsFx.isCloneEnabled(),
-                };
-                // Disable everything
-                deps.maxjsFx.setCloneEnabled(false);
-                deps.maxjsFx.setEnabled(false);
-                deps.maxjsFx.setSSREnabled(false);
-                deps.maxjsFx.setBloomEnabled(false);
-                deps.maxjsFx.setToonOutlineEnabled(false);
-                deps.maxjsFx.setMotionBlurEnabled(false);
-                deps.maxjsFx.setTRAAEnabled(false);
-                deps.maxjsFx.setContactShadowEnabled(false);
-                deps.maxjsFx.setRetroEnabled(false);
-                deps.maxjsFx.setVolumetricEnabled(false);
-                deps.maxjsFx.setPixelEnabled(false);
-                deps.maxjsFx.setPowerShotEnabled(false);
-                deps.maxjsFx.setGTAOEnabled(false);
-            }
-            if (deps.maxjsFx.setClayOverride) deps.maxjsFx.setClayOverride(true);
-
-            // Use scene.overrideMaterial — renderer + shadow system use it natively,
-            // no per-mesh swap needed, no stale WebGPU TextureNode references.
-            deps.scene.overrideMaterial = clayMat;
-            deps.maxjsFx.markOutputChanged?.();
-        }
-
-        function exitClayMode() {
-            deps.scene.overrideMaterial = null;
-
-            // Restore FX state
-            if (clayPreFxSnapshot) {
-                if (deps.maxjsFx.setClayOverride) deps.maxjsFx.setClayOverride(false);
-                deps.maxjsFx.setGTAOEnabled(clayPreFxSnapshot.gtao);
-                deps.maxjsFx.setEnabled(clayPreFxSnapshot.ssgi);
-                deps.maxjsFx.setSSREnabled(clayPreFxSnapshot.ssr);
-                deps.maxjsFx.setBloomEnabled(clayPreFxSnapshot.bloom);
-                deps.maxjsFx.setToonOutlineEnabled(clayPreFxSnapshot.toonOutline);
-                deps.maxjsFx.setMotionBlurEnabled(clayPreFxSnapshot.motionBlur);
-                deps.maxjsFx.setTRAAEnabled(clayPreFxSnapshot.traa);
-                deps.maxjsFx.setContactShadowEnabled(clayPreFxSnapshot.contactShadow);
-                deps.maxjsFx.setRetroEnabled(clayPreFxSnapshot.retro);
-                deps.maxjsFx.setVolumetricEnabled(clayPreFxSnapshot.volumetric);
-                deps.maxjsFx.setPixelEnabled(clayPreFxSnapshot.pixel);
-                deps.maxjsFx.setPowerShotEnabled(clayPreFxSnapshot.powershot);
-                deps.maxjsFx.setCloneEnabled(clayPreFxSnapshot.clone);
-                clayPreFxSnapshot = null;
-            }
-            deps.maxjsFx.markOutputChanged?.();
-        }
-
-        deps.bridge.on('clay_mode', msg => {
-            if (deps.renderToImageActive) return;  // suppress during production render
-            const enabled = !!msg.enabled;
-            const needsApply = enabled
-                ? (!clayModeActive || deps.scene.overrideMaterial !== clayMat)
-                : (clayModeActive || deps.scene.overrideMaterial === clayMat || !!clayPreFxSnapshot);
-            if (!needsApply) {
-                updateShadingMenuLabel(enabled);
-                return;
-            }
-            clayModeActive = enabled;
-            updateShadingMenuLabel(enabled);
-            if (enabled) enterClayMode(); else exitClayMode();
-            deps.syncPostFxPanel(true, { persist: false });
-        });
-
 
         // ── Studio State Persistence ────────────────────────
         let studioPersistTimer = 0;
@@ -1108,8 +1009,6 @@ function createPanelsMisc(deps = {}) {
             btnPostFxPanel,
             rightDock,
             postPanel,
-            isClayModeActive: () => clayModeActive,
-            setClayPreFxSnapshot: (snapshot) => { clayPreFxSnapshot = snapshot; },
         };
 }
 

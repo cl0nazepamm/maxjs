@@ -755,10 +755,8 @@ struct CameraData {
     float dofBokehScale;    // artistic bokeh size multiplier
 };
 
-static void GetViewportCamera(CameraData& cam) {
+static void GetViewportCamera(CameraData& cam, ViewExp& vp) {
     Interface* ip = GetCOREInterface();
-
-    ViewExp& vp = ip->GetActiveViewExp();
 
     cam.perspective = vp.IsPerspView() != 0;
     cam.fov = vp.GetFOV() * (180.0f / 3.14159265f);
@@ -830,6 +828,11 @@ static void GetViewportCamera(CameraData& cam) {
             }
         }
     }
+}
+
+// The active viewport's camera.
+static void GetViewportCamera(CameraData& cam) {
+    GetViewportCamera(cam, GetCOREInterface()->GetActiveViewExp());
 }
 
 static bool GetSceneCameraData(INode* camNode, TimeValue t, CameraData& cam) {
@@ -1016,19 +1019,6 @@ static bool IsSceneCameraTargetNode(INode* node, TimeValue t) {
     if (!node || node->IsRootNode()) return false;
     ObjectState os = node->EvalWorldState(t);
     return os.obj && os.obj->ClassID() == Class_ID(TARGET_CLASS_ID, 0);
-}
-
-static MaxSDK::Graphics::IViewportViewSetting* GetViewportSettings() {
-    Interface* ip = GetCOREInterface();
-    if (!ip) return nullptr;
-    ViewExp& vp = ip->GetActiveViewExp();
-    return static_cast<MaxSDK::Graphics::IViewportViewSetting*>(
-        vp.GetInterface(IVIEWPORT_SETTINGS_INTERFACE_ID));
-}
-
-static bool IsClayModeActive() {
-    auto* s = GetViewportSettings();
-    return s && s->GetViewportVisualStyle() == MaxSDK::Graphics::VisualStyleClay;
 }
 
 static bool NearlyEqualFloat(float a, float b, float epsilon = 1.0e-4f) {

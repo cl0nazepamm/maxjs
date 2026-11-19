@@ -6,7 +6,8 @@
 // runs, with:
 //   addEventListener('message')              JSON control messages in
 //   addEventListener('sharedbufferreceived') binary payloads in (scene_bin,
-//                                            delta_bin, geo_fast, gi_*_bin)
+//                                            delta_bin, geo_fast, gi_*_bin,
+//                                            viewport_frame_buf)
 //   postMessage(obj)                         viewer -> host, {type, ...} objects
 //   releaseBuffer(buf)                       may be a no-op
 // The viewer opens with a `{type:'ready', contractVersion}` handshake and
@@ -35,6 +36,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
     });
     let readyRetryTimer = 0;
     const sharedBufferHandlers = new Map(); // meta.type -> (buf, meta) => void
+    const retainedBufferTypes = new Set();  // meta.type whose handler may keep the buffer
     let sharedBufferFallback = null;        // scene_bin & anything untyped
     const transportObservers = new Set();  // synchronous host traffic taps
     let lastDeliveredDeltaFrameId = null;
@@ -130,8 +132,19 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         setInfoText?.(`max.js - ${prefix}: ${message}`);
     }
 
-    function onSharedBuffer(type, fn) {
+    // A buffer is released as soon as its handler returns. With `retain`, a handler that returns
+    // true keeps it instead (a persistent buffer both sides go on using), and gives it back with
+    // releaseSharedBuffer() when done.
+    function onSharedBuffer(type, fn, { retain = false } = {}) {
         sharedBufferHandlers.set(type, fn);
+        if (retain) retainedBufferTypes.add(type);
+        else retainedBufferTypes.delete(type);
+    }
+
+    function releaseSharedBuffer(buf) {
+        if (!buf || !webview) return;
+        try { webview.releaseBuffer(buf); }
+        catch (err) { console.warn('[max.js host bridge] releaseBuffer failed', err); }
     }
 
     function onSharedBufferFallback(fn) {
@@ -182,6 +195,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         // valid inside the handler — released in finally.
         webview.addEventListener('sharedbufferreceived', e => {
             let buf = null;
+            let retained = false;
             try {
                 buf = e.getBuffer();
                 let meta = typeof e.additionalData === 'string'
@@ -211,10 +225,13 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
                 }
                 notifyTransportObservers({ kind: 'shared-buffer', buffer: deliveryBuffer, meta: meta ?? {} });
                 const handler = sharedBufferHandlers.get(meta?.type) || sharedBufferFallback;
-                if (handler) handler(deliveryBuffer, meta);
+                if (handler) {
+                    const result = handler(deliveryBuffer, meta);
+                    retained = result === true && retainedBufferTypes.has(meta?.type);
+                }
             } catch (err) { reportBridgeError('binary sync error', err); }
             finally {
-                if (buf) webview.releaseBuffer(buf);
+                if (buf && !retained) webview.releaseBuffer(buf);
             }
         });
         return true;
@@ -231,6 +248,7 @@ function createHostBridge({ setInfoText, onFirstSync, onBeforeReady } = {}) {
         startBridgeHandshake,
         reportBridgeError,
         onSharedBuffer,
+        releaseSharedBuffer,
         onSharedBufferFallback,
         observeTransport,
         installHostWiring,

@@ -26,9 +26,14 @@ function createRenderLoop(deps = {}) {
             if (sceneLoadGate?.isBlockingRender?.()) return;
             const gateFirstFrame = sceneLoadGate?.isFirstFrame?.() === true;
             if (deps.renderToImageActive && !deps.pendingRenderToImage) return;
+            // Host viewport stream (viewport_stream.js): while the host pulls frames on request,
+            // those renders are the frame loop, and a requested frame is never held back.
+            const viewportStream = deps.viewportStream ?? null;
+            if (viewportStream?.shouldSkipLoopFrame()) return;
+            const hostRequestedFrame = viewportStream?.isRenderingRequest() === true;
             deps.longTaskMonitor?.setPhase?.(gateFirstFrame ? 'scene:first-frame' : 'render');
             const manualFpsCap = Number.isFinite(deps.performanceSettings.fpsCap) ? deps.performanceSettings.fpsCap : 0;
-            if (!deps.renderer.xr?.isPresenting && manualFpsCap > 0) {
+            if (!deps.renderer.xr?.isPresenting && manualFpsCap > 0 && !hostRequestedFrame) {
                 const minFrameMs = 1000 / manualFpsCap;
                 if (deps.lastRenderTimestamp !== 0 && (frameTimeMs - deps.lastRenderTimestamp) < minFrameMs) return;
             }
@@ -169,6 +174,8 @@ function createRenderLoop(deps = {}) {
                 deps.nirBandView.afterRender();
                 deps.layerManager.afterRender?.(frameElapsed);
             }
+            // The canvas holds this frame now: hand it to the host viewport, if one shows it.
+            if (!deps.renderToImageActive) viewportStream?.afterRender();
             if (gateFirstFrame) sceneLoadGate.end('rendered');
             // Clone blob overlay — draw bounding rects on 2D canvas
             if (deps.maxjsFx.isCloneEnabled() && !deps.renderToImageActive) {

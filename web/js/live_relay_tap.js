@@ -50,7 +50,6 @@ const JSON_FORWARD_TYPES = new Set([
     'gltf_update',
     'env_update',
     'probeGrids',
-    'clay_mode',
 ]);
 
 // Change-only host lanes observed during one resync are replayed after that
@@ -60,7 +59,7 @@ const KEYED_JSON_STATE = Object.freeze({
     audio_update: 'audios',
     gltf_update: 'gltfs',
 });
-const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'lightProbeSettings', 'clay_mode']);
+const WHOLE_JSON_STATE = new Set(['cam', 'env_update', 'probeGrids', 'lightProbeSettings']);
 const PANEL_JSON_TYPES = new Set(['lightProbeSettings', 'probeGrids']);
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const textEncoder = new TextEncoder();

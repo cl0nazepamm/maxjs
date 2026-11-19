@@ -80,6 +80,11 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE
     poly.lib
     MNMath.lib
     RenderingAPI.lib
+    # Nitrous view fragments (maxjs_viewport_fragment.cpp)
+    FragmentGraph.lib
+    GraphicsDriver.lib
+    GraphicsUtility.lib
+    MaxGraphicsObjects.lib
     comctl32.lib
     comdlg32.lib
     shlwapi.lib

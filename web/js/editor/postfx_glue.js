@@ -1185,25 +1185,11 @@ function createPostFxGlue(deps = {}) {
 
             document.getElementById('btnPostPanelReset').onclick = () => {
                 // Reset all FX values to defaults then disable.
-                // Does NOT touch HDRI or clay mode (only the clay restore snapshot).
-                if (deps.isClayModeActive?.()) {
-                    // Clay owns the live FX state — reset the snapshot so exit restores to defaults
-                    deps.setClayPreFxSnapshot?.({
-                        ssgi: false, ssr: false, gtao: false, bloom: false,
-                        toonOutline: false, motionBlur: false, traa: false, contactShadow: false,
-                        retro: false, volumetric: false, pixel: false, powershot: false, clone: false,
-                    });
-                    // Still push default values so they're ready when clay exits
-                    for (const section of postFxSections) {
-                        const values = getPostFxSectionDefaultValues(section);
-                        if (values) section.setValues(values);
-                    }
-                } else {
-                    for (const section of postFxSections) {
-                        section.setEnabled(false);
-                        const values = getPostFxSectionDefaultValues(section);
-                        if (values) section.setValues(values);
-                    }
+                // Does NOT touch HDRI.
+                for (const section of postFxSections) {
+                    section.setEnabled(false);
+                    const values = getPostFxSectionDefaultValues(section);
+                    if (values) section.setValues(values);
                 }
                 deps.currentToneMapping = deps.DEFAULT_TONE_MAPPING;
                 deps.currentExposure = 1.0;

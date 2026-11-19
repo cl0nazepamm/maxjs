@@ -28,6 +28,13 @@ void TogglePanel() {
         return;
     }
 
+    // While the GPU viewport runs the panel is only concealed: hiding it for real would stop the
+    // frames. The toggle brings it up and puts it away without touching the stream.
+    if (g_panel && g_panel->IsViewportStreamOn()) {
+        g_panel->ToggleViewportStreamPanel();
+        return;
+    }
+
     if (!g_panel) {
         g_panel = new MaxJSPanel();
         g_panel->Create(ip ? ip->GetMAXHWnd() : nullptr);
@@ -148,6 +155,57 @@ bool StartMaxJSRenderSequence(const std::wstring& outputPath,
         startFrame, endFrame, step, renderViewNode, renderViewParams);
 }
 
+// ── Viewport stream: the panel half of maxjs_viewport_stream.h ──────────────
+
+namespace MaxJSViewportStream {
+
+bool Start(int width, int height, std::wstring& error) {
+    if (g_panel && g_panel->IsViewportHosted()) {
+        error = L"ActiveShade is showing max.js in a viewport; stop it first";
+        return false;
+    }
+    // The stream needs the panel running but keeps its window out of sight; when it stops, the
+    // panel goes back to how the user had it. Concealed before it is shown, so it never flashes.
+    const bool panelWasVisible = g_panel && g_panel->hwnd_ && IsWindowVisible(g_panel->hwnd_);
+    if (g_panel && g_panel->hwnd_) g_panel->SetPanelConcealed(true);
+    EnsurePanel();
+    if (!g_panel) {
+        error = L"the max.js panel could not be opened";
+        return false;
+    }
+    return g_panel->StartViewportStream(width, height, panelWasVisible, error);
+}
+
+void Stop() {
+    if (g_panel) g_panel->StopViewportStream();
+}
+
+void SetRenderSize(int width, int height) {
+    if (g_panel) g_panel->SetViewportStreamRenderSize(width, height);
+}
+
+void SetMaxFps(int fps) {
+    if (g_panel) g_panel->SetViewportStreamMaxFps(fps);
+}
+
+bool HasNewFrame(std::uint32_t lastSeq) {
+    return g_panel && g_panel->ViewportStreamHasNewFrame(lastSeq);
+}
+
+bool Acquire(std::uint32_t lastSeq, int lockstepMs, Frame& frame) {
+    return g_panel && g_panel->AcquireViewportFrame(lastSeq, lockstepMs, frame);
+}
+
+void Release(const Frame& frame, bool consumed) {
+    if (g_panel) g_panel->ReleaseViewportFrame(frame, consumed);
+}
+
+std::wstring Status() {
+    return g_panel ? g_panel->ViewportStreamStatus() : std::wstring(L"stream=off (no panel)");
+}
+
+}  // namespace MaxJSViewportStream
+
 static void RegisterMaxScript() {
     wchar_t script[8192];
     swprintf_s(script, 8192,
@@ -166,6 +224,13 @@ static void RegisterMaxScript() {
         L"macroScript MaxJS_RefreshInstances category:\"max.js\" tooltip:\"Send Dirty Signal\" buttonText:\"Send Dirty Signal\" (\r\n"
         L"    windows.sendMessage MaxJS_HWND %d 0 0\r\n"
         L")\r\n"
+        // max.js GPU Viewport: the viewer's frame in the active viewport, under
+        // 3ds Max's own gizmos (maxjs_viewport_fragment.cpp). MaxJSViewport is
+        // its interface. Checked in the viewport that shows the frame.
+        L"macroScript MaxJS_GpuViewport category:\"max.js\" tooltip:\"max.js GPU Viewport\" buttonText:\"max.js GPU Viewport\" (\r\n"
+        L"    on execute do MaxJSViewport.toggle()\r\n"
+        L"    on isChecked do MaxJSViewport.isOnActiveViewport\r\n"
+        L")\r\n"
         // Menu registration targets the 2025+ CUI menu system (legacy menuMan
         // was removed there, so the pre-2026 path is gone on every supported
         // target). Menus are rebuilt from the #cuiRegisterMenus callback on
@@ -180,9 +245,15 @@ static void RegisterMaxScript() {
         L"    local mainBar = menuMgr.mainMenuBar\r\n"
         L"    local subMenu = mainBar.CreateSubMenu \"{80E4C769-A2CB-4862-9925-FF51611A3B0F}\" \"max.js\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{792F423F-6E43-4C16-83E2-841C26556502}\" \"MaxJS_Toggle\" \"max.js\" title:\"max.js\"\r\n"
+        L"    subMenu.CreateMacroScriptAction \"{6C1B7E52-0E0B-4F5E-9B43-2D5A6B7F81C4}\" \"MaxJS_GpuViewport\" \"max.js\" title:\"max.js GPU Viewport\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{792A1612-3D6F-46C2-AE4B-224362BB1C13}\" \"MaxJS_Snapshot\" \"max.js\" title:\"Snapshot\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{0DC622F5-7777-493C-B89C-909E0D5CBB49}\" \"MaxJS_RefreshInstances\" \"max.js\" title:\"Send Dirty Signal\"\r\n"
         L"    subMenu.CreateMacroScriptAction \"{4B9D5C3D-1288-411A-9CCD-B156680171BE}\" \"MaxJS_Kill\" \"max.js\" title:\"Kill max.js\"\r\n"
+        // The viewport's own shading label menu, where the other in-viewport
+        // renderers are listed (ActiveShade, Arnold Viewport, V-Ray Viewport
+        // IPR), ahead of the separator that closes that group.
+        L"    local shadingMenu = menuMgr.GetMenuById \"{46133489-146E-4913-BAB5-688159712E5B}\"\r\n"
+        L"    if shadingMenu != undefined do shadingMenu.CreateMacroScriptAction \"{16F9B6BC-378F-4B80-948A-5F5FD5C1CEEE}\" \"MaxJS_GpuViewport\" \"max.js\" title:\"max.js GPU Viewport\" beforeId:\"{2014239B-FBF4-47BE-B15E-0BEB74ECA64A}\"\r\n"
         L")\r\n"
         L"callbacks.addScript #cuiRegisterMenus \"maxjs_registerMenus()\" id:#maxjsMenus\r\n"
         L"try (\r\n"

@@ -24,6 +24,7 @@
         import { createPathTracer, normalizePathTracerSettings } from './path_tracer.js';
         import { createRenderCapture } from './render_capture.js';
         import { createRenderLoop } from './render_loop.js';
+        import { createViewportStream } from './viewport_stream.js';
         import { createSceneLoadGate } from './scene_load_gate.js';
         import { createLongTaskMonitor } from '../long_task_monitor.js';
         import { suppressKnownExrMetadataWarnings } from '../exr_warnings.js';
@@ -256,8 +257,11 @@
         let renderer = null;
         let rendererBackendLabel = 'WebGPU';
         let lightLinkingRef = null;
+        // Created with the host bridge further down; the renderer core only asks it for a size.
+        let viewportStream = null;
         const rendererCore = createRendererCore({
             getRenderOutputAspect,
+            getHostViewportSize: () => viewportStream?.getHostSize() ?? null,
             setRailButtonMeta: (...args) => setRailButtonMeta(...args),
             setViewportMenuItemHidden: (...args) => setViewportMenuItemHidden(...args),
             get renderer() { return renderer; },
@@ -1098,6 +1102,23 @@
         const bridgeHasInitialSync = hostBridge.hasInitialSync;
         ctx.hostBridge = hostBridge;
         ctx.bridge = bridge;
+
+        // ── Host viewport stream ──────────────────────────── (./viewport_stream.js)
+        // The host can show this viewer's frame inside one of its own viewports,
+        // under its own gizmos. It posts one persistent frame buffer, says what
+        // size to render, and may ask for a frame of a given camera at once.
+        viewportStream = createViewportStream({
+            getRenderer: () => renderer,
+            send: (type, data) => bridge.send(type, data),
+            releaseSharedBuffer: buffer => hostBridge.releaseSharedBuffer(buffer),
+            applyCamera: cam => applyCamera(cam),
+            renderNow: () => renderFrame(performance.now()),
+            onHostSizeChanged: () => scheduleRendererResize(),
+            isCaptureSuspended: () => renderToImageActive,
+        });
+        hostBridge.onSharedBuffer('viewport_frame_buf', buffer => viewportStream.attachBuffer(buffer), { retain: true });
+        bridge.on('viewport_stream', msg => viewportStream.setState(msg));
+        bridge.on('viewport_frame_request', msg => viewportStream.handleRequest(msg));
 
         // Relay is a hard opt-in boundary. Until the RELAY button (or the
         // public relay facade) is enabled, the relay module is not imported,
@@ -2086,8 +2107,6 @@
             btnPostFxPanel,
             rightDock,
             postPanel,
-            isClayModeActive,
-            setClayPreFxSnapshot,
         } = panelsMisc;
         syncRendererButtonUi();
 
@@ -2240,8 +2259,6 @@
             btnPostFxPanel,
             postPanel,
             rightDock,
-            isClayModeActive,
-            setClayPreFxSnapshot,
             get _projectRuntimeRef() { return _projectRuntimeRef; },
             get asciiActive() { return asciiActive; },
             get asciiSettings() { return asciiSettings; },
@@ -2387,8 +2404,10 @@
         // tracks the drag (browser scales stale pixels smoothly), but defer
         // the drawing-buffer resize + post-FX rebuild until dragging settles.
         // One pipeline churn event per resize gesture instead of dozens.
+        // The host viewport stream goes through the same path when the host
+        // viewport it renders for changes size.
         let resizeTimer = null;
-        addEventListener('resize', () => {
+        function scheduleRendererResize() {
             // CSS-only update keeps the canvas visually filling the viewport
             // during drag. No drawing-buffer resize → no swap chain churn.
             applyRenderViewportLayout({ resizeBuffers: false, resizePostFx: false });
@@ -2398,7 +2417,8 @@
                 maxjsFx.resize();
                 webglBasicFx.resize?.();
             }, 150);
-        });
+        }
+        addEventListener('resize', scheduleRendererResize);
 
         // ── Headset runtime ──────────────────────────────────
         // Fragile integration: this path is intentionally isolated from snapshots/export
@@ -2492,6 +2512,7 @@
             sendCurrentCanvasRenderFile: (...args) => sendCurrentCanvasRenderFile(...args),
             syncPostFxPanel: (...args) => syncPostFxPanel(...args),
             get webglBasicFx() { return webglBasicFx; },
+            get viewportStream() { return viewportStream; },
             get renderer() { return renderer; },
             get scene() { return scene; },
             get camera() { return camera; },

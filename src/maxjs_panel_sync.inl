@@ -71,6 +71,17 @@
             cam = renderCameraOverride_;
             return;
         }
+        // The viewport stream draws the frame inside one viewport, under that viewport's own
+        // gizmos: the frame is that viewport's view, whichever viewport is active and whatever
+        // scene camera the panel is locked to.
+        const int streamViewId = MaxJSViewportStream::ViewId();
+        if (streamViewId >= 0) {
+            ViewExp& streamView = GetCOREInterface14()->GetViewExpByID(streamViewId);
+            if (streamView.IsAlive()) {
+                GetViewportCamera(cam, streamView);
+                return;
+            }
+        }
         if (lockedCameraHandle_ != 0) {
             Interface* ip = GetCOREInterface();
             INode* camNode = ip ? ip->GetINodeByHandle(lockedCameraHandle_) : nullptr;
@@ -3013,6 +3024,11 @@
         std::wstring type;
         ExtractJsonString(msg, L"type", type);
 
+        // One per streamed frame: handled first, ahead of the substring scans below.
+        if (type == L"viewport_frame") {
+            OnViewportFrameMessage(msg);
+            return;
+        }
         if (type == L"kill" || msg.find(L"\"kill\"") != std::wstring::npos) {
             RequestPanelKill();
             return;
@@ -3416,6 +3432,7 @@
             ResetFastPathState(false);
             SendProjectConfig();
             ScanInlineLayers();
+            OnViewportStreamJsReady();
             if (pendingSnapshotExportRequest_) RequestSnapshotExport();
         }
     }
@@ -3586,16 +3603,6 @@
 
     void PollViewportModes(bool force = false) {
         if (!webview_) return;
-
-        bool clay = IsClayModeActive();
-        if (force || clay != lastClayMode_) {
-            lastClayMode_ = clay;
-            std::wstring msg = clay
-                ? L"{\"type\":\"clay_mode\",\"enabled\":true}"
-                : L"{\"type\":\"clay_mode\",\"enabled\":false}";
-            webview_->PostWebMessageAsJson(msg.c_str());
-        }
-
         SendRenderOutputSettings(force);
     }
 

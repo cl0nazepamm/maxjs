@@ -45,6 +45,7 @@
 #include "threejs_deform.h"
 #include "threejs_gltf.h"
 #include "threejs_probegrid.h"
+#include "maxjs_viewport_stream.h"
 #include <iskin.h>
 
 #include <wrl.h>
@@ -71,6 +72,7 @@
 #include <cwctype>
 #include <cstdint>
 #include <cfloat>
+#include <iomanip>
 #include <locale>
 #include <immintrin.h>
 #include <ppl.h>
@@ -94,6 +96,7 @@ using namespace Microsoft::WRL;
 #define WM_EXPORT_SNAPSHOT        (WM_USER + 7)
 #define WM_RENDER_SEQUENCE_STEP   (WM_USER + 8)
 #define WM_REFRESH_INSTANCES      (WM_USER + 10)
+#define WM_VIEWPORT_FRAME         (WM_USER + 11)
 #define SETUP_TIMER_ID            2
 #define AS_TIMER_ID               3
 #define RENDER_SEQUENCE_TIMER_ID  4
@@ -1441,6 +1444,8 @@ public:
 
 #include "maxjs_panel_render_window.inl"
 
+#include "maxjs_panel_viewport_stream.inl"
+
 };
 
 #include "maxjs_panel_callbacks.inl"
@@ -1465,6 +1470,7 @@ public:
     }
 
     void Stop() override {
+        MaxJSViewportStream::Shutdown();
         KillPanel();
         if (g_helperHwnd) { DestroyWindow(g_helperHwnd); g_helperHwnd = nullptr; }
     }

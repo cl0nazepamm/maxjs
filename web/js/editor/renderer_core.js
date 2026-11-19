@@ -4,10 +4,20 @@ import * as THREE_STD from 'three-std';
 import { resolveWebGPULimits } from '../webgpu_limits.js';
 
 function createRendererCore(deps = {}) {
+        // While the host shows the frame in one of its own viewports (viewport_stream.js), that
+        // viewport decides the frame's shape and pixel size, not this window.
+        function getHostViewportSize() {
+            const size = deps.getHostViewportSize?.();
+            return size && size.width > 0 && size.height > 0 ? size : null;
+        }
+
         function getViewportFrameRect() {
             const fullWidth = Math.max(1, innerWidth || 1);
             const fullHeight = Math.max(1, innerHeight || 1);
-            const aspect = deps.safeFrameEnabled ? deps.getRenderOutputAspect() : null;
+            const hostSize = getHostViewportSize();
+            const aspect = hostSize
+                ? hostSize.width / hostSize.height
+                : (deps.safeFrameEnabled ? deps.getRenderOutputAspect() : null);
             if (!aspect) return { x: 0, y: 0, width: fullWidth, height: fullHeight, aspect: fullWidth / fullHeight };
 
             const viewportAspect = fullWidth / fullHeight;
@@ -23,7 +33,9 @@ function createRendererCore(deps = {}) {
                 y: Math.round((fullHeight - height) * 0.5),
                 width,
                 height,
-                aspect: width / height,
+                // The host viewport's exact shape: the rounded rect would shift the projection by
+                // a fraction of a pixel against the host's gizmos.
+                aspect: hostSize ? aspect : width / height,
             };
         }
 
@@ -95,6 +107,12 @@ function createRendererCore(deps = {}) {
         }
 
         function getEffectivePixelRatio() {
+            // Host viewport stream: the drawing buffer takes the host viewport's pixel width,
+            // whatever size this window shows the frame at.
+            const hostSize = getHostViewportSize();
+            if (hostSize) {
+                return Math.max(0.05, (hostSize.width + 0.01) / Math.max(1, getViewportFrameRect().width));
+            }
             const scale = Number.isFinite(deps.performanceSettings.renderScale) ? deps.performanceSettings.renderScale : 1.0;
             return Math.max(0.25, devicePixelRatio * scale);
         }

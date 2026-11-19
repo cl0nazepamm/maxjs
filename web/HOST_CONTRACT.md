@@ -53,6 +53,7 @@ behavior branch.
 | `geo_fast` | real-time vertex/topology update for one node (`meta.h` = handle; offsets `vOff/vN`, `iOff/iN`, `uvOff/uvN`, `nOff/nN`, vertex colors `vc`, `groups`, `skipBounds`, `compactChannels`, `jsmod`, `spline`) |
 | `gi_surface_bin` | native GI surface samples (`floatCount`, `sampleCount`, `boundsMin`, `boundsSize`) |
 | `gi_light_bin` | native GI light table (`floatCount`, `lightCount`) |
+| `viewport_frame_buf` | the persistent, read/write frame buffer of the host viewport stream (`capacity` = pixel bytes after the 64-byte header). The viewer keeps it until the host posts another or stops the stream; see below. |
 
 Full-scene metadata schema v1 includes additive root fields:
 
@@ -78,14 +79,14 @@ baseline before any continuation frame and requests resync on a sequence gap.
 
 ## JSON control messages, host → viewer (`bridge.on`)
 
-`audio_update`, `cam`, `clay_mode`, `debug`, `env_update`, `geo_fast` (JSON
+`audio_update`, `cam`, `debug`, `env_update`, `geo_fast` (JSON
 variant), `gltf_update`, `hair_fast`, `host_action_result`,
 `inline_layers_state`, `live_sync_settings`, `pathtracing_settings`,
 `probeGrids`, `project_config`, `project_reload`,
 `render_output_settings`,
 `render_sequence_done`, `render_sequence_frame`, `render_to_image`,
 `render_to_image_done`, `scene`, `snapshot_export_request`,
-`xform`.
+`viewport_frame_request`, `viewport_stream`, `xform`.
 
 A host only has to send what it supports — the viewer treats every type as
 optional.
@@ -108,7 +109,7 @@ legacy project fallback.
 `ready`, `gi_probe_refresh`, `gpu_normals`, `kill`, `live_sync_settings`,
 `lock_camera`, `pathtracing_settings`, `refresh`,
 `render_to_image_ready`, `relay_resync`, `scene_dirty`, `snapshot_export`, `snapshot_serve`,
-`sync_lightmap_uvs`.
+`sync_lightmap_uvs`, `viewport_frame`.
 
 `relay_resync` asks the active DCC host for an authoritative full scene for a
 relay baseline. It may carry `{reason, sceneRequestId, streamId, producerId,
@@ -126,6 +127,28 @@ timeout (60 s default; 10 s for the project runtime's own actions). Used for
 `project_release_manifest` (result may carry `path` and optional `rootUrl`),
 `project_manifest_write`, `project_postfx_write`, `project_settings_write`,
 `inline_layer_remove`, `inline_layer_set_enabled`, `inline_layer_clear`.
+
+## Host viewport stream (optional)
+
+A host that can draw the viewer's frame inside one of its own viewports, under
+its own gizmos, uses these four messages. A host that does not send them gets
+none of the behavior. Web side: `web/js/editor/viewport_stream.js`; 3ds Max
+side: `src/maxjs_viewport_stream.h` (the buffer layout and lock protocol) and
+`src/maxjs_viewport_fragment.cpp`.
+
+1. Host posts a `viewport_frame_buf` shared buffer (read/write) and
+   `{type:'viewport_stream', enabled:true, width, height, maxFps}`. `width` and
+   `height` are the pixel size to render at: the viewer gives its drawing buffer
+   that size and its camera that aspect, whatever size its own window is.
+2. After each rendered frame the viewer copies the canvas pixels into the
+   buffer and posts `{type:'viewport_frame', seq, request}`. It waits for the
+   host to acknowledge a frame (a header word) before it sends the next.
+3. The host may post `{type:'viewport_frame_request', seq, camera}` while it
+   draws a view the last frame does not match. The viewer applies `camera` (the
+   same object as in `cam`), renders at once and answers through the buffer; the
+   host waits on the buffer, not on a message.
+4. `{type:'viewport_stream', enabled:false}` ends it; the viewer releases the
+   buffer and goes back to its own window size.
 
 ## Rules
 
